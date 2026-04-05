@@ -6,11 +6,11 @@ edition = "2024"
 [dependencies]
 fastwebsockets = { version = "0.10.0", features = ["upgrade"] }
 glidesort = "0.1.2"
-hyper = { version = "1.8.1", features = ["full"] }
-hyper-util = { version = "0.1.10", features = ["full"] }
+hyper = { version = "1.9.0", features = ["full"] }
+hyper-util = { version = "0.1.20", features = ["full"] }
 smallvec = "1.15.1"
-tokio = { version = "1.49.0", features = ["full"] }
-zerocopy = { version = "0.8.40", features = ["derive"] }
+tokio = { version = "1.51.0", features = ["full"] }
+zerocopy = { version = "0.8.48", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
@@ -18,7 +18,7 @@ http-body-util = "0.1"
 tokio-rustls = "0.26"
 rustls = "0.23"
 webpki-roots = "0.26"
-rustls-pki-types = "1.10"
+rustls-pki-types = "1.14"
 bytes = "1.11.1"
 
 # collector infrastructure
@@ -27,7 +27,7 @@ zstd = "0.13"
 itoa = "1.0"
 tracing = "0.1"
 tracing-subscriber = "0.3"
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
 thiserror = "2.0"
 reqwest = { version = "0.12", features = ["json"] }
 url = "2.5"
