@@ -1,14 +1,24 @@
 mod binancesbespot;
 mod error;
+mod feed;
 mod file;
 mod sbe_types;
 mod throttler;
 mod ws;
 
+const WRITER_QUEUE_CAPACITY: usize = 65_536;
+const WS_QUEUE_CAPACITY: usize = 16_384;
+/// How long the collection task is given to hand its already-received messages
+/// to the writer before it is aborted outright.
+const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 use anyhow::anyhow;
 use clap::Parser;
 use file::{WriteRecord, Writer};
-use tokio::{signal, sync::mpsc::unbounded_channel};
+use tokio::{
+    select, signal,
+    sync::{mpsc::channel, oneshot, watch},
+};
 use tracing::{error, info};
 
 #[derive(Parser, Debug)]
@@ -30,12 +40,13 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let args = Args::parse();
 
-    // D2: channel carries typed WriteRecord instead of an anonymous 4-tuple.
-    let (writer_tx, mut writer_rx) = unbounded_channel::<WriteRecord>();
+    std::fs::create_dir_all(&args.path)?;
+    let (writer_tx, mut writer_rx) = channel::<WriteRecord>(WRITER_QUEUE_CAPACITY);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let api_key = std::env::var("BINANCE_API_KEY").unwrap_or_default();
 
-    let handle = match args.exchange.as_str() {
+    let mut handle = match args.exchange.as_str() {
         "binancesbespot" => {
             if api_key.is_empty() {
                 return Err(anyhow!(
@@ -57,6 +68,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 args.symbols,
                 writer_tx,
                 api_key,
+                shutdown_rx,
             ))
         }
         exchange => {
@@ -64,38 +76,108 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     };
 
-    // Create output directory if it doesn't exist.
-    std::fs::create_dir_all(&args.path)?;
-
-    // Run the writer in a dedicated thread to avoid blocking async ingestion with
-    // synchronous zstd compression and disk I/O.
+    let (writer_done_tx, writer_done_rx) = oneshot::channel();
     let writer_thread = {
         let path = args.path.clone();
-        std::thread::spawn(move || {
+        std::thread::spawn(move || -> Result<(), anyhow::Error> {
             let mut writer = Writer::new(&path);
-            while let Some(record) = writer_rx.blocking_recv() {
-                if let Err(err) = writer.write(record) {
-                    error!(?err, "write error");
-                    break;
+            let result = loop {
+                match writer_rx.blocking_recv() {
+                    Some(record) => {
+                        if let Err(error) = writer.write(record) {
+                            break Err(error);
+                        }
+                    }
+                    None => break Ok(()),
                 }
-            }
-            writer.close();
+            };
+            let result = result.and(writer.close());
+            let _ = writer_done_tx.send(());
             info!("writer thread finished");
+            result
         })
     };
 
-    signal::ctrl_c().await?;
-    info!("ctrl-c received, shutting down");
+    enum Shutdown {
+        Signal,
+        Writer,
+        Collection(Result<(), anyhow::Error>),
+    }
 
-    // Abort the collection task to stop WebSocket and snapshot background tasks.
-    handle.abort();
+    let shutdown = select! {
+        result = shutdown_signal() => {
+            let signal = result?;
+            info!(signal, "shutdown signal received");
+            Shutdown::Signal
+        }
+        _ = writer_done_rx => {
+            error!("writer stopped; shutting down collection");
+            Shutdown::Writer
+        }
+        result = &mut handle => {
+            Shutdown::Collection(match result {
+                Ok(result) => result,
+                Err(error) => Err(anyhow!("collection task failed: {error}")),
+            })
+        }
+    };
 
-    // Await the handle so Tokio finishes dropping the task and all `writer_tx`
-    // clones held inside it. Without this, `writer_rx.blocking_recv()` could block
-    // indefinitely because the sender is not yet dropped when `writer_thread.join()`
-    // is called.
-    let _ = handle.await; // returns Err(JoinError::Cancelled) — intentional
+    let collection_result = match shutdown {
+        Shutdown::Signal | Shutdown::Writer => {
+            // Ask the collection task to stop reading and flush what it already
+            // has, rather than aborting it with a full queue.
+            shutdown_tx.send_replace(true);
+            match tokio::time::timeout(DRAIN_TIMEOUT, &mut handle).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => Err(anyhow!("collection task failed: {error}")),
+                Err(_) => {
+                    handle.abort();
+                    let _ = handle.await;
+                    // Whatever was still queued is gone. Exiting 0 here would
+                    // make an incomplete dump look like a clean shutdown.
+                    Err(anyhow!(
+                        "collection task did not finish draining within {DRAIN_TIMEOUT:?}; \
+                         queued records were discarded"
+                    ))
+                }
+            }
+        }
+        Shutdown::Collection(result) => result,
+    };
 
-    let _ = writer_thread.join();
-    Ok(())
+    let writer_result = match writer_thread.join() {
+        Ok(result) => result,
+        Err(_) => Err(anyhow!("writer thread panicked")),
+    };
+
+    // The collection error is the root cause; a writer close failure is usually
+    // a symptom of the same underlying problem, so it must not mask it.
+    match (collection_result, writer_result) {
+        (Err(collection), Err(writer)) => {
+            error!(%writer, "the writer also failed while shutting down");
+            Err(collection)
+        }
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+async fn shutdown_signal() -> std::io::Result<&'static str> {
+    #[cfg(unix)]
+    {
+        let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
+        select! {
+            result = signal::ctrl_c() => {
+                result?;
+                Ok("SIGINT")
+            }
+            _ = sigterm.recv() => Ok("SIGTERM"),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        signal::ctrl_c().await?;
+        Ok("SIGINT")
+    }
 }

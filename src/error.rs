@@ -10,6 +10,8 @@ pub enum ConnectorError {
     Sbe,
     #[error("Network error: {0}")]
     Network(#[from] reqwest::Error),
+    #[error("writer channel is closed")]
+    WriterClosed,
     #[allow(dead_code)]
     #[error("WebSocket error: {0}")]
     Ws(String),

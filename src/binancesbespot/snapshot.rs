@@ -1,28 +1,35 @@
 use bytes::Bytes;
 use jiff::Timestamp;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 use tracing::{error, warn};
 
-use crate::file::{Tag, WriteRecord};
+use crate::file::{Symbol, Tag, WriteRecord};
 use crate::throttler::Throttler;
 
 /// Fetch the full depth snapshot for `symbol` from the REST API.
 pub async fn fetch_snapshot(
     client: &reqwest::Client,
     symbol: &str,
-) -> Result<Bytes, reqwest::Error> {
+) -> Result<Bytes, anyhow::Error> {
     let url = format!(
         "https://api.binance.com/api/v3/depth?symbol={}&limit=5000",
         symbol.to_uppercase()
     );
-    let bytes = client
+    let response = client
         .get(&url)
         .header("Accept", "application/json")
         .send()
-        .await?
-        .bytes()
         .await?;
-    Ok(bytes)
+    let status = response.status();
+    let body = response.bytes().await?;
+    if !status.is_success() {
+        let preview = &body[..body.len().min(1024)];
+        anyhow::bail!(
+            "Binance depth snapshot returned {status}: {}",
+            String::from_utf8_lossy(preview)
+        );
+    }
+    Ok(body)
 }
 
 /// Background task: fetch a REST depth snapshot for every symbol at startup and
@@ -32,8 +39,8 @@ pub async fn fetch_snapshot(
 /// `client` is passed in from `run_collection` so the same connection pool
 /// is shared with gap-triggered snapshot fetches — no duplicate Client.
 pub async fn snapshot_loop(
-    symbols: Vec<String>,
-    writer_tx: UnboundedSender<WriteRecord>,
+    symbols: Vec<Symbol>,
+    writer_tx: Sender<WriteRecord>,
     client: reqwest::Client,
     throttler: Throttler,
     interval_secs: u64,
@@ -44,9 +51,6 @@ pub async fn snapshot_loop(
         ticker.tick().await;
 
         for symbol in &symbols {
-            // Symbols are stored lowercase in the writer; normalise here.
-            let symbol_lower = symbol.to_lowercase();
-
             let result = throttler.execute(fetch_snapshot(&client, symbol)).await;
 
             match result {
@@ -54,11 +58,11 @@ pub async fn snapshot_loop(
                     let recv_time = Timestamp::now();
                     let record = WriteRecord {
                         recv_time,
-                        symbol: symbol_lower,
+                        symbol: Symbol::clone(symbol),
                         tag: Tag::Rest,
                         data,
                     };
-                    if writer_tx.send(record).is_err() {
+                    if writer_tx.send(record).await.is_err() {
                         return; // channel closed — collector is shutting down
                     }
                 }
