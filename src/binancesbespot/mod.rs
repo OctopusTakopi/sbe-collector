@@ -2,6 +2,7 @@
 mod snapshot;
 mod ws;
 
+use crate::dedup::Dedup;
 use crate::error::ConnectorError;
 use crate::feed::Feed;
 use crate::file::{Symbol, Tag, WriteRecord};
@@ -82,10 +83,18 @@ pub async fn handle(
     recv_time: Timestamp,
     symbols: &mut SymbolMatcher,
     prev_u_map: &mut HashMap<Symbol, i64>,
+    dedup: &mut Dedup,
     client: &reqwest::Client,
     throttler: &Throttler,
     tasks: &mut JoinSet<()>,
 ) -> Result<(), ConnectorError> {
+    // Before anything reads book update ids. A second copy of a depth diff
+    // starts at the update id after the one the first copy already consumed, so
+    // letting it through would report a gap on every single frame.
+    if dedup.is_duplicate(&data) {
+        return Ok(());
+    }
+
     if data.len() < 8 {
         return Err(ConnectorError::Format);
     }
@@ -197,8 +206,14 @@ pub async fn run_collection(
     writer_tx: Sender<WriteRecord>,
     api_key: String,
     shutdown: watch::Receiver<bool>,
+    connections: usize,
 ) -> Result<(), anyhow::Error> {
-    let (ws_tx, ws_rx) = channel::<(Timestamp, Bytes)>(crate::WS_QUEUE_CAPACITY);
+    let connections = connections.max(1);
+    let mut dedup = Dedup::for_connections(connections);
+    // All connections share the queue, so it is sized per connection to keep
+    // the burst each one can absorb independent of how many there are.
+    let (ws_tx, ws_rx) =
+        channel::<(Timestamp, Bytes)>(crate::WS_QUEUE_CAPACITY.saturating_mul(connections));
     let mut feed = Feed::new(ws_rx, shutdown);
     let mut tasks = JoinSet::new();
     let canonical_symbols: Vec<Symbol> = symbols
@@ -207,10 +222,20 @@ pub async fn run_collection(
         .collect();
     let mut symbol_matcher = SymbolMatcher::new(canonical_symbols);
 
-    tasks.spawn(async move {
-        keep_connection(streams, symbols, api_key, ws_tx).await;
-        tracing::error!("the websocket connection task exited");
-    });
+    for connection in 0..connections {
+        let streams = streams.clone();
+        let symbols = symbols.clone();
+        let api_key = api_key.clone();
+        let ws_tx = ws_tx.clone();
+        tasks.spawn(async move {
+            tokio::time::sleep(crate::CONNECT_STAGGER * connection as u32).await;
+            keep_connection(streams, symbols, api_key, connection, ws_tx).await;
+            tracing::error!(connection, "the websocket connection task exited");
+        });
+    }
+    // The clones above are the only senders that should keep the feed open;
+    // holding this one would stop `Feed` from ever seeing the queue close.
+    drop(ws_tx);
 
     // One shared reqwest::Client for both the periodic snapshot loop and
     // gap-triggered snapshot fetches.
@@ -254,6 +279,7 @@ pub async fn run_collection(
             recv_time,
             &mut symbol_matcher,
             &mut prev_u_map,
+            &mut dedup,
             &client,
             &throttler,
             &mut tasks,
@@ -273,6 +299,7 @@ pub async fn run_collection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::mpsc::channel;
 
     #[test]
     fn finds_canonical_symbol_without_allocating() {
@@ -282,5 +309,155 @@ mod tests {
         let found = find_symbol(data, &symbols).unwrap();
 
         assert!(std::sync::Arc::ptr_eq(found, &symbols[0]));
+    }
+
+    /// A `DepthDiffStreamEvent` for BTCUSDT with empty bid and ask groups:
+    /// 8-byte header, the 26-byte fixed block, two `groupSize16Encoding`
+    /// dimensions, then the symbol the stream bridge appends.
+    fn depth_diff(first_u: i64, last_u: i64) -> Bytes {
+        let mut frame = Vec::with_capacity(44);
+        frame.extend_from_slice(&26u16.to_le_bytes()); // blockLength
+        frame.extend_from_slice(&TEMPLATE_DEPTH_DIFF.to_le_bytes());
+        frame.extend_from_slice(&1u16.to_le_bytes()); // schemaId
+        frame.extend_from_slice(&0u16.to_le_bytes()); // version
+        frame.extend_from_slice(&first_u.to_le_bytes()); // eventTime
+        frame.extend_from_slice(&first_u.to_le_bytes());
+        frame.extend_from_slice(&last_u.to_le_bytes());
+        frame.push(0u8 as i8 as u8); // priceExponent
+        frame.push(0u8 as i8 as u8); // qtyExponent
+        for _ in 0..2 {
+            frame.extend_from_slice(&16u16.to_le_bytes()); // group blockLength
+            frame.extend_from_slice(&0u16.to_le_bytes()); // numInGroup
+        }
+        frame.push(7); // VarString8 length
+        frame.extend_from_slice(b"BTCUSDT");
+        Bytes::from(frame)
+    }
+
+    struct Harness {
+        symbols: SymbolMatcher,
+        prev_u_map: HashMap<Symbol, i64>,
+        dedup: Dedup,
+        client: reqwest::Client,
+        throttler: Throttler,
+        tasks: JoinSet<()>,
+    }
+
+    impl Harness {
+        fn with_connections(connections: usize) -> Self {
+            Self {
+                symbols: SymbolMatcher::new(vec![Symbol::from("btcusdt")]),
+                prev_u_map: HashMap::new(),
+                dedup: Dedup::for_connections(connections),
+                client: reqwest::Client::new(),
+                throttler: Throttler::new(1),
+                tasks: JoinSet::new(),
+            }
+        }
+
+        async fn feed(
+            &mut self,
+            writer_tx: &Sender<WriteRecord>,
+            data: Bytes,
+        ) -> Result<(), ConnectorError> {
+            handle(
+                data,
+                writer_tx,
+                Timestamp::now(),
+                &mut self.symbols,
+                &mut self.prev_u_map,
+                &mut self.dedup,
+                &self.client,
+                &self.throttler,
+                &mut self.tasks,
+            )
+            .await
+        }
+    }
+
+    /// Depth diffs, in order: each one starts at the update id after the
+    /// previous one's last.
+    fn depth_sequence() -> [Bytes; 4] {
+        [
+            depth_diff(2, 3),
+            depth_diff(4, 5),
+            depth_diff(6, 7),
+            depth_diff(8, 9),
+        ]
+    }
+
+    /// The second connection's copy must be dropped *before* the continuity
+    /// check. Its `firstBookUpdateId` is the one the first copy already
+    /// consumed, so letting it through would report a gap on every frame.
+    #[tokio::test]
+    async fn a_second_connections_copy_is_neither_written_nor_read_as_a_gap() {
+        let (writer_tx, mut writer_rx) = channel(16);
+        let mut harness = Harness::with_connections(2);
+        let sequence = depth_sequence();
+
+        for frame in &sequence {
+            // Both connections deliver every frame.
+            harness.feed(&writer_tx, frame.clone()).await.unwrap();
+            harness.feed(&writer_tx, frame.clone()).await.unwrap();
+        }
+
+        let mut written = 0;
+        while writer_rx.try_recv().is_ok() {
+            written += 1;
+        }
+        assert_eq!(written, sequence.len(), "each frame is recorded once");
+        assert!(harness.tasks.is_empty(), "no gap should have been reported");
+        assert_eq!(harness.prev_u_map["btcusdt"], 9);
+    }
+
+    /// The point of the whole feature: one connection dropping mid-stream
+    /// leaves no hole, because the other one covers the frames it missed.
+    #[tokio::test]
+    async fn a_reconnect_on_one_connection_leaves_no_gap() {
+        let (writer_tx, mut writer_rx) = channel(16);
+        let mut harness = Harness::with_connections(2);
+        let sequence = depth_sequence();
+
+        // Both connections are up for the first two frames.
+        for frame in &sequence[..2] {
+            harness.feed(&writer_tx, frame.clone()).await.unwrap();
+            harness.feed(&writer_tx, frame.clone()).await.unwrap();
+        }
+        // Connection 0 drops here and misses the third frame entirely; only
+        // connection 1 delivers it.
+        harness.feed(&writer_tx, sequence[2].clone()).await.unwrap();
+        // Connection 0 is back, and both deliver the next frame.
+        harness.feed(&writer_tx, sequence[3].clone()).await.unwrap();
+        harness.feed(&writer_tx, sequence[3].clone()).await.unwrap();
+
+        let mut written = 0;
+        while writer_rx.try_recv().is_ok() {
+            written += 1;
+        }
+        assert_eq!(written, sequence.len(), "the stream is still complete");
+        assert!(
+            harness.tasks.is_empty(),
+            "the surviving connection covered the reconnect, so there is no gap \
+             and no recovery snapshot to fetch"
+        );
+    }
+
+    /// With redundancy off, nothing is filtered — a single connection cannot
+    /// produce a duplicate, and paying for the filter would be pure overhead.
+    #[tokio::test]
+    async fn a_single_connection_records_every_frame_it_receives() {
+        let (writer_tx, mut writer_rx) = channel(16);
+        let mut harness = Harness::with_connections(1);
+        let sequence = depth_sequence();
+
+        for frame in &sequence {
+            harness.feed(&writer_tx, frame.clone()).await.unwrap();
+        }
+
+        let mut written = 0;
+        while writer_rx.try_recv().is_ok() {
+            written += 1;
+        }
+        assert_eq!(written, sequence.len());
     }
 }

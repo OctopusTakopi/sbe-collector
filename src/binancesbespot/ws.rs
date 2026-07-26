@@ -22,6 +22,7 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) async fn connect(
     streams_str: &str,
     api_key: &str,
+    connection: usize,
     tls: Arc<rustls::ClientConfig>,
     ws_tx: Sender<(Timestamp, Bytes)>,
 ) -> Result<(), anyhow::Error> {
@@ -41,7 +42,11 @@ pub(crate) async fn connect(
         let message = match timeout(IDLE_TIMEOUT, conn.read()).await {
             Ok(result) => result?,
             Err(_) => {
-                warn!(?IDLE_TIMEOUT, "no websocket frame received; reconnecting");
+                warn!(
+                    connection,
+                    ?IDLE_TIMEOUT,
+                    "no websocket frame received; reconnecting"
+                );
                 return Err(Error::from(io::Error::new(ErrorKind::TimedOut, "idle")));
             }
         };
@@ -76,7 +81,7 @@ pub(crate) async fn connect(
                 sender.pong(message.payload.to_vec()).await?;
             }
             OpCode::Close => {
-                warn!("WS closed by server");
+                warn!(connection, "WS closed by server");
                 return Err(Error::from(io::Error::new(
                     ErrorKind::ConnectionAborted,
                     "server closed",
@@ -107,6 +112,7 @@ pub(crate) async fn keep_connection(
     streams: Vec<String>,
     symbols: Vec<String>,
     api_key: String,
+    connection: usize,
     ws_tx: Sender<(Timestamp, Bytes)>,
 ) {
     // Build TLS config once for the lifetime of this task.
@@ -121,17 +127,29 @@ pub(crate) async fn keep_connection(
         .collect::<Vec<_>>()
         .join("/");
 
-    tracing::info!("Connecting to SBE stream: {}", streams_str);
+    tracing::info!(connection, "Connecting to SBE stream: {}", streams_str);
 
     let mut error_count: u32 = 0;
     loop {
         let connect_time = Instant::now();
-        if let Err(err) = connect(&streams_str, &api_key, tls.clone(), ws_tx.clone()).await {
-            error!(?err, "WS connection error");
+        if let Err(err) = connect(
+            &streams_str,
+            &api_key,
+            connection,
+            tls.clone(),
+            ws_tx.clone(),
+        )
+        .await
+        {
+            let lifetime = connect_time.elapsed();
+            // The lifetime is what separates a venue recycling a healthy
+            // connection from this side failing: an `Unexpected EOF` after an
+            // hour is the former, one after a few seconds is the latter.
+            error!(connection, ?err, ?lifetime, "WS connection error");
             error_count += 1;
             // Reset the counter if the last session lived long enough — it was
             // a transient blip, not a persistent failure.
-            if connect_time.elapsed() > Duration::from_secs(30) {
+            if lifetime > Duration::from_secs(30) {
                 error_count = 0;
             }
             tokio::time::sleep(jittered_backoff(error_count)).await;
