@@ -6,13 +6,24 @@ use tracing::{error, warn};
 use crate::file::{Symbol, Tag, WriteRecord};
 use crate::throttler::Throttler;
 
+/// Depth levels requested per snapshot.
+///
+/// Must move together with [`SNAPSHOT_WEIGHT`]: Binance charges `/api/v3/depth`
+/// 5 at a limit up to 100, 25 to 500, 50 to 1000 and 250 to 5000. Dropping to
+/// 1000 would cost a fifth of the budget per fetch, at the price of a shallower
+/// book in the recording.
+const SNAPSHOT_LIMIT: u32 = 5_000;
+
+/// What Binance charges for a [`SNAPSHOT_LIMIT`]-deep snapshot.
+pub const SNAPSHOT_WEIGHT: u32 = 250;
+
 /// Fetch the full depth snapshot for `symbol` from the REST API.
 pub async fn fetch_snapshot(
     client: &reqwest::Client,
     symbol: &str,
 ) -> Result<Bytes, anyhow::Error> {
     let url = format!(
-        "https://api.binance.com/api/v3/depth?symbol={}&limit=5000",
+        "https://api.binance.com/api/v3/depth?symbol={}&limit={SNAPSHOT_LIMIT}",
         symbol.to_uppercase()
     );
     let response = client
@@ -51,7 +62,9 @@ pub async fn snapshot_loop(
         ticker.tick().await;
 
         for symbol in &symbols {
-            let result = throttler.execute(fetch_snapshot(&client, symbol)).await;
+            let result = throttler
+                .execute(SNAPSHOT_WEIGHT, fetch_snapshot(&client, symbol))
+                .await;
 
             match result {
                 Some(Ok(data)) => {

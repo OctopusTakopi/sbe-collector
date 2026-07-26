@@ -1,5 +1,5 @@
 // dead_code allow removed: unused items are now tracked explicitly.
-mod snapshot;
+pub(crate) mod snapshot;
 mod ws;
 
 use crate::dedup::Dedup;
@@ -21,6 +21,16 @@ use tokio::{
 use zerocopy::FromBytes;
 
 use ws::keep_connection;
+
+/// How far a book update id may fall below the last one seen before the stream
+/// is treated as restarted rather than merely reordered.
+///
+/// Redundant connections reorder by at most the dedup window's worth of
+/// updates — thousands, on the busiest symbol. A book that re-bases drops by
+/// orders of magnitude more, since Binance's ids run in the billions. Anything
+/// between is read as a reorder, which costs nothing but a stale high-water
+/// mark until the stream catches up.
+const RESYNC_BACKSTEP: i64 = 1_000_000;
 
 /// Match the tail of the buffer against every known subscribed symbol to extract
 /// the symbol appended by the Binance stream bridge as a `VarString8`
@@ -133,11 +143,32 @@ pub async fn handle(
             // Only trigger the gap alarm when we already have a previous update id.
             // On the very first message prev_u is None — normal startup, not a gap.
             if let Some(prev) = prev_u_map.get_mut(symbol.as_ref()) {
-                if first_u != *prev + 1 {
+                // A book that restarts its update ids (relist, maintenance)
+                // lands far below the high-water mark. Without this the mark
+                // would never come down again and every later frame would be
+                // read as a hole, for the life of the process.
+                if u < prev.saturating_sub(RESYNC_BACKSTEP) {
+                    tracing::warn!(
+                        symbol = %symbol,
+                        prev_u = *prev,
+                        last_u = u,
+                        "book update ids restarted well below the last seen; resyncing"
+                    );
+                    *prev = u;
+                    return write(writer_tx, recv_time, symbol, data).await;
+                }
+
+                // Only a frame that starts *beyond* the next expected id leaves
+                // a hole. One that starts at or below the mark is already
+                // covered: a straggler from a connection that fell behind, or
+                // the very frame that fills a hole reported earlier. Alarming
+                // on those would fetch a snapshot for data already in hand,
+                // once per frame, for as long as the connections stay skewed.
+                if first_u > prev.saturating_add(1) {
                     tracing::warn!(
                         symbol = %symbol,
                         "depth gap detected: expected first_u={} but got {} (prev_u={})",
-                        *prev + 1,
+                        prev.saturating_add(1),
                         first_u,
                         *prev
                     );
@@ -150,7 +181,10 @@ pub async fn handle(
                     tasks.spawn(async move {
                         use crate::binancesbespot::snapshot::fetch_snapshot;
                         match throttler_
-                            .execute(fetch_snapshot(&client_, &sym_for_spawn))
+                            .execute(
+                                snapshot::SNAPSHOT_WEIGHT,
+                                fetch_snapshot(&client_, &sym_for_spawn),
+                            )
                             .await
                         {
                             Some(Ok(snap_data)) => {
@@ -193,6 +227,15 @@ pub async fn handle(
         }
     }
 
+    write(writer_tx, recv_time, symbol, data).await
+}
+
+async fn write(
+    writer_tx: &Sender<WriteRecord>,
+    recv_time: Timestamp,
+    symbol: Symbol,
+    data: Bytes,
+) -> Result<(), ConnectorError> {
     writer_tx
         .send(WriteRecord {
             recv_time,
@@ -201,8 +244,7 @@ pub async fn handle(
             data,
         })
         .await
-        .map_err(|_| ConnectorError::WriterClosed)?;
-    Ok(())
+        .map_err(|_| ConnectorError::WriterClosed)
 }
 
 pub async fn run_collection(
@@ -249,7 +291,8 @@ pub async fn run_collection(
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
 
-    let throttler = Throttler::new(100);
+    // A request-weight budget, not a call count — see `Throttler`.
+    let throttler = Throttler::new(crate::throttler::SNAPSHOT_WEIGHT_BUDGET);
     {
         let symbols = symbol_matcher.symbols().to_vec();
         let writer_tx = writer_tx.clone();
@@ -318,18 +361,22 @@ mod tests {
 
     /// A `DepthDiffStreamEvent` for BTCUSDT with empty bid and ask groups:
     /// 8-byte header, the 26-byte fixed block, two `groupSize16Encoding`
-    /// dimensions, then the symbol the stream bridge appends.
+    /// dimensions, then the symbol the stream bridge appends. 50 bytes.
     fn depth_diff(first_u: i64, last_u: i64) -> Bytes {
-        let mut frame = Vec::with_capacity(44);
+        let mut frame = Vec::with_capacity(50);
         frame.extend_from_slice(&26u16.to_le_bytes()); // blockLength
         frame.extend_from_slice(&TEMPLATE_DEPTH_DIFF.to_le_bytes());
         frame.extend_from_slice(&1u16.to_le_bytes()); // schemaId
         frame.extend_from_slice(&0u16.to_le_bytes()); // version
-        frame.extend_from_slice(&first_u.to_le_bytes()); // eventTime
+        // eventTime, deliberately unrelated to the update ids: it is the one
+        // field a second connection stamps differently, so tying it to the ids
+        // would make every "other connection" frame below byte-identical and
+        // let a whole-frame key pass these tests.
+        frame.extend_from_slice(&1_785_046_950_114_506i64.to_le_bytes());
         frame.extend_from_slice(&first_u.to_le_bytes());
         frame.extend_from_slice(&last_u.to_le_bytes());
-        frame.push(0u8 as i8 as u8); // priceExponent
-        frame.push(0u8 as i8 as u8); // qtyExponent
+        frame.push(0i8 as u8); // priceExponent
+        frame.push(0i8 as u8); // qtyExponent
         for _ in 0..2 {
             frame.extend_from_slice(&16u16.to_le_bytes()); // group blockLength
             frame.extend_from_slice(&0u16.to_le_bytes()); // numInGroup
@@ -337,6 +384,17 @@ mod tests {
         frame.push(7); // VarString8 length
         frame.extend_from_slice(b"BTCUSDT");
         Bytes::from(frame)
+    }
+
+    /// The same event as a redundant connection delivers it: identical bytes
+    /// except for the `eventTime` Binance stamps per connection, tens of
+    /// microseconds apart on live data.
+    fn as_seen_by_another_connection(frame: &Bytes) -> Bytes {
+        let mut copy = frame.to_vec();
+        let stamp = i64::from_le_bytes(copy[crate::dedup::EVENT_TIME].try_into().unwrap());
+        copy[crate::dedup::EVENT_TIME].copy_from_slice(&(stamp - 23).to_le_bytes());
+        assert_ne!(&copy[..], &frame[..], "the copies must differ on the wire");
+        Bytes::from(copy)
     }
 
     struct Harness {
@@ -355,7 +413,9 @@ mod tests {
                 prev_u_map: HashMap::new(),
                 dedup: Dedup::for_connections(connections),
                 client: reqwest::Client::new(),
-                throttler: Throttler::new(1),
+                // No budget: the gap path must never issue a live
+                // request to Binance from a unit test.
+                throttler: Throttler::new(0),
                 tasks: JoinSet::new(),
             }
         }
@@ -401,9 +461,12 @@ mod tests {
         let sequence = depth_sequence();
 
         for frame in &sequence {
-            // Both connections deliver every frame.
+            // Both connections deliver every frame, each with its own stamp.
             harness.feed(&writer_tx, frame.clone()).await.unwrap();
-            harness.feed(&writer_tx, frame.clone()).await.unwrap();
+            harness
+                .feed(&writer_tx, as_seen_by_another_connection(frame))
+                .await
+                .unwrap();
         }
 
         let mut written = 0;
@@ -426,14 +489,23 @@ mod tests {
         // Both connections are up for the first two frames.
         for frame in &sequence[..2] {
             harness.feed(&writer_tx, frame.clone()).await.unwrap();
-            harness.feed(&writer_tx, frame.clone()).await.unwrap();
+            harness
+                .feed(&writer_tx, as_seen_by_another_connection(frame))
+                .await
+                .unwrap();
         }
         // Connection 0 drops here and misses the third frame entirely; only
         // connection 1 delivers it.
-        harness.feed(&writer_tx, sequence[2].clone()).await.unwrap();
+        harness
+            .feed(&writer_tx, as_seen_by_another_connection(&sequence[2]))
+            .await
+            .unwrap();
         // Connection 0 is back, and both deliver the next frame.
         harness.feed(&writer_tx, sequence[3].clone()).await.unwrap();
-        harness.feed(&writer_tx, sequence[3].clone()).await.unwrap();
+        harness
+            .feed(&writer_tx, as_seen_by_another_connection(&sequence[3]))
+            .await
+            .unwrap();
 
         let mut written = 0;
         while writer_rx.try_recv().is_ok() {
@@ -448,23 +520,24 @@ mod tests {
     }
 
     /// A frame that arrives after a later one — possible once redundant
-    /// connections can be skewed past the dedup window — costs one gap, not a
-    /// gap on every frame after it. Rewinding the sequence would make the next
-    /// in-order diff mismatch too, and so on until the streams realign.
+    /// connections can be skewed past the dedup window — costs *one* gap, for
+    /// the moment the hole was real. The straggler that fills it is not a
+    /// second hole, and must not rewind the sequence and make the next
+    /// in-order diff mismatch as well.
     #[tokio::test]
-    async fn an_out_of_order_frame_does_not_rewind_the_sequence() {
+    async fn a_straggler_fills_a_hole_rather_than_reporting_another() {
         let (writer_tx, _writer_rx) = channel(16);
         let mut harness = Harness::with_connections(2);
         let sequence = depth_sequence();
 
         harness.feed(&writer_tx, sequence[0].clone()).await.unwrap();
+        // sequence[1] has not arrived, so at this instant the hole is real.
         harness.feed(&writer_tx, sequence[2].clone()).await.unwrap();
         assert_eq!(harness.prev_u_map["btcusdt"], 7);
-        let after_skip = harness.tasks.len();
-        assert_eq!(after_skip, 1, "the skipped frame is a genuine gap");
+        assert_eq!(harness.tasks.len(), 1, "the skipped frame is a real hole");
 
-        // The straggler arrives late. It is a gap too, but it must not drag the
-        // sequence back to 5 and make the *next* frame look like one as well.
+        // The straggler arrives late and covers exactly what was reported
+        // missing. Nothing is outstanding, so nothing more should be fetched.
         harness.feed(&writer_tx, sequence[1].clone()).await.unwrap();
         assert_eq!(
             harness.prev_u_map["btcusdt"], 7,
@@ -474,8 +547,34 @@ mod tests {
         harness.feed(&writer_tx, sequence[3].clone()).await.unwrap();
         assert_eq!(
             harness.tasks.len(),
-            after_skip + 1,
-            "the reorder costs one gap, not one per frame afterwards"
+            1,
+            "already-covered frames must not each fetch a snapshot"
+        );
+    }
+
+    /// A book whose ids restart must not leave the high-water mark stranded
+    /// above the new stream, or every later diff reads as a hole forever.
+    #[tokio::test]
+    async fn a_restarted_book_resyncs_instead_of_wedging() {
+        let (writer_tx, _writer_rx) = channel(16);
+        let mut harness = Harness::with_connections(2);
+        // Parked in the billions, as Binance ids really are.
+        harness
+            .prev_u_map
+            .insert(Symbol::from("btcusdt"), 5_000_000_000);
+
+        for frame in depth_sequence() {
+            harness.feed(&writer_tx, frame).await.unwrap();
+        }
+
+        assert_eq!(
+            harness.prev_u_map["btcusdt"], 9,
+            "the mark follows the restarted stream"
+        );
+        assert!(
+            harness.tasks.len() <= 1,
+            "one resync, not a snapshot fetch per frame: {}",
+            harness.tasks.len()
         );
     }
 
