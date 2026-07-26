@@ -8,10 +8,18 @@
 //! overrunning it is a 418 with an IP ban of two minutes to three days, which
 //! stops every symbol's collection, not just the snapshot that overran.
 
-use std::{collections::VecDeque, future::Future, sync::Arc};
+use std::{
+    collections::VecDeque,
+    future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicI64, Ordering},
+    },
+};
 
 use jiff::Timestamp;
 use tokio::sync::Mutex;
+use tracing::{error, warn};
 
 const WINDOW_NANOS: i64 = 60_000_000_000;
 
@@ -31,6 +39,15 @@ pub const SNAPSHOT_WEIGHT_BUDGET: u32 = SPOT_WEIGHT_PER_MINUTE / 2;
 pub struct Throttler {
     // VecDeque allows O(1) amortised front-pop instead of O(n) retain.
     spent: Arc<Mutex<VecDeque<(i64, u32)>>>,
+    /// When an observed ban lifts, in epoch nanoseconds; 0 when not banned.
+    ///
+    /// The weight window only knows what *this process* has spent, so it cannot
+    /// see a ban earned before it started — by a previous run, or by anything
+    /// else on the host. Binance does say, in the 418 body and the `Retry-After`
+    /// header, so the ban is recorded here and every request refused until it
+    /// lifts. Continuing to send during a ban is what turns Binance's two
+    /// minutes into hours and then days.
+    banned_until: Arc<AtomicI64>,
     weight_per_minute: u32,
 }
 
@@ -39,8 +56,30 @@ impl Throttler {
     pub fn new(weight_per_minute: u32) -> Self {
         Self {
             spent: Default::default(),
+            banned_until: Arc::new(AtomicI64::new(0)),
             weight_per_minute,
         }
+    }
+
+    /// Record a ban observed in a response, so nothing is sent until it lifts.
+    ///
+    /// Keeps the latest expiry seen: a second ban while one is in force is an
+    /// escalation, never a reprieve.
+    pub fn note_ban(&self, until: Timestamp) {
+        let until_nanos = until.as_nanosecond() as i64;
+        let previous = self.banned_until.fetch_max(until_nanos, Ordering::Relaxed);
+        if previous < until_nanos {
+            error!(
+                until = %until,
+                "Binance banned this IP; no further REST requests until it lifts"
+            );
+        }
+    }
+
+    /// The ban expiry currently in force, if any.
+    fn ban_in_force(&self, now_nanos: i64) -> Option<i64> {
+        let until = self.banned_until.load(Ordering::Relaxed);
+        (until > now_nanos).then_some(until)
     }
 
     /// Execute `fut` only if `weight` still fits in the last 60 seconds'
@@ -53,6 +92,13 @@ impl Throttler {
         Fut: Future<Output = T>,
     {
         let now = Timestamp::now().as_nanosecond() as i64;
+        if let Some(until) = self.ban_in_force(now) {
+            warn!(
+                remaining_secs = (until - now) / 1_000_000_000,
+                "skipping request: this IP is still banned"
+            );
+            return None;
+        }
         {
             let mut spent = self.spent.lock().await;
             // Timestamps are monotonically increasing, so expired entries are

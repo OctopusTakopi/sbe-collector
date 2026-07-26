@@ -183,7 +183,7 @@ pub async fn handle(
                         match throttler_
                             .execute(
                                 snapshot::SNAPSHOT_WEIGHT,
-                                fetch_snapshot(&client_, &sym_for_spawn),
+                                fetch_snapshot(&client_, &throttler_, &sym_for_spawn),
                             )
                             .await
                         {
