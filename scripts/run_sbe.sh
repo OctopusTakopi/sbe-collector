@@ -6,7 +6,7 @@ COLLECTOR_EXE="/home/ec2-user/sbe-collector"
 # Base directory for data storage
 BASE_DATA_DIR="./data/sbe"
 # Coins to collect
-COINS=("btc" "eth" "sol")
+COINS=("btc" "eth" "bnb" "xrp" "sol" "trx" "doge")
 
 # Mappings for data paths
 # Format: "internal_exchange_name:filesystem_subpath"
@@ -14,7 +14,7 @@ MAPPINGS=(
     "binancesbespot:binance/spot"
 )
 
-SESSION_NAME="sbe_collection"
+SESSION_NAME="sbe_collector"
 
 # Check for API Key (required by binancesbespot)
 if [ -z "$BINANCE_API_KEY" ]; then
@@ -49,7 +49,7 @@ for MAP in "${MAPPINGS[@]}"; do
     tmux new-window -t $SESSION_NAME -n "$EXCH"
     
     # Construct the command - pass API key explicitly to the process
-    CMD="BINANCE_API_KEY=$BINANCE_API_KEY $COLLECTOR_EXE $TARGET_DIR $EXCH $SYMBOLS_LIST"
+    CMD="BINANCE_API_KEY=$BINANCE_API_KEY $COLLECTOR_EXE -c 2 $TARGET_DIR $EXCH $SYMBOLS_LIST"
     
     # Send the command to the tmux window
     tmux send-keys -t "$SESSION_NAME:$EXCH" "$CMD" C-m
