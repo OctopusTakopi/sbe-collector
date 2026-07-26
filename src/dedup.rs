@@ -5,19 +5,27 @@
 //! re-established, the others keep delivering. The cost is that every message
 //! now arrives once per healthy connection, so exactly one copy has to be kept.
 //!
-//! # Why the frame is the key
+//! # Why the frame *minus its event time* is the key
 //!
-//! Every connection receives the *same bytes* for the same market event — the
-//! exchange encodes each SBE frame once and fans it out — so the frame itself
-//! identifies the event, with no need to decode a template-specific sequence
-//! field before deciding whether the frame is new.
+//! Binance does not encode an SBE frame once and fan it out. It stamps
+//! `eventTime` when it serialises for a *particular* connection, so redundant
+//! connections receive the same event with timestamps tens of microseconds
+//! apart — measured at 18-37 us on live spot data. Hashing the whole frame
+//! therefore recognises nothing as a duplicate and records every copy, which is
+//! exactly the failure this module exists to prevent.
 //!
-//! Every SBE template subscribed here makes distinct events distinguishable:
-//! depth diffs carry book update ids, trades a trade id, bestBidAsk a book
-//! update id. A content-based filter would still be unable to separate two
-//! genuinely distinct events that serialise identically, and unlike a shed
-//! frame that loss would count as a successful suppression rather than being
-//! logged — so the property above is what the approach rests on.
+//! Excluding [`EVENT_TIME`] leaves a key that still separates distinct events:
+//! depth diffs carry their book update id range, depth snapshots and bestBidAsk
+//! a book update id, trades a transact time and per-trade ids. Verified against
+//! a single-connection recording, where every frame is by construction a
+//! distinct event: 11,446 frames across two symbols produced zero collisions on
+//! this key.
+//!
+//! The residual risk is a template whose content can repeat with no change but
+//! a new event time — a partial-book snapshot pushed on a timer while the book
+//! sits still. Such a repeat carries no information, but it would be dropped
+//! rather than recorded, and unlike a shed frame that loss counts as a
+//! successful suppression rather than being logged.
 //!
 //! # Ordering
 //!
@@ -35,10 +43,20 @@
 
 use std::{
     collections::HashSet,
+    ops::Range,
     time::{Duration, Instant},
 };
 
 use tracing::{info, warn};
+
+/// The bytes of an SBE frame holding `eventTime`, excluded from the key.
+///
+/// `eventTime` is the first field of the fixed block on every template this
+/// collector subscribes to — trades (10000), bestBidAsk (10001), depth snapshot
+/// (10002) and depth diff (10003) — so it always sits directly behind the
+/// 8-byte message header. It is stamped per connection, which is what makes it
+/// useless for identifying an event and fatal to include.
+pub const EVENT_TIME: Range<usize> = 8..16;
 
 /// How far back duplicates are remembered.
 ///
@@ -126,12 +144,28 @@ impl Dedup {
         }
     }
 
-    /// True if this frame has already been seen inside the window.
+    /// The identity of an event: the frame with its [`EVENT_TIME`] stamp cut
+    /// out, since that differs between connections for one and the same event.
     ///
-    /// A `false` return records the frame, so calling this twice on the same
-    /// bytes reports the second call as a duplicate. Call it once per frame, on
+    /// A frame too short to hold the stamp is not a template this collector
+    /// knows; hashing it whole is the conservative choice, because keeping an
+    /// unrecognised frame twice is recoverable and dropping a real one is not.
+    fn key(frame: &[u8]) -> u128 {
+        if frame.len() < EVENT_TIME.end {
+            return xxhash_rust::xxh3::xxh3_128(frame);
+        }
+        let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+        hasher.update(&frame[..EVENT_TIME.start]);
+        hasher.update(&frame[EVENT_TIME.end..]);
+        hasher.digest128()
+    }
+
+    /// True if this frame's event has already been seen inside the window.
+    ///
+    /// A `false` return records the event, so calling this twice on the same
+    /// frame reports the second call as a duplicate. Call it once per frame, on
     /// the path that decides whether to keep it.
-    pub fn is_duplicate(&mut self, payload: &[u8]) -> bool {
+    pub fn is_duplicate(&mut self, frame: &[u8]) -> bool {
         if !self.enabled {
             return false;
         }
@@ -147,7 +181,7 @@ impl Dedup {
         // probability around 2^-85. A 64-bit key would be roughly 2^-21 per
         // window, which over a year of collection is a coin flip — and a
         // collision here silently discards a real frame.
-        let key = xxhash_rust::xxh3::xxh3_128(payload);
+        let key = Self::key(frame);
         if self.previous.contains(&key) || !self.current.insert(key) {
             self.duplicate += 1;
             true
@@ -217,17 +251,68 @@ impl Dedup {
 mod tests {
     use super::*;
 
-    /// An SBE frame: 8-byte header, body, then the symbol the stream bridge
-    /// appends as a `VarString8`.
-    fn frame(template_id: u16, update_id: u64) -> Vec<u8> {
+    /// An SBE frame with the real field order: 8-byte message header,
+    /// `eventTime`, then the block's identifying fields, then the symbol the
+    /// stream bridge appends as a `VarString8`.
+    ///
+    /// `event_time` is a separate argument on purpose. An earlier version of
+    /// this helper put the discriminator where `eventTime` actually lives, so
+    /// every test passed against frames that varied precisely the field real
+    /// connections stamp differently — and the filter recognised nothing as a
+    /// duplicate on live data.
+    fn frame_at(template_id: u16, event_time: i64, update_id: u64) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&[0, 0]);
         bytes.extend_from_slice(&template_id.to_le_bytes());
         bytes.extend_from_slice(&[0, 0, 0, 0]);
+        bytes.extend_from_slice(&event_time.to_le_bytes());
         bytes.extend_from_slice(&update_id.to_le_bytes());
         bytes.push(7);
         bytes.extend_from_slice(b"BTCUSDT");
         bytes
+    }
+
+    fn frame(template_id: u16, update_id: u64) -> Vec<u8> {
+        frame_at(template_id, 1_785_046_950_114_506, update_id)
+    }
+
+    /// The bug this module shipped with: Binance stamps `eventTime` when it
+    /// serialises for a particular connection, so two connections deliver the
+    /// same event with timestamps microseconds apart. If that field reaches the
+    /// key, nothing is ever a duplicate and every copy is recorded.
+    #[test]
+    fn copies_differing_only_in_event_time_are_duplicates() {
+        let mut dedup = Dedup::new(DEDUP_WINDOW, DEDUP_MAX_ENTRIES);
+        let first = frame_at(10_003, 1_785_046_950_114_506, 42);
+        let second = frame_at(10_003, 1_785_046_950_114_469, 42);
+
+        assert_ne!(first, second, "the frames differ on the wire");
+        assert!(!dedup.is_duplicate(&first));
+        assert!(
+            dedup.is_duplicate(&second),
+            "the same event from another connection must be recognised"
+        );
+    }
+
+    /// Excluding the event time must not blur distinct events together.
+    #[test]
+    fn distinct_events_sharing_an_event_time_are_both_kept() {
+        let mut dedup = Dedup::new(DEDUP_WINDOW, DEDUP_MAX_ENTRIES);
+
+        assert!(!dedup.is_duplicate(&frame_at(10_003, 1_000, 1)));
+        assert!(!dedup.is_duplicate(&frame_at(10_003, 1_000, 2)));
+        assert!(!dedup.is_duplicate(&frame_at(10_001, 1_000, 1)));
+    }
+
+    /// A frame too short to hold an event time is hashed whole rather than
+    /// panicking on the slice.
+    #[test]
+    fn a_runt_frame_is_handled_whole() {
+        let mut dedup = Dedup::new(DEDUP_WINDOW, DEDUP_MAX_ENTRIES);
+
+        assert!(!dedup.is_duplicate(b"\x00\x01\x02"));
+        assert!(dedup.is_duplicate(b"\x00\x01\x02"));
+        assert!(!dedup.is_duplicate(b""));
     }
 
     #[test]
