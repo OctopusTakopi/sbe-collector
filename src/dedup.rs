@@ -12,9 +12,12 @@
 //! identifies the event, with no need to decode a template-specific sequence
 //! field before deciding whether the frame is new.
 //!
-//! Distinct events are never byte-identical: every SBE template carries a book
-//! update id, a trade id, or an event time, so two different events differ
-//! somewhere in the frame.
+//! Every SBE template subscribed here makes distinct events distinguishable:
+//! depth diffs carry book update ids, trades a trade id, bestBidAsk a book
+//! update id. A content-based filter would still be unable to separate two
+//! genuinely distinct events that serialise identically, and unlike a shed
+//! frame that loss would count as a successful suppression rather than being
+//! logged — so the property above is what the approach rests on.
 //!
 //! # Ordering
 //!
@@ -35,7 +38,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tracing::info;
+use tracing::{info, warn};
 
 /// How far back duplicates are remembered.
 ///
@@ -45,8 +48,15 @@ use tracing::info;
 pub const DEDUP_WINDOW: Duration = Duration::from_secs(30);
 
 /// Hard ceiling on remembered keys per generation, so an unexpected message
-/// rate cannot turn the window into unbounded memory. Two generations are live
-/// at once, so the real bound is twice this — about 16 MiB of keys.
+/// rate cannot turn the window into unbounded memory.
+///
+/// Reaching it rotates early, which shortens the window below [`DEDUP_WINDOW`]
+/// — `Dedup` logs when that happens, because a window shorter than the skew
+/// between connections lets duplicates through.
+///
+/// Two generations are live at once and `hashbrown` rounds up to a power of two
+/// at a 7/8 load factor, so 500k keys reserve 2^20 buckets of 17 bytes per
+/// generation: about 36 MiB in total, retained once reached.
 pub const DEDUP_MAX_ENTRIES: usize = 500_000;
 
 const REPORT_INTERVAL: Duration = Duration::from_secs(300);
@@ -62,7 +72,8 @@ const CLOCK_CHECK_INTERVAL: u32 = 1_024;
 /// Keys are held in two generations that rotate on a timer. A lookup checks
 /// both, so anything inserted is remembered for at least [`DEDUP_WINDOW`] and
 /// at most twice that, without storing a timestamp per key or ever walking the
-/// set to expire it.
+/// set to expire it — unless [`DEDUP_MAX_ENTRIES`] forces an early rotation,
+/// which is logged.
 pub struct Dedup {
     /// `false` for a single connection, where no frame can be a duplicate.
     /// Checked before hashing, so the whole module costs one branch.
@@ -76,6 +87,7 @@ pub struct Dedup {
     unique: u64,
     duplicate: u64,
     last_report: Instant,
+    last_ceiling_warning: Option<Instant>,
 }
 
 impl Dedup {
@@ -110,6 +122,7 @@ impl Dedup {
             unique: 0,
             duplicate: 0,
             last_report: now,
+            last_ceiling_warning: None,
         }
     }
 
@@ -153,7 +166,29 @@ impl Dedup {
     fn maintain(&mut self) {
         let now = Instant::now();
 
-        if now >= self.rotate_at || self.current.len() >= self.max_entries {
+        let full = self.current.len() >= self.max_entries;
+        if now >= self.rotate_at || full {
+            // The effective window is now however long it took to fill a
+            // generation, not `self.window`. Any connection whose skew exceeds
+            // that leaks duplicates past the filter, so this must not be
+            // silent — but a ceiling that keeps being hit would log on every
+            // rotation, so restate it at the reporting cadence instead.
+            if full
+                && self
+                    .last_ceiling_warning
+                    .is_none_or(|last| now.duration_since(last) >= REPORT_INTERVAL)
+            {
+                let held = self
+                    .window
+                    .saturating_sub(self.rotate_at.saturating_duration_since(now));
+                warn!(
+                    entries = self.current.len(),
+                    ?held,
+                    configured = ?self.window,
+                    "dedup entry ceiling reached; the duplicate window is shorter than configured"
+                );
+                self.last_ceiling_warning = Some(now);
+            }
             // `clear` keeps the allocation, and the swap hands it to `current`,
             // so steady-state rotation does not allocate.
             self.previous.clear();
@@ -269,6 +304,35 @@ mod tests {
 
         assert!(dedup.current.len() <= 16);
         assert!(dedup.previous.len() <= 16);
+    }
+
+    /// A ceiling-forced rotation shortens the window below what was asked for,
+    /// so it has to leave a trace rather than silently letting duplicates
+    /// through later.
+    #[test]
+    fn a_ceiling_forced_rotation_is_reported() {
+        let mut dedup = Dedup::new(Duration::from_secs(3_600), 16);
+        assert!(dedup.last_ceiling_warning.is_none());
+
+        for update_id in 0..64 {
+            dedup.is_duplicate(&frame(10_001, update_id));
+        }
+
+        assert!(
+            dedup.last_ceiling_warning.is_some(),
+            "hitting the ceiling must not be silent"
+        );
+    }
+
+    /// A timed rotation is the normal path and must stay quiet.
+    #[test]
+    fn a_timed_rotation_is_not_reported() {
+        let mut dedup = Dedup::new(Duration::ZERO, DEDUP_MAX_ENTRIES);
+
+        dedup.is_duplicate(&frame(10_001, 1));
+        dedup.maintain();
+
+        assert!(dedup.last_ceiling_warning.is_none());
     }
 
     /// Both counters have to move, or the health signal in the log is a lie.
