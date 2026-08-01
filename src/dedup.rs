@@ -5,6 +5,11 @@
 //! re-established, the others keep delivering. The cost is that every message
 //! now arrives once per healthy connection, so exactly one copy has to be kept.
 //!
+//! A session handover creates the same overlap on a single connection — the
+//! replacement is opened before the old socket is let go — but the filter stays
+//! off there anyway. See [`Dedup::for_connections`] for why the few duplicated
+//! frames that costs are the cheaper error.
+//!
 //! # Why the frame *minus its event time* is the key
 //!
 //! Binance does not encode an SBE frame once and fan it out. It stamps
@@ -105,8 +110,10 @@ const CLOCK_CHECK_INTERVAL: u32 = 1_024;
 /// sparse feed (see [`CLOCK_CHECK_INTERVAL`]) and shorter when
 /// [`DEDUP_MAX_ENTRIES`] forces an early rotation, which is logged.
 pub struct Dedup {
-    /// `false` for a single connection, where no frame can be a duplicate.
-    /// Checked before hashing, so the whole module costs one branch.
+    /// `false` for a single connection, where duplicates are rare enough that
+    /// filtering them would cost more than it saves. See
+    /// [`Dedup::for_connections`]. Checked before hashing, so the whole module
+    /// costs one branch.
     enabled: bool,
     current: HashSet<u128>,
     previous: HashSet<u128>,
@@ -131,6 +138,14 @@ impl Dedup {
     }
 
     /// Enabled only when more than one connection can deliver the same frame.
+    ///
+    /// A session handover overlaps two sockets on a single connection too, so
+    /// this does let a handful of frames per handover — a few a day — be
+    /// recorded twice. That is the cheaper error. Filtering unconditionally
+    /// would also drop every timer-pushed partial-book snapshot that repeats
+    /// while the book sits still (see the module docs), silently and for the
+    /// life of the process. A repeated frame can be discarded when the
+    /// recording is read; one that was never written cannot be recovered.
     pub fn for_connections(connections: usize) -> Self {
         if connections > 1 {
             Self::new(DEDUP_WINDOW, DEDUP_MAX_ENTRIES)
@@ -364,7 +379,9 @@ mod tests {
         assert!(!dedup.is_duplicate(&frame(10_002, 1)));
     }
 
-    /// A single connection must not pay for a filter that cannot fire.
+    /// A single connection must not pay for a filter whose cost — silently
+    /// dropping a timer-pushed snapshot that repeats unchanged — outweighs the
+    /// handful of handover duplicates it would catch.
     #[test]
     fn a_disabled_filter_never_reports_a_duplicate() {
         let mut dedup = Dedup::disabled();

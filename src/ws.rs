@@ -35,6 +35,20 @@ pub const QUEUE_FULL_GRACE: Duration = Duration::from_secs(1);
 /// replies never have to race the read loop.
 const OUTGOING_QUEUE_CAPACITY: usize = 64;
 
+/// How long [`connect`] may spend on TCP, TLS and the websocket upgrade
+/// together.
+///
+/// Well beyond a healthy handshake from anywhere to Binance, and short enough
+/// that a black-holed connection becomes a retry rather than a task parked
+/// forever with no data flowing.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long [`Connection::flush_close`] waits for a queued close frame.
+///
+/// Only spent on a connection that is being discarded anyway, so it buys a
+/// clean close handshake without ever delaying reconnection appreciably.
+const CLOSE_FLUSH_GRACE: Duration = Duration::from_secs(1);
+
 const OVERFLOW_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 
 struct SpawnExecutor;
@@ -232,6 +246,22 @@ impl FrameSender {
             .await
             .map_err(|_| anyhow!("websocket writer stopped"))
     }
+
+    /// Start a close handshake from this side.
+    ///
+    /// Closing a healthy connection is a local decision — retiring a session
+    /// that has been replaced — so this side sends the close. Dropping the
+    /// socket instead leaves the venue holding a connection slot that this IP
+    /// is limited on. Pair with [`Connection::flush_close`] to wait for it to
+    /// reach the wire.
+    pub async fn close(&self, code: u16, reason: &str) -> Result<()> {
+        let mut payload = code.to_be_bytes().to_vec();
+        payload.extend_from_slice(reason.as_bytes());
+        self.0
+            .send(Outgoing::CloseRaw(payload))
+            .await
+            .map_err(|_| anyhow!("websocket writer stopped"))
+    }
 }
 
 /// A received websocket frame with an owned payload.
@@ -315,6 +345,30 @@ impl<S> Connection<S> {
             payload,
         })
     }
+
+    /// Wait for a queued close frame to reach the wire.
+    ///
+    /// Close frames are queued like any other: [`read`](Self::read) only
+    /// *queues* the reply it is obliged to send before handing the close frame
+    /// back, and [`FrameSender::close`] returns as soon as its frame is
+    /// accepted. Without this the caller drops the connection, [`Drop`] aborts
+    /// the writer, and the close loses the race — every disconnect then ends as
+    /// an abrupt teardown instead of a close handshake.
+    ///
+    /// The writer task stops after writing a close frame, so this returns as
+    /// soon as that frame is out rather than after the full grace period. Call
+    /// it only on the close path; nothing else ends the writer.
+    /// Calling it twice on one connection is safe: polling a `JoinHandle` whose
+    /// output has already been taken panics, so a finished writer is reported
+    /// rather than awaited again.
+    pub async fn flush_close(&mut self) {
+        if self.writer.is_finished() {
+            return;
+        }
+        if timeout(CLOSE_FLUSH_GRACE, &mut self.writer).await.is_err() {
+            warn!("close frame was not written within {CLOSE_FLUSH_GRACE:?}");
+        }
+    }
 }
 
 impl<S> Drop for Connection<S> {
@@ -328,8 +382,14 @@ where
     W: AsyncWrite + Unpin,
 {
     while let Some(outgoing) = rx.recv().await {
+        let closing = matches!(outgoing, Outgoing::CloseRaw(_));
         if let Err(error) = write.write_frame(outgoing.into_frame()).await {
             warn!(%error, "websocket write failed");
+            return;
+        }
+        // Nothing may follow a close frame, and `flush_close` waits on this
+        // task to learn that it reached the wire.
+        if closing {
             return;
         }
     }
@@ -339,7 +399,21 @@ where
 ///
 /// Accepts a pre-built `Arc<ClientConfig>` so that certificate loading is not
 /// repeated on every reconnect — just clone the Arc.
+///
+/// Bounded by [`CONNECT_TIMEOUT`]: none of the three handshakes below carries a
+/// deadline of its own, and a caller that is reconnecting has nothing to fall
+/// back on while this hangs.
 pub async fn connect(
+    url: &str,
+    api_key: Option<&str>,
+    tls: Arc<ClientConfig>,
+) -> Result<Connection> {
+    timeout(CONNECT_TIMEOUT, handshake_all(url, api_key, tls))
+        .await
+        .map_err(|_| anyhow!("connection attempt timed out after {CONNECT_TIMEOUT:?}"))?
+}
+
+async fn handshake_all(
     url: &str,
     api_key: Option<&str>,
     tls: Arc<ClientConfig>,
@@ -390,23 +464,33 @@ pub async fn connect(
     Ok(Connection::from_websocket(ws))
 }
 
+/// Both ends of an in-memory websocket, with no handshake and no network.
+///
+/// Lets the read, pong and close paths be exercised against a real
+/// `fastwebsockets` peer — including from the connector's own tests.
+#[cfg(test)]
+pub fn duplex_pair() -> (
+    Connection<tokio::io::DuplexStream>,
+    WebSocket<tokio::io::DuplexStream>,
+) {
+    use fastwebsockets::Role;
+
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let mut client = WebSocket::after_handshake(client_io, Role::Client);
+    client.set_auto_pong(false);
+    let mut server = WebSocket::after_handshake(server_io, Role::Server);
+    // The stand-in venue only ever replies when a test tells it to. Left on,
+    // its automatic replies would be written to a client that the test has
+    // already let go, and the read that was being asserted on would fail with
+    // a broken pipe instead.
+    server.set_auto_pong(false);
+    server.set_auto_close(false);
+    (Connection::from_websocket(client), server)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fastwebsockets::Role;
-
-    /// Both ends of an in-memory websocket, with no handshake and no network.
-    fn duplex_pair() -> (
-        Connection<tokio::io::DuplexStream>,
-        WebSocket<tokio::io::DuplexStream>,
-    ) {
-        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let mut client = WebSocket::after_handshake(client_io, Role::Client);
-        client.set_auto_pong(false);
-        let mut server = WebSocket::after_handshake(server_io, Role::Server);
-        server.set_auto_pong(false);
-        (Connection::from_websocket(client), server)
-    }
 
     /// The pong must actually reach the wire with the ping's exact payload.
     /// Queuing it on the writer task is not evidence that it was written.
@@ -508,6 +592,28 @@ mod tests {
             deliver(&tx, &mut overflow, 2, |_| false).await,
             Delivery::Undeliverable
         );
+    }
+
+    /// The close echo is only *queued* by `read`, and `Drop` aborts the writer.
+    /// Without `flush_close` between them the reply never reaches the wire and
+    /// every venue-initiated close ends as an abrupt teardown.
+    #[tokio::test]
+    async fn a_server_close_is_echoed_before_the_connection_is_dropped() {
+        let (mut conn, mut server) = duplex_pair();
+
+        server
+            .write_frame(Frame::close(1001, b"going away"))
+            .await
+            .unwrap();
+
+        let message = conn.read().await.unwrap();
+        assert_eq!(message.opcode, OpCode::Close);
+        conn.flush_close().await;
+        drop(conn);
+
+        let reply = server.read_frame().await.unwrap();
+        assert_eq!(reply.opcode, OpCode::Close);
+        assert_eq!(&reply.payload[2..], b"going away");
     }
 
     /// SBE market data arrives as binary frames.

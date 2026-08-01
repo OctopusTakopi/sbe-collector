@@ -578,8 +578,14 @@ mod tests {
         );
     }
 
-    /// With redundancy off, nothing is filtered — a single connection cannot
-    /// produce a duplicate, and paying for the filter would be pure overhead.
+    /// With redundancy off nothing is filtered — so the brief overlap a session
+    /// handover creates is recorded twice, deliberately. Suppressing it would
+    /// mean running the filter on every single-connection deployment, which
+    /// also drops timer-pushed snapshots that repeat unchanged; see
+    /// [`crate::dedup::Dedup::for_connections`].
+    ///
+    /// What must still hold is that the repeat is not read as a *gap*: the
+    /// continuity check has to recognise ground it has already covered.
     #[tokio::test]
     async fn a_single_connection_records_every_frame_it_receives() {
         let (writer_tx, mut writer_rx) = channel(16);
@@ -589,11 +595,25 @@ mod tests {
         for frame in &sequence {
             harness.feed(&writer_tx, frame.clone()).await.unwrap();
         }
+        // The overlap: the replacement re-delivers an event the outgoing
+        // session already handed over.
+        harness
+            .feed(&writer_tx, as_seen_by_another_connection(&sequence[3]))
+            .await
+            .unwrap();
 
         let mut written = 0;
         while writer_rx.try_recv().is_ok() {
             written += 1;
         }
-        assert_eq!(written, sequence.len());
+        assert_eq!(
+            written,
+            sequence.len() + 1,
+            "unfiltered, so the handover overlap is recorded twice"
+        );
+        assert!(
+            harness.tasks.is_empty(),
+            "a repeat is already-covered ground, not a hole to refetch"
+        );
     }
 }
