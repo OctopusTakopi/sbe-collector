@@ -209,8 +209,11 @@ mod tests {
             Some(1)
         );
 
-        let until = ban_expiry(None, BAN_BODY, Timestamp::now()).unwrap();
-        throttler.note_ban(until.checked_add(Span::new().hours(24)).unwrap());
+        // Relative to now, not to the expiry captured in `BAN_BODY`: that one
+        // is a real timestamp from a real ban, and once it passed, the ban
+        // under test was already over and this asserted nothing.
+        let until = Timestamp::now().checked_add(Span::new().hours(24)).unwrap();
+        throttler.note_ban(until);
 
         assert_eq!(
             throttler.execute(SNAPSHOT_WEIGHT, async { 2 }).await,
