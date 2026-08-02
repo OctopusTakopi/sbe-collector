@@ -56,9 +56,15 @@ done
 tmux new-session -d -s "$SESSION_NAME" -n "init"
 
 # The collector reads the key from its environment, so hand it over through the
-# session environment rather than the command line. A key in the command would
-# be typed into the pane — recorded in that shell's history file, and visible in
-# `ps` to every user on the host for as long as the collector runs.
+# session environment rather than the collector's command line, where it would
+# be typed into the pane — recorded in that shell's history file, and readable
+# in `ps` by every user on the host for as long as the collector runs.
+#
+# This narrows that exposure rather than removing it: the key is on *this*
+# command's argv while the tmux client runs, and `tmux show-environment -t
+# sbe_collector` prints it afterwards to anyone who can reach the socket. Closing
+# those would mean the collector reading a mode-600 file instead of an
+# environment variable.
 tmux set-environment -t "$SESSION_NAME" BINANCE_API_KEY "$BINANCE_API_KEY"
 
 for MAP in "${MAPPINGS[@]}"; do
@@ -86,18 +92,23 @@ for MAP in "${MAPPINGS[@]}"; do
     tmux send-keys -t "$SESSION_NAME:$EXCH" "$CMD" C-m
 done
 
-# Cleanup the initial window
-tmux kill-window -t "$SESSION_NAME:init"
+# Cleanup the initial window. The collectors are live by now, so a tidy-up that
+# fails — a stale server, a window already gone — must not turn a successful
+# deployment into a non-zero exit under `set -e`.
+tmux kill-window -t "$SESSION_NAME:init" || true
 
 echo "SBE Collection started in tmux session: $SESSION_NAME"
 echo "Attach with: tmux attach-session -t $SESSION_NAME"
 
-# Automatically attach, but only when there is a terminal to attach to.
+# Automatically attach, but only when there is somewhere to attach to.
 #
 # The collectors are already running by this point, so this is a convenience and
-# never a failure. Without the guard, `set -e` turns "no TTY" into a non-zero
-# exit — so cron, systemd or `ssh host ./run_sbe.sh` records a successful
-# deployment as failed, and a retry would kill the session it just started.
-if [ -t 0 ] && [ -t 1 ]; then
+# never a failure. Without the guard, `set -e` turns a refused attach into a
+# non-zero exit — so cron, systemd or `ssh host ./run_sbe.sh` records a
+# successful deployment as failed, and a retry would kill the session it just
+# started. `$TMUX` is checked too: run from inside a tmux pane, which is how an
+# operator on a remote host usually runs this, both stdin and stdout are
+# terminals but tmux still refuses to nest and exits non-zero.
+if [ -z "${TMUX:-}" ] && [ -t 0 ] && [ -t 1 ]; then
     tmux attach-session -t "$SESSION_NAME"
 fi
