@@ -177,7 +177,8 @@ fn print_sbe_record(nanos: i64, data: &[u8]) {
             if let Ok((blk, _)) = TradesBlock::read_from_prefix(&data[8..]) {
                 let mut off = 8 + block_len;
                 // GroupSizeEncoding for trades: 6 bytes, numInGroup is uint32.
-                let count = read_trades_group_count(data, &mut off);
+                let (count, entry_len) =
+                    read_trades_group_header(data, &mut off).unwrap_or((0, 0));
                 println!(
                     "[{nanos}] S {msg_type} {symbol_str} trades={count} t={}",
                     blk.event_time.get()
@@ -185,7 +186,7 @@ fn print_sbe_record(nanos: i64, data: &[u8]) {
                 // Print first few trade entries.
                 let scale = |m: i64, e: i8| (m as f64) * 10f64.powi(e as i32);
                 for i in 0..count {
-                    if off + std::mem::size_of::<TradeEntry>() > data.len() {
+                    if off + entry_len.max(std::mem::size_of::<TradeEntry>()) > data.len() {
                         break;
                     }
                     if let Ok((entry, _)) = TradeEntry::read_from_prefix(&data[off..]) {
@@ -198,10 +199,13 @@ fn print_sbe_record(nanos: i64, data: &[u8]) {
                                 entry.is_buyer_maker,
                             );
                         }
-                        off += std::mem::size_of::<TradeEntry>();
                     } else {
                         break;
                     }
+                    // Skip the wire blockLength, not the compile-time struct
+                    // size: a newer schema version appends fields to the entry,
+                    // and only the dimension header knows the true stride.
+                    off += entry_len;
                 }
                 if count > 5 {
                     println!("  ...");
@@ -336,18 +340,21 @@ fn read_depth_group_header(data: &[u8], offset: &mut usize) -> Option<(usize, us
     ))
 }
 
-/// Read a `GroupSizeEncoding` header (6 bytes) used by the TradesStreamEvent group.
-/// Returns the numInGroup count (u32 truncated to usize).
-fn read_trades_group_count(data: &[u8], offset: &mut usize) -> usize {
+/// Read a `GroupSizeEncoding` header (6 bytes) used by the TradesStreamEvent
+/// group. Returns (numInGroup as usize, entry_block_length).
+fn read_trades_group_header(data: &[u8], offset: &mut usize) -> Option<(usize, usize)> {
     const GSE_LEN: usize = std::mem::size_of::<GroupSizeEncoding>(); // 6
     if *offset + GSE_LEN > data.len() {
-        return 0;
+        return None;
     }
     let Ok((gse, _)) = GroupSizeEncoding::read_from_prefix(&data[*offset..]) else {
-        return 0;
+        return None;
     };
     *offset += GSE_LEN;
-    gse.num_in_group.get() as usize
+    Some((
+        gse.num_in_group.get() as usize,
+        gse.block_length.get() as usize,
+    ))
 }
 
 /// Extract the terminal `VarString8` symbol appended by the Binance stream bridge.
