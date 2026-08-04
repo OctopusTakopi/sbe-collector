@@ -177,8 +177,7 @@ fn print_sbe_record(nanos: i64, data: &[u8]) {
             if let Ok((blk, _)) = TradesBlock::read_from_prefix(&data[8..]) {
                 let mut off = 8 + block_len;
                 // GroupSizeEncoding for trades: 6 bytes, numInGroup is uint32.
-                let (count, entry_len) =
-                    read_trades_group_header(data, &mut off).unwrap_or((0, 0));
+                let (count, entry_len) = read_trades_group_header(data, &mut off).unwrap_or((0, 0));
                 println!(
                     "[{nanos}] S {msg_type} {symbol_str} trades={count} t={}",
                     blk.event_time.get()
