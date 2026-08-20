@@ -17,7 +17,11 @@ use tokio::{
 };
 use tracing::{debug, error, info, warn};
 
-use crate::ws::{Connection, Delivery, Overflow};
+use crate::{
+    quality::QualityReporter,
+    readiness::Readiness,
+    ws::{Connection, Delivery, Overflow},
+};
 
 const WSS_HOST: &str = "stream-sbe.binance.com";
 const WSS_PORT: u16 = 9443;
@@ -300,6 +304,7 @@ fn request_replacement(
 /// still delivering, which is the whole point of the venue announcing a
 /// shutdown ahead of it. The session stops when `retire` fires, when the venue
 /// closes the socket, or when it falls silent.
+#[allow(clippy::too_many_arguments)]
 async fn run_session<S>(
     mut conn: Connection<S>,
     id: SessionId,
@@ -308,14 +313,18 @@ async fn run_session<S>(
     events: mpsc::Sender<Event>,
     mut retire: oneshot::Receiver<()>,
     max_age: Duration,
+    quality: QualityReporter,
+    readiness: Readiness,
 ) -> SessionEnd
 where
     S: AsyncRead + Unpin,
 {
     let sender = conn.sender();
-    let mut overflow = Overflow::new("binance-sbe-spot");
+    let mut overflow =
+        Overflow::with_reporter(format!("binance-sbe-spot/connection-{connection}"), quality);
     let opened = Instant::now();
-    let mut live = false;
+    let mut liveness = None;
+    let mut announced_live = false;
     let mut relieved = false;
 
     loop {
@@ -381,18 +390,26 @@ where
         match message.opcode {
             OpCode::Binary => {
                 match deliver_frame(&ws_tx, &mut overflow, message.payload).await {
-                    Delivery::Sent | Delivery::Dropped => {
-                        // Liveness is a property of the *socket* — this session
-                        // is connected and reading — not of the consumer. A
-                        // shed frame proves the socket just as well, and under
-                        // sustained shedding nothing would ever be `Sent`, so
-                        // requiring it would leave the predecessor running and
-                        // put a second producer on the queue that is already
-                        // saturated. What made shedding dangerous here was
-                        // retiring a session that still held a backlog, and
-                        // that is what `drain_buffered` now answers.
-                        if !live {
-                            live = true;
+                    Delivery::Sent => {
+                        if liveness.is_none() {
+                            liveness =
+                                Some(readiness.source_live(format!(
+                                    "binance-sbe-spot/connection-{connection}"
+                                )));
+                        }
+                        if !announced_live {
+                            announced_live = true;
+                            let _ = events.try_send(Event::Live(id));
+                        }
+                    }
+                    Delivery::Dropped => {
+                        // The socket is alive, but this process is not carrying
+                        // the feed. Revoke handover readiness until delivery
+                        // succeeds again; the in-process replacement scheduler
+                        // may still retire an older socket after this first frame.
+                        liveness = None;
+                        if !announced_live {
+                            announced_live = true;
                             let _ = events.try_send(Event::Live(id));
                         }
                     }
@@ -492,6 +509,8 @@ pub(crate) async fn keep_connection(
     api_key: String,
     connection: usize,
     ws_tx: Sender<(Timestamp, Bytes)>,
+    quality: QualityReporter,
+    readiness: Readiness,
 ) {
     // Build TLS config once for the lifetime of this task.
     let tls = Arc::new(crate::ws::build_tls_config());
@@ -561,6 +580,8 @@ pub(crate) async fn keep_connection(
             event_tx.clone(),
             retire_rx,
             max_age,
+            quality.clone(),
+            readiness.clone(),
         ));
 
         let step = loop {
@@ -686,6 +707,8 @@ mod tests {
                 event_tx,
                 retire_rx,
                 max_age,
+                QualityReporter::disabled(),
+                Readiness::new(1).0,
             ));
             Self {
                 server,

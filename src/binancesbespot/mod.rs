@@ -4,8 +4,10 @@ mod ws;
 
 use crate::dedup::Dedup;
 use crate::error::ConnectorError;
-use crate::feed::Feed;
+use crate::feed::{BackgroundResult, Feed};
 use crate::file::{Symbol, Tag, WriteRecord};
+use crate::quality::QualityReporter;
+use crate::readiness::Readiness;
 use crate::sbe_types::{DepthDiffBlock, MessageHeader, TEMPLATE_DEPTH_DIFF};
 use crate::throttler::Throttler;
 use bytes::Bytes;
@@ -96,7 +98,8 @@ pub async fn handle(
     dedup: &mut Dedup,
     client: &reqwest::Client,
     throttler: &Throttler,
-    tasks: &mut JoinSet<()>,
+    quality: &QualityReporter,
+    tasks: &mut JoinSet<BackgroundResult>,
 ) -> Result<(), ConnectorError> {
     // Before anything reads book update ids. A second copy of a depth diff
     // starts at the update id after the one the first copy already consumed, so
@@ -122,6 +125,14 @@ pub async fn handle(
             template_id,
             "could not identify symbol in SBE frame — writing to 'unknown'"
         );
+        quality.report(crate::quality::QualityEvent::FeedDegraded {
+            at_ns: crate::quality::QualityEvent::now_ns(),
+            source: "binance-sbe-spot".to_owned(),
+            detail: format!(
+                "could not identify symbol in SBE frame (template_id={template_id}, len={})",
+                data.len()
+            ),
+        });
         writer_tx
             .send(WriteRecord {
                 recv_time,
@@ -172,6 +183,15 @@ pub async fn handle(
                         first_u,
                         *prev
                     );
+                    quality.report(crate::quality::QualityEvent::FeedDegraded {
+                        at_ns: crate::quality::QualityEvent::now_ns(),
+                        source: format!("binance-sbe-spot/{symbol}"),
+                        detail: format!(
+                            "depth gap: expected first_u={} but got {first_u} (prev_u={})",
+                            prev.saturating_add(1),
+                            *prev
+                        ),
+                    });
 
                     let sym_for_spawn = Symbol::clone(&symbol);
                     let writer_tx_ = writer_tx.clone();
@@ -211,6 +231,7 @@ pub async fn handle(
                                 );
                             }
                         }
+                        Ok(())
                     });
                 }
                 // Only ever forwards. Redundant connections can deliver an
@@ -247,6 +268,7 @@ async fn write(
         .map_err(|_| ConnectorError::WriterClosed)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_collection(
     streams: Vec<String>,
     symbols: Vec<String>,
@@ -254,6 +276,8 @@ pub async fn run_collection(
     api_key: String,
     shutdown: watch::Receiver<bool>,
     connections: usize,
+    quality: QualityReporter,
+    readiness: Readiness,
 ) -> Result<(), anyhow::Error> {
     let connections = connections.max(1);
     let mut dedup = Dedup::for_connections(connections);
@@ -262,7 +286,7 @@ pub async fn run_collection(
     let (ws_tx, ws_rx) =
         channel::<(Timestamp, Bytes)>(crate::WS_QUEUE_CAPACITY.saturating_mul(connections));
     let mut feed = Feed::new(ws_rx, shutdown);
-    let mut tasks = JoinSet::new();
+    let mut tasks: JoinSet<BackgroundResult> = JoinSet::new();
     let canonical_symbols: Vec<Symbol> = symbols
         .iter()
         .map(|symbol| Symbol::from(symbol.to_ascii_lowercase()))
@@ -274,10 +298,17 @@ pub async fn run_collection(
         let symbols = symbols.clone();
         let api_key = api_key.clone();
         let ws_tx = ws_tx.clone();
+        let quality = quality.clone();
+        let readiness = readiness.clone();
         tasks.spawn(async move {
             tokio::time::sleep(crate::CONNECT_STAGGER * connection as u32).await;
-            keep_connection(streams, symbols, api_key, connection, ws_tx).await;
-            tracing::error!(connection, "the websocket connection task exited");
+            keep_connection(
+                streams, symbols, api_key, connection, ws_tx, quality, readiness,
+            )
+            .await;
+            Err(anyhow::anyhow!(
+                "websocket connection supervisor {connection} exited"
+            ))
         });
     }
     // The clones above are the only senders that should keep the feed open;
@@ -300,27 +331,13 @@ pub async fn run_collection(
         let throttler = throttler.clone();
         tasks.spawn(async move {
             snapshot::snapshot_loop(symbols, writer_tx, client, throttler, 3600).await;
-            tracing::error!("the periodic depth-snapshot task exited");
+            Err(anyhow::anyhow!("periodic depth-snapshot task exited"))
         });
     }
 
     let mut prev_u_map = HashMap::new();
 
-    let mut messages_before_reap = 1_024;
-    while let Some((recv_time, data)) = feed.recv(&mut tasks).await {
-        messages_before_reap -= 1;
-        if messages_before_reap == 0 {
-            while let Some(result) = tasks.try_join_next() {
-                // Cancellation is how shutdown stops these tasks; only a panic
-                // is worth reporting.
-                if let Err(error) = result
-                    && !error.is_cancelled()
-                {
-                    tracing::error!(?error, "background task failed");
-                }
-            }
-            messages_before_reap = 1_024;
-        }
+    while let Some((recv_time, data)) = feed.recv(&mut tasks).await? {
         if let Err(error) = handle(
             data,
             &writer_tx,
@@ -330,6 +347,7 @@ pub async fn run_collection(
             &mut dedup,
             &client,
             &throttler,
+            &quality,
             &mut tasks,
         )
         .await
@@ -403,7 +421,8 @@ mod tests {
         dedup: Dedup,
         client: reqwest::Client,
         throttler: Throttler,
-        tasks: JoinSet<()>,
+        quality: QualityReporter,
+        tasks: JoinSet<BackgroundResult>,
     }
 
     impl Harness {
@@ -416,6 +435,7 @@ mod tests {
                 // No budget: the gap path must never issue a live
                 // request to Binance from a unit test.
                 throttler: Throttler::new(0),
+                quality: QualityReporter::disabled(),
                 tasks: JoinSet::new(),
             }
         }
@@ -434,6 +454,7 @@ mod tests {
                 &mut self.dedup,
                 &self.client,
                 &self.throttler,
+                &self.quality,
                 &mut self.tasks,
             )
             .await
