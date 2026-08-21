@@ -121,8 +121,9 @@ struct Series {
     files: Vec<DatedFile>,
 }
 
-/// Discover legacy daily and current segmented zstd files under the roots and
-/// group them into per-(directory, symbol) series in recording order.
+/// Discover daily files, handover sidecars, and legacy segmented zstd files
+/// under the roots and group them into per-(directory, symbol) series in
+/// recording order.
 fn discover(roots: &[PathBuf]) -> Result<Vec<Series>> {
     let mut map: BTreeMap<(PathBuf, String), Vec<DatedFile>> = BTreeMap::new();
     let mut stack: Vec<PathBuf> = Vec::new();
@@ -159,7 +160,9 @@ fn discover(roots: &[PathBuf]) -> Result<Vec<Series>> {
         }
     }
     if skipped > 0 {
-        eprintln!("note: skipped {skipped} .zst file(s) not named <symbol>_<YYYYMMDD>.zst");
+        eprintln!(
+            "note: skipped {skipped} .zst file(s) not named <symbol>_<YYYYMMDD>.zst or a handover sidecar"
+        );
     }
 
     let mut series: Vec<Series> = map
@@ -188,14 +191,16 @@ fn dated_file(path: &Path) -> Option<(String, DatedFile)> {
         return None;
     }
     let stem = path.file_stem()?.to_str()?;
-    // Current segmented form: <symbol>_<date>_<segment-start-ns>_<run-id>.zst.
-    // `rsplitn` preserves underscores in exchange symbols.
+    // Legacy segmented form: <symbol>_<date>_<segment-start-ns>_<run-id>.zst.
+    // `rsplitn` preserves underscores in exchange symbols. The segment start is
+    // epoch nanoseconds, not an 8-digit YYYYMMDD.
     let mut parts = stem.rsplitn(4, '_');
     let run_id = parts.next()?.to_owned();
     let segment_start = parts.next();
     let date_str = parts.next();
     let symbol = parts.next();
     if let (Some(segment_start), Some(date_str), Some(symbol)) = (segment_start, date_str, symbol)
+        && segment_start.len() != 8
         && let (Ok(segment_start_ns), Ok(date)) = (
             segment_start.parse::<i64>(),
             civil::Date::strptime("%Y%m%d", date_str),
@@ -212,7 +217,26 @@ fn dated_file(path: &Path) -> Option<(String, DatedFile)> {
         ));
     }
 
-    // Legacy daily form: <symbol>_<date>.zst.
+    // Handover sidecar: <symbol>_<date>_<run-id>.zst.
+    let mut parts = stem.rsplitn(3, '_');
+    let sidecar_run = parts.next()?.to_owned();
+    let date_str = parts.next();
+    let symbol = parts.next();
+    if let (Some(date_str), Some(symbol)) = (date_str, symbol)
+        && let Ok(date) = civil::Date::strptime("%Y%m%d", date_str)
+    {
+        return Some((
+            symbol.to_owned(),
+            DatedFile {
+                path: path.to_path_buf(),
+                date,
+                segment_start_ns: i64::MIN,
+                run_id: Some(sidecar_run),
+            },
+        ));
+    }
+
+    // Daily form: <symbol>_<date>.zst.
     let (symbol, date_str) = stem.rsplit_once('_')?;
     let date = civil::Date::strptime("%Y%m%d", date_str).ok()?;
     Some((
@@ -741,20 +765,17 @@ fn scan_series(series: &Series, min_gap_ns: i64, exact: bool) -> SeriesReport {
 
         let mut run_indices: HashMap<&str, usize> = HashMap::new();
         for df in &series.files[first..end] {
-            if let Some(run_id) = df.run_id.as_deref() {
-                let run_id = logical_run_id(run_id);
-                let next = run_indices.len();
-                run_indices.entry(run_id).or_insert(next);
-            }
+            let run_id = df.run_id.as_deref().map(logical_run_id).unwrap_or("");
+            let next = run_indices.len();
+            run_indices.entry(run_id).or_insert(next);
         }
-        let overlapping_runs = key.1 != i64::MIN && run_indices.len() > 1;
+        let overlapping_runs = run_indices.len() > 1;
         if overlapping_runs {
             let mut records = Vec::new();
             let mut decode_error = false;
             for df in &series.files[first..end] {
-                let source = *run_indices
-                    .get(logical_run_id(df.run_id.as_deref().expect("segmented run")))
-                    .expect("run indexed");
+                let source_key = df.run_id.as_deref().map(logical_run_id).unwrap_or("");
+                let source = *run_indices.get(source_key).expect("run indexed");
                 let report = read_file(df, |recv, tag, payload| {
                     records.push(RawRecord {
                         recv,
@@ -773,8 +794,9 @@ fn scan_series(series: &Series, min_gap_ns: i64, exact: bool) -> SeriesReport {
                 scan.prev_recv = None;
             }
         } else {
-            // Legacy daily files and ordinary single-run segments stay fully
-            // streaming and preserve the order actually recorded on disk.
+            // Daily files, handover sidecars without a peer, and ordinary
+            // single-run segments stay fully streaming and preserve the order
+            // actually recorded on disk.
             for df in &series.files[first..end] {
                 let report = read_file(df, |recv, tag, payload| {
                     scan.process_record(recv, tag, payload, min_gap_ns);
@@ -1383,6 +1405,24 @@ mod tests {
         assert_eq!(file.date, civil::Date::new(2026, 8, 20).unwrap());
         assert_eq!(file.segment_start_ns, 1_787_200_000_000_000_000);
         assert_eq!(file.run_id.as_deref(), Some("1787200000000000001-42"));
+    }
+
+    #[test]
+    fn sidecar_filename_is_grouped_with_the_daily_file() {
+        let (symbol, file) =
+            dated_file(Path::new("btc_usdt_20260821_1787200000000000001-42.zst")).unwrap();
+        assert_eq!(symbol, "btc_usdt");
+        assert_eq!(file.date, civil::Date::new(2026, 8, 21).unwrap());
+        assert_eq!(file.segment_start_ns, i64::MIN);
+        assert_eq!(file.run_id.as_deref(), Some("1787200000000000001-42"));
+    }
+
+    #[test]
+    fn daily_filename_has_no_run_id() {
+        let (symbol, file) = dated_file(Path::new("btcusdt_20260821.zst")).unwrap();
+        assert_eq!(symbol, "btcusdt");
+        assert_eq!(file.date, civil::Date::new(2026, 8, 21).unwrap());
+        assert!(file.run_id.is_none());
     }
 
     #[test]
