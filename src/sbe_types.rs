@@ -1,4 +1,7 @@
-#![allow(dead_code, clippy::identity_op)]
+//! Fixed-layout parts of the Binance spot stream schema (`stream_1_0.xml`).
+
+use std::ops::Range;
+
 use zerocopy::byteorder::LittleEndian;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
@@ -6,7 +9,15 @@ type U16LE = zerocopy::byteorder::U16<LittleEndian>;
 type U32LE = zerocopy::byteorder::U32<LittleEndian>;
 type I64LE = zerocopy::byteorder::I64<LittleEndian>;
 
-// ── SBE Wire Header (8 bytes) ────────────────────────────────────────────────
+pub const TEMPLATE_TRADES: u16 = 10000;
+pub const TEMPLATE_BEST_BID_ASK: u16 = 10001;
+pub const TEMPLATE_DEPTH_SNAPSHOT: u16 = 10002;
+pub const TEMPLATE_DEPTH_DIFF: u16 = 10003;
+
+/// The bytes of `eventTime`: the first fixed-block field of every template
+/// above, right behind the 8-byte message header.
+pub const EVENT_TIME: Range<usize> = 8..16;
+
 #[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned, Debug, Copy, Clone)]
 #[repr(C)]
 pub struct MessageHeader {
@@ -16,56 +27,26 @@ pub struct MessageHeader {
     pub version: U16LE,
 }
 
-// ── Group size encodings ──────────────────────────────────────────────────────
-//
-// The schema defines TWO distinct dimension composites:
-//
-//   groupSizeEncoding  (used by TradesStreamEvent):
-//     blockLength : uint16  (2 bytes)
-//     numInGroup  : uint32  (4 bytes)   ← 32-bit!
-//     Total: 6 bytes
-//
-//   groupSize16Encoding  (used by Depth Snapshot + Diff):
-//     blockLength : uint16  (2 bytes)
-//     numInGroup  : uint16  (2 bytes)   ← 16-bit
-//     Total: 4 bytes
-//
-// Using the wrong one shifts every subsequent parse by ±2 bytes — silent corruption.
-
-/// `groupSizeEncoding` — used by `TradesStreamEvent` (id=10000).
-/// Wire size: 6 bytes.
+/// `groupSizeEncoding`, the trades group's dimension: a `uint32` count, so
+/// 6 bytes. Mistaking it for [`GroupSize16Encoding`] shifts every later field.
 #[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned, Debug, Copy, Clone)]
 #[repr(C)]
 pub struct GroupSizeEncoding {
     pub block_length: U16LE,
-    pub num_in_group: U32LE, // uint32 per schema
+    pub num_in_group: U32LE,
 }
 
-/// `groupSize16Encoding` — used by `DepthSnapshotStreamEvent` (id=10002) and
-/// `DepthDiffStreamEvent` (id=10003).
-/// Wire size: 4 bytes.
+/// `groupSize16Encoding`, the depth groups' dimension: a `uint16` count, so
+/// 4 bytes.
 #[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned, Debug, Copy, Clone)]
 #[repr(C)]
 pub struct GroupSize16Encoding {
     pub block_length: U16LE,
-    pub num_in_group: U16LE, // uint16 per schema
+    pub num_in_group: U16LE,
 }
 
-// ── Message IDs ───────────────────────────────────────────────────────────────
-pub const TEMPLATE_TRADES: u16 = 10000;
-pub const TEMPLATE_BEST_BID_ASK: u16 = 10001;
-pub const TEMPLATE_DEPTH_SNAPSHOT: u16 = 10002;
-pub const TEMPLATE_DEPTH_DIFF: u16 = 10003;
-
-// ── TradesStreamEvent (id=10000) fixed block ──────────────────────────────────
-//
-// Schema fixed block (blockLength = 18):
-//   eventTime     : utcTimestampUs (int64)
-//   transactTime  : utcTimestampUs (int64)
-//   priceExponent : exponent8 (int8)
-//   qtyExponent   : exponent8 (int8)
-//
-// Followed by group "trades" with groupSizeEncoding (6 bytes), then N entries.
+/// `TradesStreamEvent` fixed block (18 bytes), followed by the trades group
+/// and the symbol.
 #[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned, Debug, Copy, Clone)]
 #[repr(C)]
 pub struct TradesBlock {
@@ -75,34 +56,19 @@ pub struct TradesBlock {
     pub qty_exponent: i8,
 }
 
-// TradesStreamEvent group "trades" entry (25 bytes per entry):
-//   id            : tradeId  (int64)        ← was MISSING in old code
-//   price         : mantissa64 (int64)
-//   qty           : mantissa64 (int64)
-//   isBuyerMaker  : boolEnum (uint8)
-//   isBestMatch   : constant True — NOT present on the wire
+/// One trades group entry (25 bytes). `isBestMatch` is a schema constant and
+/// not on the wire.
 #[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned, Debug, Copy, Clone)]
 #[repr(C)]
 pub struct TradeEntry {
-    pub id: I64LE, // tradeId — was phantom `time` field before
+    pub id: I64LE,
     pub price: I64LE,
     pub qty: I64LE,
-    pub is_buyer_maker: u8, // boolEnum: 0=False, 1=True
+    /// `boolEnum`: 0 false, 1 true.
+    pub is_buyer_maker: u8,
 }
 
-// ── BestBidAskStreamEvent (id=10001) fixed block (blockLength = 50) ───────────
-//
-// Schema:
-//   eventTime     : utcTimestampUs (int64)
-//   bookUpdateId  : updateId (int64)
-//   priceExponent : exponent8 (int8)
-//   qtyExponent   : exponent8 (int8)
-//   bidPrice      : mantissa64 (int64)
-//   bidQty        : mantissa64 (int64)
-//   askPrice      : mantissa64 (int64)
-//   askQty        : mantissa64 (int64)
-//
-// No groups. Followed immediately by symbol VarString8.
+/// `BestBidAskStreamEvent` fixed block (50 bytes), followed by the symbol.
 #[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned, Debug, Copy, Clone)]
 #[repr(C)]
 pub struct BestBidAskBlock {
@@ -116,16 +82,8 @@ pub struct BestBidAskBlock {
     pub ask_qty: I64LE,
 }
 
-// ── DepthSnapshotStreamEvent (id=10002) fixed block (blockLength = 18) ────────
-//
-// Schema:
-//   eventTime     : utcTimestampUs (int64)
-//   bookUpdateId  : updateId (int64)
-//   priceExponent : exponent8 (int8)
-//   qtyExponent   : exponent8 (int8)
-//
-// Followed by group "bids" (groupSize16Encoding), group "asks" (groupSize16Encoding),
-// then symbol VarString8.
+/// `DepthSnapshotStreamEvent` fixed block (18 bytes), followed by the bids
+/// and asks groups and the symbol.
 #[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned, Debug, Copy, Clone)]
 #[repr(C)]
 pub struct DepthSnapshotBlock {
@@ -135,17 +93,8 @@ pub struct DepthSnapshotBlock {
     pub qty_exponent: i8,
 }
 
-// ── DepthDiffStreamEvent (id=10003) fixed block (blockLength = 26) ─────────────
-//
-// Schema:
-//   eventTime          : utcTimestampUs (int64)
-//   firstBookUpdateId  : updateId (int64)
-//   lastBookUpdateId   : updateId (int64)
-//   priceExponent      : exponent8 (int8)
-//   qtyExponent        : exponent8 (int8)
-//
-// Followed by group "bids" (groupSize16Encoding), group "asks" (groupSize16Encoding),
-// then symbol VarString8.
+/// `DepthDiffStreamEvent` fixed block (26 bytes), followed by the bids and
+/// asks groups and the symbol.
 #[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned, Debug, Copy, Clone)]
 #[repr(C)]
 pub struct DepthDiffBlock {
@@ -156,7 +105,7 @@ pub struct DepthDiffBlock {
     pub qty_exponent: i8,
 }
 
-// ── Shared depth level entry (16 bytes, used in both Snapshot and Diff) ────────
+/// One bids or asks entry of a depth snapshot or diff (16 bytes).
 #[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned, Debug, Copy, Clone)]
 #[repr(C)]
 pub struct DepthEntry {
@@ -164,23 +113,21 @@ pub struct DepthEntry {
     pub qty: I64LE,
 }
 
-// ── VarString8 decoder — 1-byte length prefix ─────────────────────────────────
-#[inline(always)]
-pub fn get_var_str_u8<'a>(data: &'a [u8], offset: &mut usize) -> &'a [u8] {
-    if *offset + 1 > data.len() {
-        return &[];
-    }
-    let len = data[*offset] as usize;
-    *offset += 1;
-    if *offset + len > data.len() {
-        return &[];
-    }
-    let s = &data[*offset..*offset + len];
-    *offset += len;
-    s
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[inline(always)]
-pub fn format_decimal(mantissa: i64, exponent: i8) -> f64 {
-    (mantissa as f64) * 10f64.powi(exponent as i32)
+    #[test]
+    fn wire_sizes_match_the_schema() {
+        assert_eq!(size_of::<MessageHeader>(), 8);
+        assert_eq!(size_of::<GroupSizeEncoding>(), 6);
+        assert_eq!(size_of::<GroupSize16Encoding>(), 4);
+        assert_eq!(size_of::<TradesBlock>(), 18);
+        assert_eq!(size_of::<TradeEntry>(), 25);
+        assert_eq!(size_of::<BestBidAskBlock>(), 50);
+        assert_eq!(size_of::<DepthSnapshotBlock>(), 18);
+        assert_eq!(size_of::<DepthDiffBlock>(), 26);
+        assert_eq!(size_of::<DepthEntry>(), 16);
+        assert_eq!(EVENT_TIME.start, size_of::<MessageHeader>());
+    }
 }

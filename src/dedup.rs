@@ -52,20 +52,11 @@
 
 use std::{
     collections::HashSet,
-    ops::Range,
     time::{Duration, Instant},
 };
 
+use sbe_collector::sbe_types::EVENT_TIME;
 use tracing::{info, warn};
-
-/// The bytes of an SBE frame holding `eventTime`, excluded from the key.
-///
-/// `eventTime` is the first field of the fixed block on every template this
-/// collector subscribes to — trades (10000), bestBidAsk (10001), depth snapshot
-/// (10002) and depth diff (10003) — so it always sits directly behind the
-/// 8-byte message header. It is stamped per connection, which is what makes it
-/// useless for identifying an event and fatal to include.
-pub const EVENT_TIME: Range<usize> = 8..16;
 
 /// How far back duplicates are remembered.
 ///

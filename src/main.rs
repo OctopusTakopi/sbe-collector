@@ -6,7 +6,6 @@ mod file;
 mod handover;
 mod quality;
 mod readiness;
-mod sbe_types;
 mod throttler;
 mod ws;
 

@@ -3,9 +3,6 @@
 //! Usage:
 //!   cargo run --bin reader -- <file.zst> [<file2.zst> ...]
 
-#[path = "../sbe_types.rs"]
-mod sbe_types;
-
 use std::{
     env,
     fs::File,
@@ -13,8 +10,9 @@ use std::{
     path::Path,
 };
 
-use sbe_types::{
-    DepthEntry, GroupSize16Encoding, GroupSizeEncoding, MessageHeader, TradeEntry, TradesBlock,
+use sbe_collector::sbe_types::{
+    self, DepthEntry, GroupSize16Encoding, GroupSizeEncoding, MessageHeader, TEMPLATE_BEST_BID_ASK,
+    TEMPLATE_DEPTH_DIFF, TEMPLATE_DEPTH_SNAPSHOT, TEMPLATE_TRADES, TradeEntry, TradesBlock,
 };
 use zerocopy::FromBytes;
 use zstd::stream::read::Decoder as ZstdDecoder;
@@ -22,12 +20,6 @@ use zstd::stream::read::Decoder as ZstdDecoder;
 const TAG_SBE: u8 = b'S';
 const TAG_REST: u8 = b'R';
 const FRAME_HEADER_LEN: usize = 13; // 8 (nanos) + 1 (tag) + 4 (payload_len)
-
-// Message IDs
-const TEMPLATE_TRADES: u16 = 10000;
-const TEMPLATE_BEST_BID_ASK: u16 = 10001;
-const TEMPLATE_DEPTH_SNAPSHOT: u16 = 10002;
-const TEMPLATE_DEPTH_DIFF: u16 = 10003;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let files: Vec<String> = env::args().skip(1).collect();

@@ -15,14 +15,18 @@ use tokio::{
 use tracing::{error, warn};
 use zerocopy::FromBytes;
 
+use sbe_collector::{
+    record::Tag,
+    sbe_types::{DepthDiffBlock, MessageHeader, TEMPLATE_DEPTH_DIFF},
+};
+
 use crate::{
     dedup::Dedup,
     error::ConnectorError,
     feed::{BackgroundResult, Feed},
-    file::{Symbol, Tag, WriteRecord},
+    file::{Symbol, WriteRecord},
     quality::{QualityEvent, QualityReporter},
     readiness::Readiness,
-    sbe_types::{DepthDiffBlock, MessageHeader, TEMPLATE_DEPTH_DIFF},
     throttler::{SNAPSHOT_WEIGHT_BUDGET, Throttler},
 };
 use snapshot::Snapshots;
@@ -302,6 +306,7 @@ pub async fn run_collection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sbe_collector::sbe_types::EVENT_TIME;
     use tokio::sync::mpsc::{Receiver, channel};
 
     #[test]
@@ -344,8 +349,8 @@ mod tests {
     /// the per-connection `eventTime`.
     fn as_seen_by_another_connection(frame: &Bytes) -> Bytes {
         let mut copy = frame.to_vec();
-        let stamp = i64::from_le_bytes(copy[crate::dedup::EVENT_TIME].try_into().unwrap());
-        copy[crate::dedup::EVENT_TIME].copy_from_slice(&(stamp - 23).to_le_bytes());
+        let stamp = i64::from_le_bytes(copy[EVENT_TIME].try_into().unwrap());
+        copy[EVENT_TIME].copy_from_slice(&(stamp - 23).to_le_bytes());
         assert_ne!(&copy[..], &frame[..], "the copies must differ on the wire");
         Bytes::from(copy)
     }

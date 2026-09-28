@@ -31,9 +31,6 @@
 //! Sequence state is kept per stream *across* files of a series, so breaks
 //! straddling the rotation boundary are attributed correctly.
 
-#[path = "../sbe_types.rs"]
-mod sbe_types;
-
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     fs::{self, File},
@@ -49,7 +46,7 @@ use std::{
 use anyhow::{Context as _, Result};
 use clap::Parser;
 use jiff::{Span, Timestamp, civil, tz::TimeZone};
-use sbe_types::{
+use sbe_collector::sbe_types::{
     BestBidAskBlock, DepthDiffBlock, GroupSizeEncoding, MessageHeader, TEMPLATE_BEST_BID_ASK,
     TEMPLATE_DEPTH_DIFF, TEMPLATE_DEPTH_SNAPSHOT, TEMPLATE_TRADES, TradesBlock,
 };

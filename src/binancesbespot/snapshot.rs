@@ -5,9 +5,11 @@ use jiff::{SignedDuration, Timestamp};
 use tokio::sync::mpsc::Sender;
 use tracing::{error, warn};
 
+use sbe_collector::record::Tag;
+
 use crate::{
     error::ConnectorError,
-    file::{Symbol, Tag, WriteRecord},
+    file::{Symbol, WriteRecord},
     throttler::Throttler,
 };
 

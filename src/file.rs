@@ -13,19 +13,11 @@ use std::{
 use anyhow::bail;
 use bytes::{BufMut, Bytes, BytesMut};
 use jiff::{Timestamp, civil::Date, tz::TimeZone};
+use sbe_collector::record::{Header, Tag};
 use tracing::{error, info, warn};
 use zstd::stream::write::Encoder as ZstdEncoder;
 
 use crate::quality::{QualityEvent, QualityReporter};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum Tag {
-    /// Raw SBE stream frame.
-    Sbe = b'S',
-    /// REST depth snapshot (JSON).
-    Rest = b'R',
-}
 
 pub type Symbol = Arc<str>;
 
@@ -601,7 +593,6 @@ impl RotatingFile {
         Ok(())
     }
 
-    /// Frame one record as `[i64 recv_ns LE][u8 tag][u32 len LE][payload]`.
     fn write(&mut self, timestamp: Timestamp, tag: Tag, data: Bytes) -> io::Result<()> {
         if timestamp >= self.day.end {
             self.rotate(timestamp)?;
@@ -620,9 +611,12 @@ impl RotatingFile {
         );
         // Never `unwrap` here: under `panic = "abort"` a panic skips every
         // `Drop` and leaves all the other symbols' files unterminated.
-        self.batch.put_i64_le(timestamp.as_nanosecond() as i64);
-        self.batch.put_u8(tag as u8);
-        self.batch.put_u32_le(data.len() as u32);
+        let header = Header {
+            recv_ns: timestamp.as_nanosecond() as i64,
+            tag: tag as u8,
+            len: data.len() as u32,
+        };
+        self.batch.put_slice(&header.encode());
         self.batch.put(data);
 
         if self.batch.len() >= ZSTD_BATCH_BYTES {
