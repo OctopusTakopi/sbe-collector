@@ -31,9 +31,9 @@ const WS_QUEUE_CAPACITY: usize = 16_384;
 /// How long the collection task may spend handing what it already received
 /// to the writer before it is aborted.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long a drained incumbent waits for its drain report to reach the
-/// challenger.
-const DRAIN_REPORT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the handover supervisor gets at exit: to deliver the drain
+/// report after a takeover, or to release the socket otherwise.
+const HANDOVER_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Redundant connections are opened this far apart. Simultaneous handshakes
 /// are what a venue's connection rate limit notices, and connections opened
 /// together are the ones recycled together.
@@ -257,6 +257,12 @@ async fn main() -> anyhow::Result<()> {
         result = &mut collection => Shutdown::Collection(joined("collection task", result)),
     };
 
+    if !matches!(shutdown, Shutdown::Takeover(_)) {
+        // Release the handover socket at once. A takeover request that raced
+        // this exit is dropped, and its challenger chooses its role again.
+        shutdown_tx.send_replace(true);
+        drop(takeover_rx);
+    }
     let (collection_result, takeover) = match shutdown {
         Shutdown::Collection(result) => (result, None),
         Shutdown::Takeover(request) => (
@@ -293,23 +299,19 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let report_grace = match takeover {
-        Some(request) => {
-            let outcome = match collection_result.as_ref().and(writer_result.as_ref()) {
-                Ok(()) => Ok(()),
-                Err(error) => Err(error.to_string()),
-            };
-            quality.report(QualityEvent::Handover {
-                at_ns: QualityEvent::now_ns(),
-                state: HandoverState::drained(outcome.is_ok()),
-                peer_run_id: Some(request.peer_run_id.clone()),
-            });
-            request.complete(outcome);
-            DRAIN_REPORT_TIMEOUT
-        }
-        None => Duration::ZERO,
-    };
-    finish_or_abort(&mut handover_task, report_grace).await;
+    if let Some(request) = takeover {
+        let outcome = match collection_result.as_ref().and(writer_result.as_ref()) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(error.to_string()),
+        };
+        quality.report(QualityEvent::Handover {
+            at_ns: QualityEvent::now_ns(),
+            state: HandoverState::drained(outcome.is_ok()),
+            peer_run_id: Some(request.peer_run_id.clone()),
+        });
+        request.complete(outcome);
+    }
+    finish_or_abort(&mut handover_task, HANDOVER_REPLY_TIMEOUT).await;
 
     drop(quality);
     let quality_result = quality_writer

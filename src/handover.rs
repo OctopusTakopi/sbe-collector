@@ -119,8 +119,9 @@ impl Listener {
         })
     }
 
-    /// Unlink `path` if it still names this socket, then stop listening.
-    fn release(self, path: &Path) {
+    /// Unlink `path` if it still names this socket.
+    fn release(&self, path: &Path) {
+        tracing::info!(path = %path.display(), "shutting down; releasing the handover socket");
         let unlinked = match std::fs::symlink_metadata(path) {
             Ok(metadata) if (metadata.dev(), metadata.ino()) == self.inode => {
                 std::fs::remove_file(path)
@@ -203,11 +204,7 @@ pub async fn run(
             "handover incumbent disappeared before draining; choosing a role again"
         );
         lost_after_ready = lost.after_ready;
-        tokio::select! {
-            biased;
-            () = stop_requested(&mut shutdown) => return Ok(()),
-            () = tokio::time::sleep(RESELECT_DELAY) => {}
-        }
+        tokio::time::sleep(RESELECT_DELAY).await;
     };
     server_loop(
         listener,
@@ -244,7 +241,7 @@ impl Challenge {
     fn lost(error: WireError, after_ready: Option<String>) -> anyhow::Result<Self> {
         match error {
             WireError::Gone(error) => Ok(Self::Lost(Lost { error, after_ready })),
-            WireError::Invalid(error) => Err(anyhow!(error)),
+            error => Err(error.into()),
         }
     }
 }
@@ -281,16 +278,19 @@ async fn challenge(
     };
 
     // The incumbent sends nothing before `Drained`, so anything readable
-    // while warming up is EOF or a protocol violation, and cancelling the
-    // read loses nothing.
+    // while warming up is EOF or a protocol violation.
+    let mut probe = [0_u8; 1];
     tokio::select! {
         biased;
         () = stop_requested(shutdown) => return Ok(Challenge::Stopped),
         result = wait_until_stably_ready(ready, OVERLAP_GRACE) => result?,
-        early = read_message(&mut stream) => match early {
-            Err(error) => return Challenge::lost(error, None),
-            Ok(Message::Reject { reason }) => bail!("handover rejected: {reason}"),
-            Ok(message) => bail!("unexpected handover message before readiness: {message:?}"),
+        read = stream.read(&mut probe) => match read {
+            Ok(0) => {
+                let eof = io::Error::from(io::ErrorKind::UnexpectedEof);
+                return Challenge::lost(WireError::Gone(eof), None);
+            }
+            Ok(_) => bail!("handover incumbent sent data before draining"),
+            Err(error) => return Challenge::lost(WireError::Gone(error), None),
         },
     }
     quality.report(QualityEvent::Handover {
@@ -373,14 +373,20 @@ async fn server_loop(
     loop {
         let mut stream = tokio::select! {
             biased;
-            () = stop_requested(shutdown) => break,
+            () = stop_requested(shutdown) => {
+                listener.release(path);
+                return Ok(());
+            }
             accepted = listener.socket.accept() => accepted?.0,
         };
-        // Shutting down drops a challenger mid-handshake: it sees EOF and
-        // chooses its role again.
+        // Shutting down drops a challenger mid-handshake once the path is
+        // gone: it sees EOF and chooses its role again.
         let peer_run_id = tokio::select! {
             biased;
-            () = stop_requested(shutdown) => break,
+            () = stop_requested(shutdown) => {
+                listener.release(path);
+                return Ok(());
+            }
             peer = negotiate(&mut stream, path, identity, run_id) => match peer {
                 Some(peer_run_id) => peer_run_id,
                 None => continue,
@@ -413,9 +419,6 @@ async fn server_loop(
         }
         return Ok(());
     }
-    tracing::info!(path = %path.display(), "shutting down; releasing the handover socket");
-    listener.release(path);
-    Ok(())
 }
 
 /// Resolves once the process is asked to stop; never if it no longer can be.
@@ -585,25 +588,22 @@ fn same_uid(stream: &UnixStream, path: &Path) -> anyhow::Result<bool> {
     Ok(stream.peer_cred()?.uid() == std::fs::metadata(path)?.uid())
 }
 
-/// Why a message could not be exchanged.
+/// Why a message could not be exchanged. Only `Gone` means the peer left.
 #[derive(Debug, thiserror::Error)]
 enum WireError {
-    /// EOF or a socket error: the peer is gone.
+    /// EOF or a socket error.
     #[error("handover peer is gone: {0}")]
     Gone(#[from] io::Error),
-    /// The peer is there but broke the protocol.
-    #[error("{0}")]
-    Invalid(String),
+    #[error("handover message exceeds {MAX_MESSAGE_BYTES} bytes")]
+    TooLarge,
+    #[error("malformed handover message: {0}")]
+    Malformed(#[from] serde_json::Error),
 }
 
 async fn write_message(stream: &mut UnixStream, message: &Message) -> Result<(), WireError> {
-    let body = serde_json::to_vec(message)
-        .map_err(|error| WireError::Invalid(format!("cannot encode handover message: {error}")))?;
+    let body = serde_json::to_vec(message)?;
     if body.len() > MAX_MESSAGE_BYTES {
-        return Err(WireError::Invalid(format!(
-            "handover message is too large: {} bytes",
-            body.len()
-        )));
+        return Err(WireError::TooLarge);
     }
     stream.write_all(&(body.len() as u32).to_be_bytes()).await?;
     stream.write_all(&body).await?;
@@ -616,14 +616,11 @@ async fn read_message(stream: &mut UnixStream) -> Result<Message, WireError> {
     stream.read_exact(&mut length).await?;
     let length = u32::from_be_bytes(length) as usize;
     if length > MAX_MESSAGE_BYTES {
-        return Err(WireError::Invalid(format!(
-            "handover message exceeds {MAX_MESSAGE_BYTES} bytes"
-        )));
+        return Err(WireError::TooLarge);
     }
     let mut body = vec![0_u8; length];
     stream.read_exact(&mut body).await?;
-    serde_json::from_slice(&body)
-        .map_err(|error| WireError::Invalid(format!("invalid handover message: {error}")))
+    Ok(serde_json::from_slice(&body)?)
 }
 
 #[cfg(test)]
