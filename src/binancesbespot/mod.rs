@@ -22,7 +22,7 @@ use tokio::{
 };
 use zerocopy::FromBytes;
 
-use ws::keep_connection;
+use ws::{Endpoint, keep_connection};
 
 /// How far a book update id may fall below the last one seen before the stream
 /// is treated as restarted rather than merely reordered.
@@ -293,19 +293,15 @@ pub async fn run_collection(
         .collect();
     let mut symbol_matcher = SymbolMatcher::new(canonical_symbols);
 
+    let endpoint = std::sync::Arc::new(Endpoint::new(&streams, &symbols, api_key));
     for connection in 0..connections {
-        let streams = streams.clone();
-        let symbols = symbols.clone();
-        let api_key = api_key.clone();
+        let endpoint = std::sync::Arc::clone(&endpoint);
         let ws_tx = ws_tx.clone();
         let quality = quality.clone();
         let readiness = readiness.clone();
         tasks.spawn(async move {
             tokio::time::sleep(crate::CONNECT_STAGGER * connection as u32).await;
-            keep_connection(
-                streams, symbols, api_key, connection, ws_tx, quality, readiness,
-            )
-            .await;
+            keep_connection(endpoint, connection, ws_tx, quality, readiness).await;
             Err(anyhow::anyhow!(
                 "websocket connection supervisor {connection} exited"
             ))
