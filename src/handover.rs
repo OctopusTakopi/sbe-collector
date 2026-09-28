@@ -175,8 +175,19 @@ pub async fn run(
                 break listener;
             }
             Role::Challenger(stream) => {
-                match challenge(stream, &path, &identity, &run_id, &mut ready, &quality).await? {
+                let outcome = challenge(
+                    stream,
+                    &path,
+                    &identity,
+                    &run_id,
+                    &mut ready,
+                    &quality,
+                    &mut shutdown,
+                )
+                .await?;
+                match outcome {
                     Challenge::TookOver(listener) => break listener,
+                    Challenge::Stopped => return Ok(()),
                     Challenge::Lost(lost) => lost,
                 }
             }
@@ -192,7 +203,11 @@ pub async fn run(
             "handover incumbent disappeared before draining; choosing a role again"
         );
         lost_after_ready = lost.after_ready;
-        tokio::time::sleep(RESELECT_DELAY).await;
+        tokio::select! {
+            biased;
+            () = stop_requested(&mut shutdown) => return Ok(()),
+            () = tokio::time::sleep(RESELECT_DELAY) => {}
+        }
     };
     server_loop(
         listener,
@@ -210,6 +225,9 @@ pub async fn run(
 enum Challenge {
     /// The incumbent drained and this process bound the socket.
     TookOver(Listener),
+    /// This process was asked to stop before it reported ready. Retiring the
+    /// incumbent now would leave nothing collecting.
+    Stopped,
     /// The incumbent went away before reporting its drain.
     Lost(Lost),
 }
@@ -239,6 +257,7 @@ async fn challenge(
     run_id: &str,
     ready: &mut watch::Receiver<ReadinessState>,
     quality: &QualityReporter,
+    shutdown: &mut watch::Receiver<bool>,
 ) -> anyhow::Result<Challenge> {
     let hello = Message::Hello {
         protocol_version: PROTOCOL_VERSION,
@@ -248,7 +267,12 @@ async fn challenge(
     if let Err(error) = write_message(&mut stream, &hello).await {
         return Challenge::lost(error, None);
     }
-    let incumbent_run_id = match timeout(HANDSHAKE_TIMEOUT, read_message(&mut stream)).await {
+    let acknowledgement = tokio::select! {
+        biased;
+        () = stop_requested(shutdown) => return Ok(Challenge::Stopped),
+        acknowledgement = timeout(HANDSHAKE_TIMEOUT, read_message(&mut stream)) => acknowledgement,
+    };
+    let incumbent_run_id = match acknowledgement {
         Ok(Ok(Message::HelloAck { run_id })) => run_id,
         Ok(Ok(Message::Reject { reason })) => bail!("handover rejected: {reason}"),
         Ok(Ok(message)) => bail!("unexpected handover response: {message:?}"),
@@ -260,6 +284,8 @@ async fn challenge(
     // while warming up is EOF or a protocol violation, and cancelling the
     // read loses nothing.
     tokio::select! {
+        biased;
+        () = stop_requested(shutdown) => return Ok(Challenge::Stopped),
         result = wait_until_stably_ready(ready, OVERLAP_GRACE) => result?,
         early = read_message(&mut stream) => match early {
             Err(error) => return Challenge::lost(error, None),
@@ -643,9 +669,9 @@ mod tests {
     struct Peer {
         task: tokio::task::JoinHandle<anyhow::Result<()>>,
         takeover: mpsc::Receiver<TakeoverRequest>,
-        _readiness: Readiness,
+        readiness: Readiness,
         _source: Option<SourceLease>,
-        _shutdown: watch::Sender<bool>,
+        shutdown: watch::Sender<bool>,
     }
 
     impl Fixture {
@@ -689,9 +715,9 @@ mod tests {
             Peer {
                 task,
                 takeover,
-                _readiness: readiness,
+                readiness,
                 _source: source,
-                _shutdown: shutdown,
+                shutdown,
             }
         }
 
@@ -860,6 +886,29 @@ mod tests {
         fixture.wait_until_listening().await;
         assert!(!new.task.is_finished());
         stop(new).await;
+    }
+
+    #[tokio::test]
+    async fn challenger_told_to_stop_before_ready_leaves_the_incumbent_alone() {
+        let fixture = Fixture::new("challenger-stop");
+        let mut old = fixture.start_incumbent().await;
+        let new = fixture.start("new", false);
+        // Acknowledged and warming up.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        new.shutdown.send_replace(true);
+        // Readiness that arrives now must not retire the incumbent.
+        new.readiness.mark_writer_ready();
+        let _source = new.readiness.source_live("source");
+
+        timeout(Duration::from_secs(1), new.task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(old.takeover.try_recv().is_err());
+        assert!(!old.task.is_finished());
+        fixture.wait_until_listening().await;
+        stop(old).await;
     }
 
     #[tokio::test]
