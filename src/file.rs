@@ -2,7 +2,7 @@ use std::{
     borrow::Cow,
     collections::HashMap,
     fs::{File, TryLockError},
-    io::{self, Seek, SeekFrom, Write},
+    io::{self, BufReader, Read, Seek, SeekFrom, Write},
     mem,
     os::unix::fs::{FileExt, MetadataExt},
     path::{Path, PathBuf},
@@ -11,11 +11,11 @@ use std::{
 };
 
 use anyhow::bail;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use jiff::{Timestamp, civil::Date, tz::TimeZone};
-use sbe_collector::record::{Header, Tag};
+use sbe_collector::record::{HEADER_LEN, Header, Tag};
 use tracing::{error, info, warn};
-use zstd::stream::write::Encoder as ZstdEncoder;
+use zstd::stream::{read::Decoder as ZstdDecoder, write::Encoder as ZstdEncoder};
 
 use crate::quality::{QualityEvent, QualityReporter};
 
@@ -433,6 +433,52 @@ fn seal(mut encoder: Encoder, batch: &mut BytesMut, path: &Path) -> Result<(), S
         .map_err(|error| SealError::Unsynced(context("sync", error)))
 }
 
+/// How much of `batch` the abandoned `sidecar` already holds: up to and
+/// including the first record equal to the last whole record the sidecar
+/// decodes to. `None` if that record is not in the batch.
+fn persisted_prefix(sidecar: &Path, batch: &[u8]) -> io::Result<Option<usize>> {
+    let Some(last) = last_record(sidecar)? else {
+        return Ok(None);
+    };
+    let mut start = 0;
+    while let Some(header) = batch.get(start..).and_then(<[u8]>::first_chunk) {
+        let end = start + HEADER_LEN + Header::parse(header).len as usize;
+        if batch.get(start..end) == Some(&last[..]) {
+            return Ok(Some(end));
+        }
+        start = end;
+    }
+    Ok(None)
+}
+
+/// The last whole record `path` decodes to, up to where its last frame was
+/// cut off. Any other decoding error is an error.
+fn last_record(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    let mut decoder = BufReader::new(ZstdDecoder::new(File::open(path)?)?);
+    let mut header = [0; HEADER_LEN];
+    let (mut last, mut next) = (Vec::new(), Vec::new());
+    let mut found = false;
+    loop {
+        match decoder.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(error),
+        }
+        let len = Header::parse(&header).len;
+        next.clear();
+        next.extend_from_slice(&header);
+        match (&mut decoder).take(u64::from(len)).read_to_end(&mut next) {
+            Ok(read) if read == len as usize => {}
+            Ok(_) => break,
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(error),
+        }
+        mem::swap(&mut last, &mut next);
+        found = true;
+    }
+    Ok(found.then_some(last))
+}
+
 /// Keep writing a sealed sidecar after its merge failed: a new frame after
 /// the sealed one, so a later merge still appends whole frames.
 fn resume_sidecar(path: &Path) -> io::Result<Encoder> {
@@ -722,18 +768,41 @@ impl RotatingFile {
             ),
             Err(SealError::Unfinished(error)) => {
                 // An unfinished frame is never appended (see `lock_daily`);
-                // the records still batched go to the daily file instead.
+                // the batched records it lacks go to the daily file instead.
                 self.faults.report(
                     &path,
                     &error,
                     "failed to seal handover sidecar; leaving it on disk unfinished",
                 );
+                self.drop_persisted(&path);
                 return Switch::Switched(daily);
             }
         }
         match self.merge(&mut daily, &path) {
             Progress::Failed => self.resume_or_queue(path, daily),
             Progress::Idle | Progress::Done => Switch::Switched(daily),
+        }
+    }
+
+    /// Drop the batched records an abandoned sidecar already holds, so
+    /// rewriting the batch elsewhere does not repeat them. When that cannot
+    /// be told, all of them are rewritten: duplicates over gaps.
+    fn drop_persisted(&mut self, sidecar: &Path) {
+        if self.batch.is_empty() {
+            return;
+        }
+        match persisted_prefix(sidecar, &self.batch) {
+            Ok(Some(len)) => self.batch.advance(len),
+            Ok(None) => self.faults.report(
+                sidecar,
+                &io::Error::other("its last whole record is not in the batch"),
+                "cannot tell which batched records the abandoned sidecar holds; rewriting the whole batch",
+            ),
+            Err(error) => self.faults.report(
+                sidecar,
+                &error,
+                "cannot decode the abandoned sidecar; rewriting the whole batch",
+            ),
         }
     }
 
@@ -839,7 +908,10 @@ impl RotatingFile {
             Sink::Daily(encoder) | Sink::Sidecar { encoder, .. } => encoder,
             Sink::Closed => return Err(no_sink(&self.prefix)),
         };
+        // Flushed per batch, so a frame that fails unfinished can have
+        // persisted only part of the batch being sealed.
         encoder.write_all(&self.batch)?;
+        encoder.flush()?;
         self.batch.clear();
         Ok(())
     }
@@ -1765,6 +1837,90 @@ mod tests {
             decoded_records(&[
                 (day_one(), b"incumbent"),
                 (day_one(), b"overlap"),
+                (day_one(), b"after"),
+            ])
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A sidecar left as a failed `finish` leaves it: `earlier` flushed whole,
+    /// then `persisted` of the batch being sealed, then nothing.
+    fn abandoned_sidecar(path: &Path, earlier: &[u8], persisted: &[u8]) {
+        let mut encoder = Encoder::new(File::create(path).unwrap(), ZSTD_LEVEL).unwrap();
+        for bytes in [earlier, persisted] {
+            encoder.write_all(bytes).unwrap();
+            encoder.flush().unwrap();
+        }
+    }
+
+    #[test]
+    fn only_batched_records_an_abandoned_sidecar_lacks_are_kept() {
+        let dir = test_dir("persisted");
+        let sidecar = dir.join("sidecar.zst");
+        let (quality, events) = QualityReporter::test_channel();
+        let mut file =
+            RotatingFile::open(dir.join("btcusdt"), Arc::from("run"), day_one(), quality).unwrap();
+        let earlier = decoded_records(&[(day_one(), b"earlier")]);
+        let batch = decoded_records(&[(day_one(), b"a"), (day_one(), b"bb"), (day_one(), b"ccc")]);
+        let first = decoded_records(&[(day_one(), b"a")]).len();
+        let mut kept = |persisted: Option<&[u8]>| {
+            match persisted {
+                Some(persisted) => abandoned_sidecar(&sidecar, &earlier, persisted),
+                None => std::fs::write(&sidecar, b"not zstd at all").unwrap(),
+            }
+            file.batch = BytesMut::from(&batch[..]);
+            file.drop_persisted(&sidecar);
+            mem::take(&mut file.batch).to_vec()
+        };
+
+        // Cut after the first record, or inside the second.
+        assert_eq!(kept(Some(&batch[..first])), batch[first..]);
+        assert_eq!(kept(Some(&batch[..first + 5])), batch[first..]);
+        assert_eq!(kept(Some(&batch)), b"");
+        assert_eq!(degraded(&events), 0);
+        // Nothing of the batch persisted, or the sidecar cannot be decoded.
+        assert_eq!(kept(Some(b"")), batch);
+        assert_eq!(kept(None), batch);
+        assert_eq!(degraded(&events), 2);
+        drop(file);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Flushed batches stay in the abandoned sidecar and only the batch being
+    /// sealed is rewritten: every record is on disk exactly once.
+    #[test]
+    fn unfinished_sidecar_and_daily_file_hold_each_record_once() {
+        static BIG: [u8; 1024] = [7; 1024];
+        let dir = test_dir("switch-flushed");
+        let mut incumbent = writer(&dir, "incumbent");
+        incumbent.write(sbe(day_one(), b"incumbent")).unwrap();
+        let mut challenger = writer(&dir, "challenger");
+        let flushed = ZSTD_BATCH_BYTES / (HEADER_LEN + BIG.len()) + 1;
+        for _ in 0..flushed {
+            challenger.write(sbe(day_one(), &BIG)).unwrap();
+        }
+        challenger.write(sbe(day_one(), b"batched")).unwrap();
+        incumbent.close().unwrap();
+        arm(&[Step::Finish]);
+        challenger.write(sbe(day_one(), b"after")).unwrap();
+        assert!(challenger.close().is_err());
+
+        let mut sidecar = Vec::new();
+        let truncated =
+            ZstdDecoder::new(File::open(dir.join("btcusdt_20270115_challenger.zst")).unwrap())
+                .unwrap()
+                .read_to_end(&mut sidecar)
+                .unwrap_err();
+        assert_eq!(truncated.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(
+            sidecar,
+            decoded_records(&vec![(day_one(), &BIG[..]); flushed])
+        );
+        assert_eq!(
+            decoded(&dir.join("btcusdt_20270115.zst")),
+            decoded_records(&[
+                (day_one(), b"incumbent"),
+                (day_one(), b"batched"),
                 (day_one(), b"after"),
             ])
         );
