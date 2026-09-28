@@ -25,6 +25,11 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
 const OVERLAP_GRACE: Duration = Duration::from_secs(2);
 const BIND_RETRY: Duration = Duration::from_millis(10);
+/// A challenger whose incumbent vanished before draining chooses its role
+/// again after this pause, at most `MAX_RESELECTIONS` times, so a flapping
+/// peer cannot keep it spinning.
+const RESELECT_DELAY: Duration = Duration::from_millis(250);
+const MAX_RESELECTIONS: u32 = 5;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Identity {
@@ -150,97 +155,146 @@ pub async fn run(
             .with_context(|| format!("cannot create UDS directory {}", parent.display()))?;
     }
 
-    match select_role(&path).await? {
-        Role::Incumbent(listener) => {
-            server_loop(
-                listener,
-                &path,
-                &identity,
-                &run_id,
-                takeover_tx,
-                quality,
-                &mut shutdown,
-            )
-            .await
-        }
-        Role::Challenger(mut stream) => {
-            write_message(
-                &mut stream,
-                &Message::Hello {
-                    protocol_version: PROTOCOL_VERSION,
-                    run_id: run_id.clone(),
-                    identity: identity.clone(),
-                },
-            )
-            .await?;
-            let incumbent_run_id = match timeout(HANDSHAKE_TIMEOUT, read_message(&mut stream)).await
-            {
-                Ok(Ok(Message::HelloAck { run_id })) => run_id,
-                Ok(Ok(Message::Reject { reason })) => bail!("handover rejected: {reason}"),
-                Ok(Ok(message)) => bail!("unexpected handover response: {message:?}"),
-                Ok(Err(error)) => return Err(error),
-                Err(_) => bail!("timed out waiting for handover acknowledgement"),
-            };
-
-            wait_until_stably_ready(&mut ready, OVERLAP_GRACE).await?;
-            quality.report(QualityEvent::Handover {
-                at_ns: QualityEvent::now_ns(),
-                state: HandoverState::ChallengerReady,
-                peer_run_id: Some(incumbent_run_id.clone()),
-            });
-            write_message(
-                &mut stream,
-                &Message::Ready {
-                    run_id: run_id.clone(),
-                },
-            )
-            .await?;
-
-            let listener = match read_message(&mut stream).await {
-                Ok(Message::Drained { clean, error }) => {
-                    let outcome = drain_outcome(clean, error);
+    let mut reselections = 0;
+    // The incumbent of the last challenge, if it vanished after this
+    // process reported ready.
+    let mut lost_after_ready = None;
+    let listener = loop {
+        let lost = match select_role(&path).await? {
+            Role::Incumbent(listener) => {
+                if let Some(incumbent_run_id) = lost_after_ready {
+                    tracing::warn!(
+                        "incumbent disappeared after challenger readiness; promoted challenger"
+                    );
                     quality.report(QualityEvent::Handover {
                         at_ns: QualityEvent::now_ns(),
-                        state: HandoverState::drained(outcome.is_ok()),
-                        peer_run_id: Some(incumbent_run_id.clone()),
+                        state: HandoverState::IncumbentLostAfterReadyPromoted,
+                        peer_run_id: Some(incumbent_run_id),
                     });
-                    if let Err(error) = outcome {
-                        tracing::error!(error, "incumbent reported a degraded drain");
-                    }
-                    bind_after_handover(&path).await?
                 }
-                Ok(Message::Reject { reason }) => {
-                    bail!("handover rejected after readiness: {reason}")
+                break listener;
+            }
+            Role::Challenger(stream) => {
+                match challenge(stream, &path, &identity, &run_id, &mut ready, &quality).await? {
+                    Challenge::TookOver(listener) => break listener,
+                    Challenge::Lost(lost) => lost,
                 }
-                Ok(message) => bail!("unexpected handover completion: {message:?}"),
-                Err(error) => match select_role(&path).await? {
-                    Role::Incumbent(listener) => {
-                        tracing::warn!(%error, "incumbent disappeared after challenger readiness; promoted challenger");
-                        quality.report(QualityEvent::Handover {
-                            at_ns: QualityEvent::now_ns(),
-                            state: HandoverState::IncumbentLostAfterReadyPromoted,
-                            peer_run_id: Some(incumbent_run_id.clone()),
-                        });
-                        listener
-                    }
-                    Role::Challenger(_) => {
-                        return Err(error).context(
-                            "incumbent handover stream failed but the socket still has a live owner",
-                        );
-                    }
-                },
-            };
-            server_loop(
-                listener,
-                &path,
-                &identity,
-                &run_id,
-                takeover_tx,
-                quality,
-                &mut shutdown,
-            )
-            .await
+            }
+        };
+        reselections += 1;
+        if reselections > MAX_RESELECTIONS {
+            return Err(lost.error).context(format!(
+                "handover incumbent disappeared {reselections} times before draining"
+            ));
         }
+        tracing::warn!(
+            error = %lost.error,
+            "handover incumbent disappeared before draining; choosing a role again"
+        );
+        lost_after_ready = lost.after_ready;
+        tokio::time::sleep(RESELECT_DELAY).await;
+    };
+    server_loop(
+        listener,
+        &path,
+        &identity,
+        &run_id,
+        takeover_tx,
+        quality,
+        &mut shutdown,
+    )
+    .await
+}
+
+/// How a challenge that did not fail ended.
+enum Challenge {
+    /// The incumbent drained and this process bound the socket.
+    TookOver(Listener),
+    /// The incumbent went away before reporting its drain.
+    Lost(Lost),
+}
+
+struct Lost {
+    error: io::Error,
+    /// The incumbent's run id, if it was told this process is ready.
+    after_ready: Option<String>,
+}
+
+impl Challenge {
+    /// A peer that is gone lost the challenge; one that broke the protocol
+    /// fails it.
+    fn lost(error: WireError, after_ready: Option<String>) -> anyhow::Result<Self> {
+        match error {
+            WireError::Gone(error) => Ok(Self::Lost(Lost { error, after_ready })),
+            WireError::Invalid(error) => Err(anyhow!(error)),
+        }
+    }
+}
+
+/// Ask the incumbent to drain once this process is stably ready.
+async fn challenge(
+    mut stream: UnixStream,
+    path: &Path,
+    identity: &Identity,
+    run_id: &str,
+    ready: &mut watch::Receiver<ReadinessState>,
+    quality: &QualityReporter,
+) -> anyhow::Result<Challenge> {
+    let hello = Message::Hello {
+        protocol_version: PROTOCOL_VERSION,
+        run_id: run_id.to_owned(),
+        identity: identity.clone(),
+    };
+    if let Err(error) = write_message(&mut stream, &hello).await {
+        return Challenge::lost(error, None);
+    }
+    let incumbent_run_id = match timeout(HANDSHAKE_TIMEOUT, read_message(&mut stream)).await {
+        Ok(Ok(Message::HelloAck { run_id })) => run_id,
+        Ok(Ok(Message::Reject { reason })) => bail!("handover rejected: {reason}"),
+        Ok(Ok(message)) => bail!("unexpected handover response: {message:?}"),
+        Ok(Err(error)) => return Challenge::lost(error, None),
+        Err(_) => bail!("timed out waiting for handover acknowledgement"),
+    };
+
+    // The incumbent sends nothing before `Drained`, so anything readable
+    // while warming up is EOF or a protocol violation, and cancelling the
+    // read loses nothing.
+    tokio::select! {
+        result = wait_until_stably_ready(ready, OVERLAP_GRACE) => result?,
+        early = read_message(&mut stream) => match early {
+            Err(error) => return Challenge::lost(error, None),
+            Ok(Message::Reject { reason }) => bail!("handover rejected: {reason}"),
+            Ok(message) => bail!("unexpected handover message before readiness: {message:?}"),
+        },
+    }
+    quality.report(QualityEvent::Handover {
+        at_ns: QualityEvent::now_ns(),
+        state: HandoverState::ChallengerReady,
+        peer_run_id: Some(incumbent_run_id.clone()),
+    });
+    let ready_message = Message::Ready {
+        run_id: run_id.to_owned(),
+    };
+    if let Err(error) = write_message(&mut stream, &ready_message).await {
+        return Challenge::lost(error, None);
+    }
+
+    match read_message(&mut stream).await {
+        Ok(Message::Drained { clean, error }) => {
+            let outcome = drain_outcome(clean, error);
+            quality.report(QualityEvent::Handover {
+                at_ns: QualityEvent::now_ns(),
+                state: HandoverState::drained(outcome.is_ok()),
+                peer_run_id: Some(incumbent_run_id),
+            });
+            if let Err(error) = outcome {
+                tracing::error!(error, "incumbent reported a degraded drain");
+            }
+            Ok(Challenge::TookOver(bind_after_handover(path).await?))
+        }
+        Ok(Message::Reject { reason }) => bail!("handover rejected after readiness: {reason}"),
+        Ok(message) => bail!("unexpected handover completion: {message:?}"),
+        Err(error) => Challenge::lost(error, Some(incumbent_run_id)),
     }
 }
 
@@ -505,10 +559,25 @@ fn same_uid(stream: &UnixStream, path: &Path) -> anyhow::Result<bool> {
     Ok(stream.peer_cred()?.uid() == std::fs::metadata(path)?.uid())
 }
 
-async fn write_message(stream: &mut UnixStream, message: &Message) -> anyhow::Result<()> {
-    let body = serde_json::to_vec(message)?;
+/// Why a message could not be exchanged.
+#[derive(Debug, thiserror::Error)]
+enum WireError {
+    /// EOF or a socket error: the peer is gone.
+    #[error("handover peer is gone: {0}")]
+    Gone(#[from] io::Error),
+    /// The peer is there but broke the protocol.
+    #[error("{0}")]
+    Invalid(String),
+}
+
+async fn write_message(stream: &mut UnixStream, message: &Message) -> Result<(), WireError> {
+    let body = serde_json::to_vec(message)
+        .map_err(|error| WireError::Invalid(format!("cannot encode handover message: {error}")))?;
     if body.len() > MAX_MESSAGE_BYTES {
-        bail!("handover message is too large: {} bytes", body.len());
+        return Err(WireError::Invalid(format!(
+            "handover message is too large: {} bytes",
+            body.len()
+        )));
     }
     stream.write_all(&(body.len() as u32).to_be_bytes()).await?;
     stream.write_all(&body).await?;
@@ -516,16 +585,19 @@ async fn write_message(stream: &mut UnixStream, message: &Message) -> anyhow::Re
     Ok(())
 }
 
-async fn read_message(stream: &mut UnixStream) -> anyhow::Result<Message> {
+async fn read_message(stream: &mut UnixStream) -> Result<Message, WireError> {
     let mut length = [0_u8; 4];
     stream.read_exact(&mut length).await?;
     let length = u32::from_be_bytes(length) as usize;
     if length > MAX_MESSAGE_BYTES {
-        bail!("handover message exceeds {MAX_MESSAGE_BYTES} bytes");
+        return Err(WireError::Invalid(format!(
+            "handover message exceeds {MAX_MESSAGE_BYTES} bytes"
+        )));
     }
     let mut body = vec![0_u8; length];
     stream.read_exact(&mut body).await?;
-    Ok(serde_json::from_slice(&body)?)
+    serde_json::from_slice(&body)
+        .map_err(|error| WireError::Invalid(format!("invalid handover message: {error}")))
 }
 
 #[cfg(test)]
@@ -686,13 +758,50 @@ mod tests {
         }
     }
 
+    /// Blocking, for peers on their own threads.
     impl Fixture {
-        /// Blocking, for peers on their own threads.
         fn wait_for_socket(&self) {
             let deadline = std::time::Instant::now() + Duration::from_secs(2);
             while !self.path.exists() {
                 assert!(std::time::Instant::now() < deadline, "no socket appeared");
                 std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        /// The run id of whoever answers on the socket once someone does,
+        /// asked as a challenger would.
+        fn owner(&self) -> String {
+            use std::io::{Read, Write};
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match std::os::unix::net::UnixStream::connect(&self.path) {
+                    Ok(stream) => break stream,
+                    Err(error) => {
+                        assert!(std::time::Instant::now() < deadline, "no owner: {error}");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let hello = serde_json::to_vec(&Message::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                run_id: "probe".to_owned(),
+                identity: self.identity.clone(),
+            })
+            .unwrap();
+            stream
+                .write_all(&(hello.len() as u32).to_be_bytes())
+                .unwrap();
+            stream.write_all(&hello).unwrap();
+            let mut length = [0; 4];
+            stream.read_exact(&mut length).unwrap();
+            let mut body = vec![0; u32::from_be_bytes(length) as usize];
+            stream.read_exact(&mut body).unwrap();
+            match serde_json::from_slice(&body).unwrap() {
+                Message::HelloAck { run_id } => run_id,
+                message => panic!("expected an acknowledgement, got {message:?}"),
             }
         }
     }
@@ -786,6 +895,22 @@ mod tests {
         let old = Process::spawn(&fixture, "old");
         fixture.wait_for_socket();
         old.shut_down().unwrap();
+        assert!(!fixture.path.exists());
+    }
+
+    #[test]
+    fn challenger_mid_handshake_takes_over_from_an_incumbent_that_shut_down() {
+        let fixture = Fixture::new("reselect");
+        let old = Process::spawn(&fixture, "old");
+        fixture.wait_for_socket();
+        let new = Process::spawn(&fixture, "new");
+        // Long enough to be acknowledged; it never becomes ready.
+        std::thread::sleep(Duration::from_millis(200));
+        old.shut_down().unwrap();
+
+        assert_eq!(fixture.owner(), "new");
+        assert!(!new.thread.is_finished());
+        new.shut_down().unwrap();
         assert!(!fixture.path.exists());
     }
 
