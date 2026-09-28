@@ -5,8 +5,11 @@ use jiff::{Span, Timestamp};
 use tokio::sync::mpsc::Sender;
 use tracing::{error, warn};
 
-use crate::file::{Symbol, Tag, WriteRecord};
-use crate::throttler::Throttler;
+use crate::{
+    error::ConnectorError,
+    file::{Symbol, Tag, WriteRecord},
+    throttler::Throttler,
+};
 
 /// Depth levels requested per snapshot.
 ///
@@ -28,6 +31,9 @@ pub const SNAPSHOT_WEIGHT: u32 = 250;
 /// nothing in a position to notice. Spacing the requests means a restart costs
 /// one snapshot rather than a whole round.
 const SNAPSHOT_PACE: Duration = Duration::from_secs(2);
+
+/// How often every symbol's book is recorded.
+const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// How long to wait before the first request of the process.
 ///
@@ -60,7 +66,7 @@ fn ban_expiry(retry_after: Option<&str>, body: &[u8], now: Timestamp) -> Option<
 ///
 /// Takes the throttler so a ban in the reply gates every later request rather
 /// than only failing this one — see [`Throttler::note_ban`].
-pub async fn fetch_snapshot(
+async fn fetch_snapshot(
     client: &reqwest::Client,
     throttler: &Throttler,
     symbol: &str,
@@ -108,59 +114,74 @@ pub async fn fetch_snapshot(
     Ok(body)
 }
 
-/// Background task: fetch a REST depth snapshot for every symbol shortly after
-/// startup and then every `interval_secs` seconds (default 3600 = 1 hour).
-/// Writes tagged `Rest` records into the same per-symbol zstd file as the SBE
-/// stream frames.
-///
-/// Requests within a round are spaced by [`SNAPSHOT_PACE`] and the first is held
-/// back by [`SNAPSHOT_START_DELAY`], so neither a restart nor a crash-loop can
-/// dump a whole round's request weight at once.
-///
-/// `client` is passed in from `run_collection` so the same connection pool
-/// is shared with gap-triggered snapshot fetches — no duplicate Client.
-pub async fn snapshot_loop(
-    symbols: Vec<Symbol>,
-    writer_tx: Sender<WriteRecord>,
+/// REST depth snapshots, rationed by one weight budget shared by the
+/// periodic round and gap recovery.
+#[derive(Clone)]
+pub struct Snapshots {
     client: reqwest::Client,
     throttler: Throttler,
-    interval_secs: u64,
-) {
-    tokio::time::sleep(SNAPSHOT_START_DELAY).await;
+}
 
-    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-    let mut pacer = tokio::time::interval(SNAPSHOT_PACE);
-    // A round that overruns its spacing must not then fire the backlog at once.
-    pacer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // tick() fires immediately on the first call, so the first round runs as
-    // soon as the start delay is over.
-    loop {
-        ticker.tick().await;
+impl Snapshots {
+    pub fn new(throttler: Throttler) -> reqwest::Result<Self> {
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .build()?;
+        Ok(Self { client, throttler })
+    }
 
-        for symbol in &symbols {
-            pacer.tick().await;
-            let result = throttler
-                .execute(SNAPSHOT_WEIGHT, fetch_snapshot(&client, &throttler, symbol))
-                .await;
+    /// Fetch `symbol`'s book within the budget and queue it for the writer.
+    /// Fails only when the writer is gone.
+    pub async fn record(
+        &self,
+        symbol: &Symbol,
+        writer_tx: &Sender<WriteRecord>,
+    ) -> Result<(), ConnectorError> {
+        let fetched = self
+            .throttler
+            .execute(
+                SNAPSHOT_WEIGHT,
+                fetch_snapshot(&self.client, &self.throttler, symbol),
+            )
+            .await;
+        match fetched {
+            Some(Ok(data)) => writer_tx
+                .send(WriteRecord {
+                    recv_time: Timestamp::now(),
+                    symbol: Symbol::clone(symbol),
+                    tag: Tag::Rest,
+                    data,
+                })
+                .await
+                .map_err(|_| ConnectorError::WriterClosed),
+            Some(Err(error)) => {
+                error!(%symbol, %error, "failed to fetch depth snapshot");
+                Ok(())
+            }
+            None => {
+                warn!(%symbol, "depth snapshot rate-limited, skipping");
+                Ok(())
+            }
+        }
+    }
 
-            match result {
-                Some(Ok(data)) => {
-                    let recv_time = Timestamp::now();
-                    let record = WriteRecord {
-                        recv_time,
-                        symbol: Symbol::clone(symbol),
-                        tag: Tag::Rest,
-                        data,
-                    };
-                    if writer_tx.send(record).await.is_err() {
-                        return; // channel closed — collector is shutting down
-                    }
-                }
-                Some(Err(e)) => {
-                    error!(symbol = %symbol, error = %e, "failed to fetch depth snapshot");
-                }
-                None => {
-                    warn!(symbol = %symbol, "snapshot fetch rate-limited, skipping");
+    /// Snapshot every symbol after [`SNAPSHOT_START_DELAY`] and then every
+    /// [`SNAPSHOT_INTERVAL`], one request per [`SNAPSHOT_PACE`]. Returns once
+    /// the writer is gone.
+    pub async fn run_periodic(self, symbols: Vec<Symbol>, writer_tx: Sender<WriteRecord>) {
+        tokio::time::sleep(SNAPSHOT_START_DELAY).await;
+        // The first tick is immediate.
+        let mut ticker = tokio::time::interval(SNAPSHOT_INTERVAL);
+        let mut pacer = tokio::time::interval(SNAPSHOT_PACE);
+        // An overrun must not fire the backlog at once.
+        pacer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            for symbol in &symbols {
+                pacer.tick().await;
+                if self.record(symbol, &writer_tx).await.is_err() {
+                    return;
                 }
             }
         }

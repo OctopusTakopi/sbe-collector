@@ -152,27 +152,17 @@ async fn main() -> anyhow::Result<()> {
     let (writer_tx, mut writer_rx) = mpsc::channel::<WriteRecord>(WRITER_QUEUE_CAPACITY);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut collection = match args.exchange {
-        Exchange::BinanceSbeSpot => {
-            let streams = [
-                "$symbol@trade",
-                "$symbol@bestBidAsk",
-                "$symbol@depth",
-                "$symbol@depth20",
-            ]
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>();
-            tokio::spawn(binancesbespot::run_collection(
-                streams,
-                args.symbols,
-                writer_tx,
+        Exchange::BinanceSbeSpot => tokio::spawn(binancesbespot::run_collection(
+            binancesbespot::Subscription {
+                symbols: args.symbols,
                 api_key,
-                shutdown_rx,
                 connections,
-                quality.clone(),
-                readiness.clone(),
-            ))
-        }
+            },
+            writer_tx,
+            shutdown_rx,
+            quality.clone(),
+            readiness.clone(),
+        )),
     };
 
     let (writer_done_tx, writer_done_rx) = oneshot::channel();
