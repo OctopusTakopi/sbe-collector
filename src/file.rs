@@ -1125,6 +1125,35 @@ mod tests {
     }
 
     #[test]
+    fn records_are_framed_as_recv_ns_tag_len_payload() {
+        let dir = test_dir("framing");
+        let mut writer = writer(&dir, "framing-run");
+        writer.write(sbe(day_one(), b"frame")).unwrap();
+        writer
+            .write(WriteRecord {
+                tag: Tag::Rest,
+                ..record("btcusdt", day_one(), b"{}")
+            })
+            .unwrap();
+        writer.close().unwrap();
+
+        let ns = 1_800_000_000_000_000_000i64.to_le_bytes();
+        let expected = [
+            &ns[..],
+            b"S",
+            &5u32.to_le_bytes(),
+            b"frame",
+            &ns,
+            b"R",
+            &2u32.to_le_bytes(),
+            b"{}",
+        ]
+        .concat();
+        assert_eq!(decoded(&dir.join("btcusdt_20270115.zst")), expected);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn rollback_append_restores_prior_length() {
         let dir = test_dir("rollback");
         let path = dir.join("dst");
