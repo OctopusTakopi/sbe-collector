@@ -320,8 +320,7 @@ where
     S: AsyncRead + Unpin,
 {
     let sender = conn.sender();
-    let mut overflow =
-        Overflow::with_reporter(format!("binance-sbe-spot/connection-{connection}"), quality);
+    let mut overflow = Overflow::new(format!("binance-sbe-spot/connection-{connection}"), quality);
     let opened = Instant::now();
     let mut liveness = None;
     let mut announced_live = false;
@@ -869,7 +868,7 @@ mod tests {
     async fn retiring_delivers_the_backlog_that_already_arrived() {
         let (mut conn, mut server) = crate::ws::duplex_pair();
         let (ws_tx, data) = mpsc::channel(16);
-        let mut overflow = Overflow::new("test");
+        let mut overflow = Overflow::new("test", QualityReporter::disabled());
 
         for _ in 0..3 {
             server
@@ -898,7 +897,7 @@ mod tests {
     async fn draining_a_caught_up_socket_returns_at_once() {
         let (mut conn, _server) = crate::ws::duplex_pair();
         let (ws_tx, _data) = mpsc::channel(16);
-        let mut overflow = Overflow::new("test");
+        let mut overflow = Overflow::new("test", QualityReporter::disabled());
 
         let before = tokio::time::Instant::now();
         let drained = drain_buffered(

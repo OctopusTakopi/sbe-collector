@@ -27,31 +27,23 @@ type Io = TokioIo<Upgraded>;
 /// How long a frame may wait for room in the websocket queue before it is
 /// dropped.
 ///
-/// This wait blocks the read loop, and a blocked read loop cannot see — let
-/// alone answer — a server ping, so it must stay far below the shortest
-/// server-side pong deadline (Binance closes after about a minute). One second
-/// absorbs ordinary bursts losslessly while keeping the socket responsive.
+/// The wait blocks the read loop, which then cannot answer a server ping, so
+/// it must stay far below the venue's pong deadline (Binance closes after
+/// about a minute).
 pub const QUEUE_FULL_GRACE: Duration = Duration::from_secs(1);
 
-/// Outgoing frames are queued rather than written inline so that control-frame
-/// replies never have to race the read loop.
+/// Outgoing frames go through a queue so control replies never race the read
+/// loop.
 const OUTGOING_QUEUE_CAPACITY: usize = 64;
 
-/// How long [`connect`] may spend on TCP, TLS and the websocket upgrade
-/// together.
-///
-/// Well beyond a healthy handshake from anywhere to Binance, and short enough
-/// that a black-holed connection becomes a retry rather than a task parked
-/// forever with no data flowing.
+/// Bound on TCP, TLS and the websocket upgrade together, so a black-holed
+/// connection becomes a retry instead of a task parked forever.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// RFC 6455 caps a control frame's payload at 125 bytes.
 const MAX_CONTROL_PAYLOAD: usize = 125;
 
 /// How long [`Connection::flush_close`] waits for a queued close frame.
-///
-/// Only spent on a connection that is being discarded anyway, so it buys a
-/// clean close handshake without ever delaying reconnection appreciably.
 const CLOSE_FLUSH_GRACE: Duration = Duration::from_secs(1);
 
 const OVERFLOW_REPORT_INTERVAL: Duration = Duration::from_secs(5);
@@ -67,9 +59,8 @@ where
     }
 }
 
-/// Build a TLS client config backed by the Mozilla root certificate bundle.
-/// Call this ONCE, wrap in `Arc`, and reuse across every reconnect to avoid
-/// cloning ~140 root certificates on each connection attempt.
+/// A TLS client config over the Mozilla root bundle. Build it once and share
+/// the `Arc`: each build clones ~140 root certificates.
 pub fn build_tls_config() -> ClientConfig {
     let root_store =
         rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -78,29 +69,27 @@ pub fn build_tls_config() -> ClientConfig {
         .with_no_client_auth()
 }
 
-/// Rate-limited accounting for frames dropped because the writer cannot keep up.
+/// Rate-limited accounting for frames dropped because the writer cannot keep
+/// up.
 ///
-/// Dropping is preferable to stalling: a stalled read loop stops answering
-/// pings, so the exchange closes the connection and the resulting gap is far
-/// larger than the overflow itself. The depth-diff gap detector additionally
-/// notices the resulting sequence break and refetches a snapshot. What must
-/// never happen is dropping *silently*.
+/// Dropping beats stalling: a stalled read loop stops answering pings, and
+/// the venue's disconnect costs far more than the overflow. Dropping silently
+/// is what must never happen.
 pub struct Overflow {
     label: String,
-    quality: Option<QualityReporter>,
+    quality: QualityReporter,
     dropped: u64,
     reported: u64,
     last_report: Instant,
-    /// Once the consumer is established as too slow, frames are shed without
-    /// waiting at all. See [`deliver`].
+    /// The consumer is known to be too slow: shed without waiting.
     shedding: bool,
 }
 
 impl Overflow {
-    pub fn new(label: impl Into<String>) -> Self {
+    pub fn new(label: impl Into<String>, quality: QualityReporter) -> Self {
         Self {
             label: label.into(),
-            quality: None,
+            quality,
             dropped: 0,
             reported: 0,
             last_report: Instant::now(),
@@ -108,14 +97,6 @@ impl Overflow {
         }
     }
 
-    pub fn with_reporter(label: impl Into<String>, quality: QualityReporter) -> Self {
-        Self {
-            quality: Some(quality),
-            ..Self::new(label)
-        }
-    }
-
-    /// Record one dropped frame.
     pub fn record_drop(&mut self) {
         self.dropped += 1;
         if self.dropped == 1 || self.last_report.elapsed() >= OVERFLOW_REPORT_INTERVAL {
@@ -125,14 +106,12 @@ impl Overflow {
                 dropped_since_last_report = self.dropped - self.reported,
                 "writer cannot keep up; dropping frames"
             );
-            if let Some(quality) = &self.quality {
-                quality.report(QualityEvent::MarketDataDropped {
-                    at_ns: QualityEvent::now_ns(),
-                    source: self.label.to_owned(),
-                    dropped_total: self.dropped,
-                    dropped_since_last_report: self.dropped - self.reported,
-                });
-            }
+            self.quality.report(QualityEvent::MarketDataDropped {
+                at_ns: QualityEvent::now_ns(),
+                source: self.label.clone(),
+                dropped_total: self.dropped,
+                dropped_since_last_report: self.dropped - self.reported,
+            });
             self.reported = self.dropped;
             self.last_report = Instant::now();
         }
@@ -146,30 +125,15 @@ impl Overflow {
                 dropped_total = self.dropped,
                 "writer caught up; no longer dropping frames"
             );
-            if let Some(quality) = &self.quality {
-                quality.report(QualityEvent::MarketDataRecovered {
-                    at_ns: QualityEvent::now_ns(),
-                    source: self.label.to_owned(),
-                    dropped_total: self.dropped,
-                });
-            }
+            self.quality.report(QualityEvent::MarketDataRecovered {
+                at_ns: QualityEvent::now_ns(),
+                source: self.label.clone(),
+                dropped_total: self.dropped,
+            });
             self.dropped = 0;
             self.reported = 0;
         }
         self.shedding = false;
-    }
-
-    fn is_shedding(&self) -> bool {
-        self.shedding
-    }
-
-    fn begin_shedding(&mut self) {
-        self.shedding = true;
-    }
-
-    #[cfg(test)]
-    pub fn dropped(&self) -> u64 {
-        self.dropped
     }
 }
 
@@ -187,18 +151,14 @@ pub enum Delivery {
 
 /// Hand a frame to the consumer without ever starving control frames.
 ///
-/// Waiting for queue space also blocks the read loop, so waiting on *every*
-/// frame would throttle socket reads to one frame per grace period. Market data
-/// would then pile up ahead of the server's ping in the kernel buffer, the ping
-/// would go unanswered, and the exchange would close the connection — a far
-/// bigger gap than the overflow itself. So the wait happens only when the queue
-/// *first* fills; after that frames are shed without waiting until the consumer
-/// catches up.
+/// Waiting on every frame would throttle reads to one frame per grace period
+/// and bury the server's ping behind market data, so the wait happens only
+/// when the queue first fills; after that, frames are shed at once until the
+/// consumer catches up.
 ///
-/// `sheddable` decides whether a given frame may be dropped, and is consulted
-/// only on the slow path, so classification costs nothing while the consumer
-/// keeps up. Subscription acks and rejections must not be shed: losing one
-/// silently leaves topics unsubscribed with nothing left to trigger a retry.
+/// `sheddable` is consulted only on that slow path. Subscription acks and
+/// rejections must not be shed: losing one leaves topics unsubscribed with
+/// nothing to trigger a retry.
 pub async fn deliver<T, F>(
     tx: &mpsc::Sender<T>,
     overflow: &mut Overflow,
@@ -219,7 +179,7 @@ where
     }
 
     let may_shed = sheddable(&value);
-    if may_shed && overflow.is_shedding() {
+    if may_shed && overflow.shedding {
         overflow.record_drop();
         return Delivery::Dropped;
     }
@@ -232,7 +192,7 @@ where
         }
         Ok(Err(_)) => Delivery::Closed,
         Err(_) if may_shed => {
-            overflow.begin_shedding();
+            overflow.shedding = true;
             overflow.record_drop();
             Delivery::Dropped
         }
@@ -276,16 +236,12 @@ impl FrameSender {
             .map_err(|_| anyhow!("websocket writer stopped"))
     }
 
-    /// Start a close handshake from this side.
+    /// Start a close handshake from this side; pair with
+    /// [`Connection::flush_close`] to wait for it to reach the wire.
     ///
-    /// Closing a healthy connection is a local decision — retiring a session
-    /// that has been replaced — so this side sends the close. Dropping the
-    /// socket instead leaves the venue holding a connection slot that this IP
-    /// is limited on. Pair with [`Connection::flush_close`] to wait for it to
-    /// reach the wire.
-    /// `reason` is truncated to fit: a control frame may carry at most 125
-    /// bytes, and overrunning it turns a polite close into a protocol error the
-    /// peer must fail the connection on.
+    /// Dropping the socket instead leaves the venue holding a connection slot
+    /// this IP is limited on. `reason` is truncated to the 125-byte control
+    /// frame limit, past which the close becomes a protocol error.
     pub async fn close(&self, code: u16, reason: &str) -> Result<()> {
         let room = MAX_CONTROL_PAYLOAD - size_of::<u16>();
         let reason = &reason.as_bytes()[..reason.len().min(room)];
@@ -306,12 +262,9 @@ pub struct Message {
 
 /// A split websocket connection.
 ///
-/// The write half is owned by a dedicated task fed through [`FrameSender`], so
-/// the caller's read loop never has to share a `select!` with writes. That
-/// separation is load-bearing — see [`Connection::read`].
-///
-/// Generic over the transport so the read/pong path can be exercised over an
-/// in-memory duplex stream in tests; production always uses the default.
+/// The write half is owned by a task fed through [`FrameSender`], so the
+/// caller's read loop never shares a `select!` with writes (see
+/// [`Connection::read`]). Generic over the transport for in-memory tests.
 pub struct Connection<S = Io> {
     read: FragmentCollectorRead<ReadHalf<S>>,
     out_tx: mpsc::Sender<Outgoing>,
@@ -343,14 +296,11 @@ impl<S> Connection<S> {
     /// Read the next frame.
     ///
     /// **Not cancel-safe.** `fastwebsockets` consumes the frame header
-    /// (`buffer.advance(2)`) before awaiting the payload bytes, so dropping this
-    /// future mid-frame loses the header and the next read re-parses the middle
-    /// of a payload as a header — yielding `ReservedBitsNotZero`, `FrameTooLarge`
-    /// or, worse, silently corrupted frames.
-    ///
-    /// Cancelling it is therefore only sound when the connection is being
-    /// discarded. Any `select!` arm racing this future must be terminal: return
-    /// an error, never `continue` the loop.
+    /// (`buffer.advance(2)`) before awaiting the payload, so dropping this
+    /// future mid-frame makes the next read parse payload bytes as a header:
+    /// `ReservedBitsNotZero`, `FrameTooLarge`, or silently corrupted frames.
+    /// Cancel it only when discarding the connection; any `select!` arm racing
+    /// it must end the session, never `continue`.
     pub async fn read(&mut self) -> Result<Message>
     where
         S: AsyncRead + Unpin,
@@ -382,19 +332,11 @@ impl<S> Connection<S> {
 
     /// Wait for a queued close frame to reach the wire.
     ///
-    /// Close frames are queued like any other: [`read`](Self::read) only
-    /// *queues* the reply it is obliged to send before handing the close frame
-    /// back, and [`FrameSender::close`] returns as soon as its frame is
-    /// accepted. Without this the caller drops the connection, [`Drop`] aborts
-    /// the writer, and the close loses the race — every disconnect then ends as
-    /// an abrupt teardown instead of a close handshake.
-    ///
-    /// The writer task stops after writing a close frame, so this returns as
-    /// soon as that frame is out rather than after the full grace period. Call
-    /// it only on the close path; nothing else ends the writer.
-    /// Calling it twice on one connection is safe: polling a `JoinHandle` whose
-    /// output has already been taken panics, so a finished writer is reported
-    /// rather than awaited again.
+    /// [`read`](Self::read) and [`FrameSender::close`] only queue the close;
+    /// without this, dropping the connection aborts the writer first and the
+    /// close handshake becomes an abrupt teardown. The writer stops after a
+    /// close frame, so this returns as soon as it is out. Safe to call twice:
+    /// a finished writer is not polled again.
     pub async fn flush_close(&mut self) {
         if self.writer.is_finished() {
             return;
@@ -421,22 +363,15 @@ where
             warn!(%error, "websocket write failed");
             return;
         }
-        // Nothing may follow a close frame, and `flush_close` waits on this
-        // task to learn that it reached the wire.
+        // Nothing may follow a close frame; `flush_close` waits on this exit.
         if closing {
             return;
         }
     }
 }
 
-/// Open a TLS WebSocket to `url`, optionally sending `X-MBX-APIKEY`.
-///
-/// Accepts a pre-built `Arc<ClientConfig>` so that certificate loading is not
-/// repeated on every reconnect — just clone the Arc.
-///
-/// Bounded by [`CONNECT_TIMEOUT`]: none of the three handshakes below carries a
-/// deadline of its own, and a caller that is reconnecting has nothing to fall
-/// back on while this hangs.
+/// Open a TLS WebSocket to `url`, optionally sending `X-MBX-APIKEY`, within
+/// [`CONNECT_TIMEOUT`]: none of the three handshakes has a deadline of its own.
 pub async fn connect(
     url: &str,
     api_key: Option<&str>,
@@ -491,17 +426,13 @@ async fn handshake_all(
     let (mut ws, _) = handshake::client(&SpawnExecutor, req, tls_stream)
         .await
         .map_err(|e| anyhow!("WebSocket handshake failed: {:?}", e))?;
-    // Ping frames are surfaced to the caller so the connector can track
-    // liveness; the pong is queued explicitly on the writer task.
+    // Pings reach the caller, which answers them through the writer task.
     ws.set_auto_pong(false);
 
     Ok(Connection::from_websocket(ws))
 }
 
 /// Both ends of an in-memory websocket, with no handshake and no network.
-///
-/// Lets the read, pong and close paths be exercised against a real
-/// `fastwebsockets` peer — including from the connector's own tests.
 #[cfg(test)]
 pub fn duplex_pair() -> (
     Connection<tokio::io::DuplexStream>,
@@ -513,10 +444,8 @@ pub fn duplex_pair() -> (
     let mut client = WebSocket::after_handshake(client_io, Role::Client);
     client.set_auto_pong(false);
     let mut server = WebSocket::after_handshake(server_io, Role::Server);
-    // The stand-in venue only ever replies when a test tells it to. Left on,
-    // its automatic replies would be written to a client that the test has
-    // already let go, and the read that was being asserted on would fail with
-    // a broken pipe instead.
+    // The stand-in venue replies only when told to: automatic replies to a
+    // client the test already dropped would fail its read with a broken pipe.
     server.set_auto_pong(false);
     server.set_auto_close(false);
     (Connection::from_websocket(client), server)
@@ -529,7 +458,7 @@ mod tests {
     #[test]
     fn overflow_emits_loss_and_recovery_quality_events() {
         let (quality, rx) = QualityReporter::test_channel();
-        let mut overflow = Overflow::with_reporter("test", quality);
+        let mut overflow = Overflow::new("test", quality);
         overflow.record_drop();
         overflow.record_drop();
         overflow.record_sent();
@@ -551,8 +480,7 @@ mod tests {
         ));
     }
 
-    /// The pong must actually reach the wire with the ping's exact payload.
-    /// Queuing it on the writer task is not evidence that it was written.
+    /// Queuing the pong is not evidence that it reached the wire.
     #[tokio::test]
     async fn server_ping_is_answered_with_a_matching_pong() {
         let (mut conn, mut server) = duplex_pair();
@@ -583,7 +511,7 @@ mod tests {
     async fn sustained_backpressure_sheds_without_waiting_after_the_first_grace() {
         let (tx, _rx) = mpsc::channel::<u32>(1);
         tx.try_reserve().unwrap().send(0); // fill it
-        let mut overflow = Overflow::new("test");
+        let mut overflow = Overflow::new("test", QualityReporter::disabled());
 
         let before = tokio::time::Instant::now();
         assert_eq!(
@@ -608,7 +536,7 @@ mod tests {
             after_first,
             "shedding must not wait"
         );
-        assert_eq!(overflow.dropped(), 99);
+        assert_eq!(overflow.dropped, 99);
     }
 
     /// A brief burst is absorbed losslessly rather than shed.
@@ -623,28 +551,26 @@ mod tests {
             std::future::pending::<()>().await;
         });
 
-        let mut overflow = Overflow::new("test");
+        let mut overflow = Overflow::new("test", QualityReporter::disabled());
         assert_eq!(
             deliver(&tx, &mut overflow, 1, |_| true).await,
             Delivery::Sent
         );
-        assert_eq!(overflow.dropped(), 0);
+        assert_eq!(overflow.dropped, 0);
     }
 
-    /// Control responses must never be shed: losing a subscription rejection
-    /// leaves those topics unsubscribed with nothing left to trigger a retry.
     #[tokio::test(start_paused = true)]
     async fn control_frames_are_never_shed() {
         let (tx, _rx) = mpsc::channel::<u32>(1);
         tx.try_reserve().unwrap().send(0);
-        let mut overflow = Overflow::new("test");
+        let mut overflow = Overflow::new("test", QualityReporter::disabled());
 
         // Get into the shedding state with a data frame.
         assert_eq!(
             deliver(&tx, &mut overflow, 1, |_| true).await,
             Delivery::Dropped
         );
-        assert!(overflow.is_shedding());
+        assert!(overflow.shedding);
 
         // A non-sheddable frame reports undeliverable instead of vanishing.
         assert_eq!(
@@ -653,9 +579,6 @@ mod tests {
         );
     }
 
-    /// The close echo is only *queued* by `read`, and `Drop` aborts the writer.
-    /// Without `flush_close` between them the reply never reaches the wire and
-    /// every venue-initiated close ends as an abrupt teardown.
     #[tokio::test]
     async fn a_server_close_is_echoed_before_the_connection_is_dropped() {
         let (mut conn, mut server) = duplex_pair();
