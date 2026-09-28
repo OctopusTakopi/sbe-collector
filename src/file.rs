@@ -675,7 +675,7 @@ impl RotatingFile {
     fn lock_failed(&mut self, date: Date, error: &io::Error) -> Progress {
         let path = day_file(&self.prefix, date, "");
         self.faults
-            .report(&path, error, "cannot take the daily file; using a sidecar");
+            .report(&path, error, "cannot take the daily file");
         Progress::Failed
     }
 
