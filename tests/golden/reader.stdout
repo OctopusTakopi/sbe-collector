@@ -56,7 +56,7 @@
 [1785542400000000012] R <invalid JSON>
 [1785542400000000013] R SNAPSHOT lastUpdateId=0 bids=0 asks=0
 [1785542400000000014] unknown tag: 0x58, payload_len=4
---- total: 15 records (11 SBE stream, 3 REST snapshot) ---
+--- total: 16 records (12 SBE stream, 3 REST snapshot) ---
 === ethusdt_20260801.zst ===
 [1785542400000000015] S BEST_BID_ASK ETHUSDT bid=65432.100000 ask=65432.110000 t=1
 --- total: 1 records (1 SBE stream, 0 REST snapshot) ---

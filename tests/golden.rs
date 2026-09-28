@@ -231,6 +231,13 @@ fn reader_output_is_unchanged() {
             rest(T0 + 12, "not json"),
             rest(T0 + 13, r#"{"lastUpdateId":"x"}"#),
             record(T0 + 14, b'X', b"what"),
+            // Fits its declared 4-byte block but not the real one: the reader
+            // prints nothing for it.
+            sbe(T0 + 15, &{
+                let mut frame = header(4, TRADES);
+                frame.extend_from_slice(&[0; 4]);
+                frame
+            }),
         ],
     );
     zstd_file(
