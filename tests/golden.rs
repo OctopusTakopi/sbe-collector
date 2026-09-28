@@ -130,6 +130,29 @@ fn truncated_zstd_file(path: &Path, records: &[Vec<u8>], cut: usize) {
     fs::write(path, bytes).unwrap();
 }
 
+/// The collector's clean-close trailer: a zstd skippable frame recording
+/// the offset it starts at.
+fn trailer(offset: usize) -> Vec<u8> {
+    [
+        &0x184D_2A5Cu32.to_le_bytes()[..],
+        &16u32.to_le_bytes(),
+        b"COLLECTR",
+        &(offset as u64).to_le_bytes(),
+    ]
+    .concat()
+}
+
+/// As the collector leaves a file after a merge: each frame followed by a
+/// trailer.
+fn zstd_file_with_trailers(path: &Path, frames: &[&[Vec<u8>]]) {
+    let mut bytes = Vec::new();
+    for records in frames {
+        bytes.extend(zstd::encode_all(records.concat().as_slice(), 1).unwrap());
+        bytes.extend(trailer(bytes.len()));
+    }
+    fs::write(path, bytes).unwrap();
+}
+
 fn age(path: &Path) {
     let old = SystemTime::now() - Duration::from_secs(24 * 60 * 60);
     File::options()
@@ -401,4 +424,38 @@ fn gap_detector_output_is_unchanged() {
     assert_golden("gap_detector_none.stdout", &nothing.stdout);
 
     fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn trailers_change_neither_reader_nor_gap_detector_output() {
+    let records = [
+        sbe(T0, &depth_diff(100, 1, 10, 1, 1, "BTCUSDT")),
+        sbe(T0 + SECOND, &trades(110, &[1_000, 1_001], "BTCUSDT")),
+        sbe(T0 + 8 * SECOND, &best_bid_ask(120, 500, "BTCUSDT")),
+        rest(T0 + 9 * SECOND, "{}"),
+    ];
+    let plain = fixture_dir("plain");
+    let trailed = fixture_dir("trailed");
+    zstd_file(&plain.join("btcusdt_20260801.zst"), &records);
+    let (first, second) = records.split_at(2);
+    zstd_file_with_trailers(&trailed.join("btcusdt_20260801.zst"), &[first, second]);
+
+    let reader = env!("CARGO_BIN_EXE_reader");
+    let expected = run(reader, &plain, &["btcusdt_20260801.zst"]);
+    let actual = run(reader, &trailed, &["btcusdt_20260801.zst"]);
+    assert!(String::from_utf8_lossy(&expected.stdout).contains("total: 4 records"));
+    assert_eq!(actual.stdout, expected.stdout);
+    assert_eq!(actual.stderr, expected.stderr);
+
+    let gap_detector = env!("CARGO_BIN_EXE_gap_detector");
+    let expected = run(gap_detector, &plain, &["."]);
+    let actual = run(gap_detector, &trailed, &["."]);
+    assert!(expected.status.success() && actual.status.success());
+    assert_eq!(
+        String::from_utf8(actual.stdout).unwrap(),
+        String::from_utf8(expected.stdout).unwrap()
+    );
+
+    fs::remove_dir_all(&plain).unwrap();
+    fs::remove_dir_all(&trailed).unwrap();
 }

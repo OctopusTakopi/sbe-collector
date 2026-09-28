@@ -32,6 +32,14 @@ const MERGE_RETRY_BACKOFF: Duration = Duration::from_secs(5);
 const ZSTD_MAGIC: u32 = 0xFD2F_B528;
 const SKIPPABLE_MAGIC: u32 = 0x184D_2A50;
 const SKIPPABLE_MAGIC_MASK: u32 = 0xFFFF_FFF0;
+/// Clean-close trailer, appended after a sink's last frame: a zstd skippable
+/// frame `[magic][size 16]["COLLECTR"][u64 LE offset]`, where `offset` is the
+/// file length at which the trailer starts. A file ending in a trailer that
+/// points at itself ends on a frame boundary, known from one read instead of
+/// a walk over every block. Decoders skip it.
+const TRAILER_MAGIC: u32 = 0x184D_2A5C;
+const TRAILER_TAG: [u8; 8] = *b"COLLECTR";
+const TRAILER_LEN: usize = 24;
 
 /// `symbol` must be lowercase.
 pub struct WriteRecord {
@@ -107,12 +115,46 @@ fn names_file(path: &Path, file: &File) -> io::Result<bool> {
     }
 }
 
-/// Whether `file` ends exactly where a complete zstd frame does.
+fn trailer(offset: u64) -> [u8; TRAILER_LEN] {
+    let mut bytes = [0; TRAILER_LEN];
+    bytes[..4].copy_from_slice(&TRAILER_MAGIC.to_le_bytes());
+    bytes[4..8].copy_from_slice(&(TRAILER_LEN as u32 - 8).to_le_bytes());
+    bytes[8..16].copy_from_slice(&TRAILER_TAG);
+    bytes[16..].copy_from_slice(&offset.to_le_bytes());
+    bytes
+}
+
+/// Append a trailer at `file`'s end, which its write position must be.
+fn append_trailer(file: &mut File) -> io::Result<()> {
+    let offset = file.metadata()?.len();
+    file.write_all(&trailer(offset))
+}
+
+/// Whether `file` ends on a frame boundary: from its trailer if it ends with
+/// one that points at itself, else by walking every frame.
+fn ends_cleanly(file: &File) -> io::Result<bool> {
+    let len = file.metadata()?.len();
+    if len == 0 || ends_with_trailer(file, len)? {
+        return Ok(true);
+    }
+    ends_on_frame_boundary(file, len)
+}
+
+fn ends_with_trailer(file: &File, len: u64) -> io::Result<bool> {
+    let Some(start) = len.checked_sub(TRAILER_LEN as u64) else {
+        return Ok(false);
+    };
+    let mut tail = [0; TRAILER_LEN];
+    file.read_exact_at(&mut tail, start)?;
+    Ok(tail == trailer(start))
+}
+
+/// Whether the first `len` bytes of `file` end exactly where a complete zstd
+/// frame does.
 ///
 /// Walks frame and block headers only: one small `pread` per block, no
 /// decompression.
-fn ends_on_frame_boundary(file: &File) -> io::Result<bool> {
-    let len = file.metadata()?.len();
+fn ends_on_frame_boundary(file: &File, len: u64) -> io::Result<bool> {
     let read_le = |pos: u64, width: usize| -> io::Result<Option<u32>> {
         if pos.saturating_add(width as u64) > len {
             return Ok(None);
@@ -189,7 +231,7 @@ fn lock_daily(prefix: &Path, date: Date) -> io::Result<Option<File>> {
     let Some(daily) = open_locked(&path)? else {
         return Ok(None);
     };
-    if ends_on_frame_boundary(&daily)? {
+    if ends_cleanly(&daily)? {
         return Ok(Some(daily));
     }
     let salvage = day_file(
@@ -215,8 +257,11 @@ fn rollback_append(daily: &mut File, start: u64) -> io::Result<()> {
     daily.sync_all()
 }
 
+/// Append the sidecar and a trailer for the daily file's new length, so the
+/// daily file stays verifiable from its tail.
 fn copy_synced(daily: &mut File, sidecar: &Path) -> io::Result<()> {
     io::copy(&mut File::open(sidecar)?, daily)?;
+    append_trailer(daily)?;
     daily.sync_all()
 }
 
@@ -262,7 +307,8 @@ fn merge_into_daily(prefix: &Path, date: Date, sidecar: &Path) -> io::Result<Opt
     Ok(Some(daily))
 }
 
-/// Write the batched records, finish the zstd frame, and fsync.
+/// Write the batched records, finish the zstd frame, append the trailer,
+/// and fsync.
 fn seal(mut encoder: Encoder, batch: &mut BytesMut, path: &Path) -> io::Result<()> {
     let context = |what: &str, error: io::Error| {
         io::Error::new(
@@ -274,9 +320,10 @@ fn seal(mut encoder: Encoder, batch: &mut BytesMut, path: &Path) -> io::Result<(
         .write_all(batch)
         .map_err(|error| context("write records to", error))?;
     batch.clear();
-    let file = encoder
+    let mut file = encoder
         .finish()
         .map_err(|error| context("finish zstd stream", error))?;
+    append_trailer(&mut file).map_err(|error| context("append trailer to", error))?;
     // No retry: Linux may drop the dirty pages of a failed fsync and mark
     // them clean, so a second attempt can succeed with the data gone.
     file.sync_all().map_err(|error| context("sync", error))
@@ -945,6 +992,10 @@ mod tests {
             2,
             "close should not append an empty extra zstd frame"
         );
+        assert!(
+            ends_with_own_trailer(&merged),
+            "the merge must leave the daily file verifiable from its tail"
+        );
         let merged = zstd::decode_all(merged.as_slice()).unwrap();
         for payload in [&b"incumbent"[..], b"sidecar-overlap"] {
             assert!(
@@ -1052,7 +1103,7 @@ mod tests {
         let path = dir.join("walk.zst");
         let check = |bytes: &[u8]| {
             std::fs::write(&path, bytes).unwrap();
-            ends_on_frame_boundary(&File::open(&path).unwrap()).unwrap()
+            ends_on_frame_boundary(&File::open(&path).unwrap(), bytes.len() as u64).unwrap()
         };
         let mut streamed = ZstdEncoder::new(Vec::new(), 1).unwrap();
         streamed.write_all(b"streamed, no content size").unwrap();
@@ -1070,6 +1121,44 @@ mod tests {
         let mut garbage = whole.clone();
         garbage.extend_from_slice(b"not zstd");
         assert!(!check(&garbage));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn ends_with_own_trailer(bytes: &[u8]) -> bool {
+        let start = bytes.len() - TRAILER_LEN;
+        bytes[start..] == trailer(start as u64)
+    }
+
+    #[test]
+    fn trailer_bytes_are_pinned() {
+        let expected = [
+            0x5C, 0x2A, 0x4D, 0x18, // skippable-frame magic
+            16, 0, 0, 0, // content size
+            b'C', b'O', b'L', b'L', b'E', b'C', b'T', b'R', //
+            8, 7, 6, 5, 4, 3, 2, 1, // offset
+        ];
+        assert_eq!(trailer(0x0102_0304_0506_0708), expected);
+    }
+
+    #[test]
+    fn a_trailer_that_points_at_itself_is_trusted_without_a_walk() {
+        let dir = test_dir("trailer");
+        let path = dir.join("trailer.zst");
+        let check = |bytes: &[u8]| {
+            std::fs::write(&path, bytes).unwrap();
+            ends_cleanly(&File::open(&path).unwrap()).unwrap()
+        };
+        let frame = zstd::encode_all(&b"records"[..], 1).unwrap();
+        // Not walkable: the walk would stop at the first byte.
+        let garbage = b"not zstd at all".as_slice();
+
+        assert!(check(&[garbage, &trailer(garbage.len() as u64)].concat()));
+        // A trailer pointing elsewhere is just a skippable frame to the walk.
+        assert!(!check(&[garbage, &trailer(0)].concat()));
+        assert!(check(&[&frame[..], &trailer(0)].concat()));
+        // No trailer: the walk decides.
+        assert!(check(&frame));
+        assert!(!check(&frame[..frame.len() - 1]));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1149,7 +1238,9 @@ mod tests {
             b"{}",
         ]
         .concat();
-        assert_eq!(decoded(&dir.join("btcusdt_20270115.zst")), expected);
+        let bytes = std::fs::read(dir.join("btcusdt_20270115.zst")).unwrap();
+        assert!(ends_with_own_trailer(&bytes));
+        assert_eq!(zstd::decode_all(bytes.as_slice()).unwrap(), expected);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
