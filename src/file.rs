@@ -30,7 +30,6 @@ pub enum Tag {
 
 pub type Symbol = Arc<str>;
 
-const SYNC_ATTEMPTS: u32 = 3;
 /// Uncompressed bytes accumulated before they are handed to zstd. Matches the
 /// compressor's block size so we do not call into it once per websocket frame.
 const ZSTD_BATCH_BYTES: usize = 128 * 1024;
@@ -562,27 +561,12 @@ impl RotatingFile {
             )
         })?;
 
-        // Retry a transient fsync failure, then let the last attempt speak for
-        // itself — no unreachable arm to fall out of sync with the bound.
-        for attempt in 1..SYNC_ATTEMPTS {
-            match raw_file.sync_all() {
-                Ok(()) => {
-                    let _ = unsafe { libc::flock(raw_file.as_raw_fd(), libc::LOCK_UN) };
-                    return Ok(());
-                }
-                Err(error) => {
-                    warn!(path = %self.path, attempt, %error, "sync_all failed; retrying");
-                    std::thread::sleep(Duration::from_millis(25 * u64::from(attempt)));
-                }
-            }
-        }
+        // No retry: Linux may drop the dirty pages of a failed fsync and mark
+        // them clean, so a second attempt can succeed with the data gone.
         raw_file.sync_all().map_err(|error| {
             io::Error::new(
                 error.kind(),
-                format!(
-                    "failed to sync {} after {SYNC_ATTEMPTS} attempts: {error}",
-                    self.path
-                ),
+                format!("failed to sync {}: {error}", self.path),
             )
         })?;
         let _ = unsafe { libc::flock(raw_file.as_raw_fd(), libc::LOCK_UN) };
