@@ -1345,7 +1345,6 @@ dependencies = [
  "hyper-util",
  "itoa",
  "jiff",
- "libc",
  "reqwest",
  "rustls",
  "rustls-pki-types",

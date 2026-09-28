@@ -1,12 +1,9 @@
 use std::{
     borrow::Cow,
     collections::HashMap,
-    fs::File,
+    fs::{File, TryLockError},
     io::{self, Seek, SeekFrom, Write},
-    os::{
-        fd::AsRawFd,
-        unix::fs::{FileExt, MetadataExt},
-    },
+    os::unix::fs::{FileExt, MetadataExt},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -87,16 +84,12 @@ fn encode_symbol(symbol: &str) -> Cow<'_, str> {
     Cow::Owned(encoded)
 }
 
+/// `flock(LOCK_EX | LOCK_NB)` on Linux, so it excludes older binaries too.
 fn try_exclusive_lock(file: &File) -> io::Result<bool> {
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc == 0 {
-        return Ok(true);
-    }
-    let err = io::Error::last_os_error();
-    if err.kind() == io::ErrorKind::WouldBlock {
-        Ok(false)
-    } else {
-        Err(err)
+    match file.try_lock() {
+        Ok(()) => Ok(true),
+        Err(TryLockError::WouldBlock) => Ok(false),
+        Err(TryLockError::Error(error)) => Err(error),
     }
 }
 
@@ -569,7 +562,6 @@ impl RotatingFile {
                 format!("failed to sync {}: {error}", self.path),
             )
         })?;
-        let _ = unsafe { libc::flock(raw_file.as_raw_fd(), libc::LOCK_UN) };
         Ok(())
     }
 
