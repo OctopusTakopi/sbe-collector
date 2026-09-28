@@ -1,12 +1,9 @@
 //! Budgeting for Binance's REST rate limit.
 //!
-//! The limit is denominated in *request weight*, not requests: Binance charges
-//! `/api/v3/depth` 5 at a limit of 100 and 250 at a limit of 5000, against one
-//! shared per-IP allowance. Counting calls instead of weight therefore says
-//! nothing about whether the budget is spent — 100 full-depth snapshots a
-//! minute is 25,000 weight against an allowance of 6,000, and the reply to
-//! overrunning it is a 418 with an IP ban of two minutes to three days, which
-//! stops every symbol's collection, not just the snapshot that overran.
+//! The limit is per-IP *request weight*, not requests: `/api/v3/depth` costs 5
+//! at a limit of 100 and 250 at 5000, so 100 full-depth snapshots a minute is
+//! 25,000 weight against an allowance of 6,000. Overrunning it earns a 418 and
+//! an IP ban of two minutes to three days.
 
 use std::{
     collections::VecDeque,
@@ -27,26 +24,19 @@ const WINDOW_NANOS: i64 = 60_000_000_000;
 /// `exchangeInfo` under `REQUEST_WEIGHT`.
 const SPOT_WEIGHT_PER_MINUTE: u32 = 6_000;
 
-/// What this collector will spend of it.
-///
-/// Derived from the ceiling rather than written out, so the two cannot drift.
-/// Half on purpose: the allowance is per IP, so anything else on the host
-/// talking to Binance draws from the same pool, and the cost of being wrong is
-/// a ban of up to three days rather than a rejected request.
+/// What this collector will spend of it: half, because anything else on the
+/// host draws from the same per-IP pool, and being wrong costs a ban.
 pub const SNAPSHOT_WEIGHT_BUDGET: u32 = SPOT_WEIGHT_PER_MINUTE / 2;
 
 #[derive(Clone)]
 pub struct Throttler {
-    // VecDeque allows O(1) amortised front-pop instead of O(n) retain.
+    /// `(epoch ns, weight)` of the requests in the last minute, oldest first.
     spent: Arc<Mutex<VecDeque<(i64, u32)>>>,
     /// When an observed ban lifts, in epoch nanoseconds; 0 when not banned.
     ///
-    /// The weight window only knows what *this process* has spent, so it cannot
-    /// see a ban earned before it started — by a previous run, or by anything
-    /// else on the host. Binance does say, in the 418 body and the `Retry-After`
-    /// header, so the ban is recorded here and every request refused until it
-    /// lifts. Continuing to send during a ban is what turns Binance's two
-    /// minutes into hours and then days.
+    /// The weight window only knows what this process spent, not a ban earned
+    /// by a previous run or another program. Sending during a ban is what
+    /// turns Binance's two minutes into hours and then days.
     banned_until: Arc<AtomicI64>,
     weight_per_minute: u32,
 }
@@ -62,9 +52,7 @@ impl Throttler {
     }
 
     /// Record a ban observed in a response, so nothing is sent until it lifts.
-    ///
-    /// Keeps the latest expiry seen: a second ban while one is in force is an
-    /// escalation, never a reprieve.
+    /// The latest expiry wins: a second ban is an escalation, not a reprieve.
     pub fn note_ban(&self, until: Timestamp) {
         let until_nanos = until.as_nanosecond() as i64;
         let previous = self.banned_until.fetch_max(until_nanos, Ordering::Relaxed);
@@ -82,11 +70,8 @@ impl Throttler {
         (until > now_nanos).then_some(until)
     }
 
-    /// Execute `fut` only if `weight` still fits in the last 60 seconds'
-    /// allowance. Returns `None` if it does not.
-    ///
-    /// Takes `&self` (not `&mut self`) — all mutation goes through the inner
-    /// `Arc<Mutex>`, so callers can share a `&Throttler` without cloning.
+    /// Run `fut` only if no ban is in force and `weight` still fits in the
+    /// last minute's allowance; `None` otherwise.
     pub async fn execute<Fut, T>(&self, weight: u32, fut: Fut) -> Option<T>
     where
         Fut: Future<Output = T>,
@@ -101,8 +86,7 @@ impl Throttler {
         }
         {
             let mut spent = self.spent.lock().await;
-            // Timestamps are monotonically increasing, so expired entries are
-            // always at the front.
+            // Entries are pushed in time order, so expired ones are at the front.
             while let Some(&(at, _)) = spent.front() {
                 if at <= now - WINDOW_NANOS {
                     spent.pop_front();
@@ -150,11 +134,8 @@ mod tests {
         assert_eq!(throttler.execute(250, async { 1 }).await, None);
     }
 
-    /// The real numbers: how many full-depth snapshots a minute the configured
-    /// budget actually admits, and that they fit Binance's per-IP allowance.
-    ///
-    /// The old call-counting limiter admitted 100, which at weight 250 was
-    /// 25,000 against an allowance of 6,000.
+    /// How many full-depth snapshots a minute the configured budget admits,
+    /// and that they fit Binance's per-IP allowance.
     #[tokio::test]
     async fn the_configured_budget_stays_inside_binances_allowance() {
         let throttler = Throttler::new(SNAPSHOT_WEIGHT_BUDGET);

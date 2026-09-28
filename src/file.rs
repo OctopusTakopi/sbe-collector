@@ -50,7 +50,7 @@ fn is_safe_in_filename(byte: u8) -> bool {
 ///
 /// The encoding must be injective: each symbol owns one zstd encoder, and two
 /// encoders appending to one file would interleave frames into garbage.
-/// Percent escaping is, because `%` itself is always escaped.
+/// Percent escaping is injective because `%` itself is always escaped.
 fn encode_symbol(symbol: &str) -> Cow<'_, str> {
     if symbol.bytes().all(is_safe_in_filename) {
         return Cow::Borrowed(symbol);
@@ -463,9 +463,8 @@ impl RotatingFile {
             unreachable!("checked above");
         };
         if let Err(error) = seal(encoder, &mut self.batch, &path) {
-            // An unfinished frame must never be appended: everything after it
-            // in the daily file would be undecodable. Records still batched
-            // go to the daily file instead.
+            // An unfinished frame is never appended (see `lock_daily`); the
+            // records still batched go to the daily file instead.
             error!(
                 path = %path.display(),
                 %error,
