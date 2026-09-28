@@ -15,7 +15,7 @@ use tokio::{
 };
 
 use crate::{
-    quality::{QualityEvent, QualityReporter},
+    quality::{HandoverState, QualityEvent, QualityReporter},
     readiness::ReadinessState,
 };
 
@@ -24,6 +24,7 @@ const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
 const OVERLAP_GRACE: Duration = Duration::from_secs(2);
+const BIND_RETRY: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Identity {
@@ -56,20 +57,35 @@ enum Message {
     },
 }
 
-#[derive(Clone, Debug)]
-pub struct DrainReport {
-    pub clean: bool,
-    pub error: Option<String>,
+impl Message {
+    fn drained(outcome: DrainOutcome) -> Self {
+        let (clean, error) = match outcome {
+            Ok(()) => (true, None),
+            Err(error) => (false, Some(error)),
+        };
+        Self::Drained { clean, error }
+    }
+}
+
+/// How the incumbent's drain went; `Err` says why it was degraded.
+pub type DrainOutcome = Result<(), String>;
+
+fn drain_outcome(clean: bool, error: Option<String>) -> DrainOutcome {
+    if clean {
+        Ok(())
+    } else {
+        Err(error.unwrap_or_default())
+    }
 }
 
 pub struct TakeoverRequest {
     pub peer_run_id: String,
-    complete: oneshot::Sender<DrainReport>,
+    complete: oneshot::Sender<DrainOutcome>,
 }
 
 impl TakeoverRequest {
-    pub fn complete(self, report: DrainReport) {
-        let _ = self.complete.send(report);
+    pub fn complete(self, outcome: DrainOutcome) {
+        let _ = self.complete.send(outcome);
     }
 }
 
@@ -117,7 +133,7 @@ pub async fn run(
             wait_until_stably_ready(&mut ready, OVERLAP_GRACE).await?;
             quality.report(QualityEvent::Handover {
                 at_ns: QualityEvent::now_ns(),
-                state: "challenger_ready".to_owned(),
+                state: HandoverState::ChallengerReady,
                 peer_run_id: Some(incumbent_run_id.clone()),
             });
             write_message(
@@ -130,19 +146,14 @@ pub async fn run(
 
             let listener = match read_message(&mut stream).await {
                 Ok(Message::Drained { clean, error }) => {
-                    let report = DrainReport { clean, error };
+                    let outcome = drain_outcome(clean, error);
                     quality.report(QualityEvent::Handover {
                         at_ns: QualityEvent::now_ns(),
-                        state: if report.clean {
-                            "incumbent_drained"
-                        } else {
-                            "incumbent_drained_degraded"
-                        }
-                        .to_owned(),
+                        state: HandoverState::drained(outcome.is_ok()),
                         peer_run_id: Some(incumbent_run_id.clone()),
                     });
-                    if !report.clean {
-                        tracing::error!(error = ?report.error, "incumbent reported a degraded drain");
+                    if let Err(error) = outcome {
+                        tracing::error!(error, "incumbent reported a degraded drain");
                     }
                     bind_after_handover(&path).await?
                 }
@@ -155,7 +166,7 @@ pub async fn run(
                         tracing::warn!(%error, "incumbent disappeared after challenger readiness; promoted challenger");
                         quality.report(QualityEvent::Handover {
                             at_ns: QualityEvent::now_ns(),
-                            state: "incumbent_lost_after_ready_promoted".to_owned(),
+                            state: HandoverState::IncumbentLostAfterReadyPromoted,
                             peer_run_id: Some(incumbent_run_id.clone()),
                         });
                         listener
@@ -318,7 +329,7 @@ async fn server_loop(
 
         quality.report(QualityEvent::Handover {
             at_ns: QualityEvent::now_ns(),
-            state: "takeover_requested".to_owned(),
+            state: HandoverState::TakeoverRequested,
             peer_run_id: Some(peer_run_id.clone()),
         });
         let (complete_tx, complete_rx) = oneshot::channel();
@@ -329,7 +340,7 @@ async fn server_loop(
             })
             .await
             .map_err(|_| anyhow!("collector supervisor is unavailable"))?;
-        let report = complete_rx
+        let outcome = complete_rx
             .await
             .map_err(|_| anyhow!("collector stopped without completing handover"))?;
 
@@ -337,15 +348,7 @@ async fn server_loop(
         // alive for this final response, while the challenger can bind the path
         // immediately after receiving it.
         remove_socket(path)?;
-        if let Err(error) = write_message(
-            &mut stream,
-            &Message::Drained {
-                clean: report.clean,
-                error: report.error,
-            },
-        )
-        .await
-        {
+        if let Err(error) = write_message(&mut stream, &Message::drained(outcome)).await {
             tracing::warn!(%error, "handover challenger disconnected before drain report");
         }
         return Ok(());
@@ -391,7 +394,7 @@ async fn bind_after_handover(path: &Path) -> anyhow::Result<UnixListener> {
             match bind_listener(path) {
                 Ok(listener) => return Ok(listener),
                 Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
-                    tokio::task::yield_now().await;
+                    tokio::time::sleep(BIND_RETRY).await;
                 }
                 Err(error) => return Err(error),
             }
@@ -421,17 +424,7 @@ fn remove_socket(path: &Path) -> anyhow::Result<()> {
 }
 
 fn same_uid(stream: &UnixStream, path: &Path) -> anyhow::Result<bool> {
-    #[cfg(target_os = "linux")]
-    {
-        let peer_uid = stream.peer_cred()?.uid();
-        let owner_uid = std::fs::metadata(path)?.uid();
-        Ok(peer_uid == owner_uid)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (stream, path);
-        Ok(true)
-    }
+    Ok(stream.peer_cred()?.uid() == std::fs::metadata(path)?.uid())
 }
 
 async fn write_message(stream: &mut UnixStream, message: &Message) -> anyhow::Result<()> {
@@ -460,7 +453,7 @@ async fn read_message(stream: &mut UnixStream) -> anyhow::Result<Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::readiness::Readiness;
+    use crate::readiness::{Readiness, SourceLease};
 
     #[tokio::test]
     async fn readiness_must_remain_live_for_the_whole_overlap() {
@@ -490,215 +483,184 @@ mod tests {
             .unwrap();
     }
 
+    /// A socket path and the identity every peer in a test shares.
+    struct Fixture {
+        dir: PathBuf,
+        path: PathBuf,
+        identity: Identity,
+    }
+
+    /// One running handover supervisor.
+    struct Peer {
+        task: tokio::task::JoinHandle<anyhow::Result<()>>,
+        takeover: mpsc::Receiver<TakeoverRequest>,
+        _readiness: Readiness,
+        _source: Option<SourceLease>,
+    }
+
+    impl Fixture {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "sbe-handover-{tag}-test-{}-{}",
+                std::process::id(),
+                QualityEvent::now_ns()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self {
+                path: dir.join("collector.sock"),
+                identity: Identity {
+                    exchange: "test".to_owned(),
+                    symbols: vec!["btcusdt".to_owned()],
+                    connections: 1,
+                    output: dir.display().to_string(),
+                },
+                dir,
+            }
+        }
+
+        /// A challenger is `ready` from the start: writer up, source live.
+        fn start(&self, run_id: &str, ready: bool) -> Peer {
+            let (readiness, ready_rx) = Readiness::new(1);
+            let source = ready.then(|| {
+                readiness.mark_writer_ready();
+                readiness.source_live("source")
+            });
+            let (takeover_tx, takeover) = mpsc::channel(1);
+            let task = tokio::spawn(run(
+                self.path.clone(),
+                self.identity.clone(),
+                run_id.to_owned(),
+                ready_rx,
+                takeover_tx,
+                QualityReporter::disabled(),
+            ));
+            Peer {
+                task,
+                takeover,
+                _readiness: readiness,
+                _source: source,
+            }
+        }
+
+        async fn start_incumbent(&self) -> Peer {
+            let incumbent = self.start("old", false);
+            timeout(Duration::from_secs(2), async {
+                while !self.path.exists() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            incumbent
+        }
+
+        async fn wait_until_listening(&self) {
+            timeout(Duration::from_secs(2), async {
+                while UnixStream::connect(&self.path).await.is_err() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    async fn stop(peer: Peer) {
+        peer.task.abort();
+        let _ = peer.task.await;
+    }
+
     #[tokio::test]
     async fn a_ready_challenger_causes_a_drained_takeover() {
-        let dir = std::env::temp_dir().join(format!(
-            "sbe-handover-test-{}-{}",
-            std::process::id(),
-            QualityEvent::now_ns()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("collector.sock");
-        let identity = Identity {
-            exchange: "test".to_owned(),
-            symbols: vec!["btcusdt".to_owned()],
-            connections: 1,
-            output: dir.display().to_string(),
-        };
+        let fixture = Fixture::new("takeover");
+        let mut old = fixture.start_incumbent().await;
+        let new = fixture.start("new", true);
 
-        let (old_tx, mut old_rx) = mpsc::channel(1);
-        let (_old_readiness, old_ready) = Readiness::new(1);
-        let old = tokio::spawn(run(
-            path.clone(),
-            identity.clone(),
-            "old".to_owned(),
-            old_ready,
-            old_tx,
-            QualityReporter::disabled(),
-        ));
-        timeout(Duration::from_secs(2), async {
-            while !path.exists() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-
-        let (new_readiness, new_ready) = Readiness::new(1);
-        let _new_source = new_readiness.source_live("source");
-        new_readiness.mark_writer_ready();
-        let (new_tx, _new_rx) = mpsc::channel(1);
-        let new = tokio::spawn(run(
-            path.clone(),
-            identity,
-            "new".to_owned(),
-            new_ready,
-            new_tx,
-            QualityReporter::disabled(),
-        ));
-
-        let request = timeout(Duration::from_secs(5), old_rx.recv())
+        let request = timeout(Duration::from_secs(5), old.takeover.recv())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(request.peer_run_id, "new");
-        request.complete(DrainReport {
-            clean: true,
-            error: None,
-        });
-        timeout(Duration::from_secs(2), old)
+        request.complete(Ok(()));
+        timeout(Duration::from_secs(2), old.task)
             .await
             .unwrap()
             .unwrap()
             .unwrap();
-        timeout(Duration::from_secs(2), async {
-            loop {
-                if UnixStream::connect(&path).await.is_ok() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        new.abort();
-        let _ = new.await;
-        let _ = std::fs::remove_file(path);
-        std::fs::remove_dir_all(dir).unwrap();
+        fixture.wait_until_listening().await;
+        stop(new).await;
     }
 
     #[tokio::test]
     async fn ready_challenger_promotes_when_incumbent_disappears() {
-        let dir = std::env::temp_dir().join(format!(
-            "sbe-handover-promotion-test-{}-{}",
-            std::process::id(),
-            QualityEvent::now_ns()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("collector.sock");
-        let identity = Identity {
-            exchange: "test".to_owned(),
-            symbols: vec!["btcusdt".to_owned()],
-            connections: 1,
-            output: dir.display().to_string(),
-        };
+        let fixture = Fixture::new("promotion");
+        let mut old = fixture.start_incumbent().await;
+        let new = fixture.start("new", true);
 
-        let (old_tx, mut old_rx) = mpsc::channel(1);
-        let (_old_readiness, old_ready) = Readiness::new(1);
-        let old = tokio::spawn(run(
-            path.clone(),
-            identity.clone(),
-            "old".to_owned(),
-            old_ready,
-            old_tx,
-            QualityReporter::disabled(),
-        ));
-        timeout(Duration::from_secs(2), async {
-            while !path.exists() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-
-        let (new_readiness, new_ready) = Readiness::new(1);
-        let _new_source = new_readiness.source_live("source");
-        new_readiness.mark_writer_ready();
-        let (new_tx, _new_rx) = mpsc::channel(1);
-        let new = tokio::spawn(run(
-            path.clone(),
-            identity,
-            "new".to_owned(),
-            new_ready,
-            new_tx,
-            QualityReporter::disabled(),
-        ));
-
-        let request = timeout(Duration::from_secs(5), old_rx.recv())
+        let request = timeout(Duration::from_secs(5), old.takeover.recv())
             .await
             .unwrap()
             .unwrap();
         drop(request);
         assert!(
-            timeout(Duration::from_secs(2), old)
+            timeout(Duration::from_secs(2), old.task)
                 .await
                 .unwrap()
                 .unwrap()
                 .is_err()
         );
 
-        timeout(Duration::from_secs(2), async {
-            loop {
-                if UnixStream::connect(&path).await.is_ok() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        assert!(!new.is_finished());
-
-        new.abort();
-        let _ = new.await;
-        let _ = std::fs::remove_file(path);
-        std::fs::remove_dir_all(dir).unwrap();
+        fixture.wait_until_listening().await;
+        assert!(!new.task.is_finished());
+        stop(new).await;
     }
 
     #[tokio::test]
     async fn mismatched_configuration_cannot_retire_the_incumbent() {
-        let dir = std::env::temp_dir().join(format!(
-            "sbe-handover-mismatch-test-{}-{}",
-            std::process::id(),
-            QualityEvent::now_ns()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("collector.sock");
-        let identity = Identity {
-            exchange: "test".to_owned(),
-            symbols: vec!["btcusdt".to_owned()],
-            connections: 1,
-            output: dir.display().to_string(),
-        };
-        let (old_tx, mut old_rx) = mpsc::channel(1);
-        let (_old_readiness, old_ready) = Readiness::new(1);
-        let old = tokio::spawn(run(
-            path.clone(),
-            identity.clone(),
-            "old".to_owned(),
-            old_ready,
-            old_tx,
-            QualityReporter::disabled(),
-        ));
-        timeout(Duration::from_secs(2), async {
-            while !path.exists() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        let fixture = Fixture::new("mismatch");
+        let mut old = fixture.start_incumbent().await;
 
-        let mut mismatch = identity;
+        let mut mismatch = fixture.identity.clone();
         mismatch.symbols.push("ethusdt".to_owned());
-        let (_new_readiness, new_ready) = Readiness::new(1);
-        let (new_tx, _new_rx) = mpsc::channel(1);
+        let (_readiness, ready) = Readiness::new(1);
+        let (takeover_tx, _takeover) = mpsc::channel(1);
         let error = run(
-            path.clone(),
+            fixture.path.clone(),
             mismatch,
             "new".to_owned(),
-            new_ready,
-            new_tx,
+            ready,
+            takeover_tx,
             QualityReporter::disabled(),
         )
         .await
         .unwrap_err();
         assert!(error.to_string().contains("rejected"));
-        assert!(old_rx.try_recv().is_err());
-        assert!(!old.is_finished());
+        assert!(old.takeover.try_recv().is_err());
+        assert!(!old.task.is_finished());
+        stop(old).await;
+    }
 
-        old.abort();
-        let _ = old.await;
-        let _ = std::fs::remove_file(path);
-        std::fs::remove_dir_all(dir).unwrap();
+    #[test]
+    fn drain_outcomes_round_trip_the_wire_fields() {
+        let Message::Drained { clean, error } = Message::drained(Err("disk full".to_owned()))
+        else {
+            unreachable!();
+        };
+        assert!(!clean);
+        assert_eq!(error.as_deref(), Some("disk full"));
+        assert_eq!(drain_outcome(clean, error), Err("disk full".to_owned()));
+
+        let Message::Drained { clean, error } = Message::drained(Ok(())) else {
+            unreachable!();
+        };
+        assert!(clean);
+        assert_eq!(error, None);
+        assert_eq!(drain_outcome(clean, error), Ok(()));
     }
 }

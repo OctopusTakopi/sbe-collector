@@ -33,7 +33,7 @@ use tokio::{
 };
 use tracing::{error, info};
 
-use quality::QualityEvent;
+use quality::{HandoverState, QualityEvent};
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Binance SBE stream collector")]
@@ -109,8 +109,12 @@ async fn main() -> Result<(), anyhow::Error> {
         jiff::Timestamp::now().as_nanosecond(),
         std::process::id()
     );
-    let (quality, quality_thread, mut quality_done_rx, quality_path) =
-        quality::start(std::path::Path::new(&args.path), &run_id)?;
+    let quality::QualityLog {
+        reporter: quality,
+        writer: quality_thread,
+        stopped: mut quality_done_rx,
+        path: quality_path,
+    } = quality::start(std::path::Path::new(&args.path), &run_id)?;
     info!(run_id, path = %quality_path.display(), "quality log started");
     let handover_path = args
         .handover_socket
@@ -322,25 +326,16 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     if let Some(request) = takeover_request {
-        let error = collection_result
-            .as_ref()
-            .err()
-            .or_else(|| writer_result.as_ref().err())
-            .map(ToString::to_string);
+        let outcome = match collection_result.as_ref().and(writer_result.as_ref()) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(error.to_string()),
+        };
         quality.report(QualityEvent::Handover {
             at_ns: QualityEvent::now_ns(),
-            state: if error.is_none() {
-                "incumbent_drained"
-            } else {
-                "incumbent_drained_degraded"
-            }
-            .to_owned(),
+            state: HandoverState::drained(outcome.is_ok()),
             peer_run_id: Some(request.peer_run_id.clone()),
         });
-        request.complete(handover::DrainReport {
-            clean: error.is_none(),
-            error,
-        });
+        request.complete(outcome);
         if tokio::time::timeout(std::time::Duration::from_secs(5), &mut handover_handle)
             .await
             .is_err()
