@@ -1,18 +1,12 @@
 use thiserror::Error;
 
+/// Why a received frame could not be routed to the writer.
 #[derive(Error, Debug)]
 pub enum ConnectorError {
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("format error")]
-    Format,
-    #[error("SBE parsing error")]
-    Sbe,
-    #[error("Network error: {0}")]
-    Network(#[from] reqwest::Error),
+    #[error("{len}-byte frame is shorter than the SBE message header")]
+    ShortFrame { len: usize },
+    #[error("{len}-byte depth diff is shorter than its fixed block")]
+    ShortDepthDiff { len: usize },
     #[error("writer channel is closed")]
     WriterClosed,
-    #[allow(dead_code)]
-    #[error("WebSocket error: {0}")]
-    Ws(String),
 }

@@ -130,11 +130,8 @@ impl Ingest {
         if self.dedup.is_duplicate(&data) {
             return Ok(());
         }
-        if data.len() < 8 {
-            return Err(ConnectorError::Format);
-        }
-        let Ok((header, _)) = MessageHeader::read_from_prefix(&data) else {
-            return Err(ConnectorError::Sbe);
+        let Ok((header, body)) = MessageHeader::read_from_prefix(&data) else {
+            return Err(ConnectorError::ShortFrame { len: data.len() });
         };
         let template_id = header.template_id.get();
 
@@ -155,8 +152,8 @@ impl Ingest {
         };
 
         if template_id == TEMPLATE_DEPTH_DIFF {
-            let Ok((block, _)) = DepthDiffBlock::read_from_prefix(&data[8..]) else {
-                return Err(ConnectorError::Sbe);
+            let Ok((block, _)) = DepthDiffBlock::read_from_prefix(body) else {
+                return Err(ConnectorError::ShortDepthDiff { len: data.len() });
             };
             self.check_continuity(
                 &symbol,
@@ -506,6 +503,24 @@ mod tests {
         assert!(
             ingest.tasks.is_empty(),
             "a repeat is already-covered ground, not a hole to refetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_frames_say_what_is_missing() {
+        let (mut ingest, _writer_rx) = ingest(1);
+
+        let runt = ingest.handle(Timestamp::now(), Bytes::from_static(b"\x01\x02"));
+        assert_eq!(
+            runt.await.unwrap_err().to_string(),
+            "2-byte frame is shorter than the SBE message header"
+        );
+        let mut truncated = depth_diff(2, 3).to_vec();
+        truncated.drain(20..42);
+        let truncated = ingest.handle(Timestamp::now(), Bytes::from(truncated));
+        assert_eq!(
+            truncated.await.unwrap_err().to_string(),
+            "28-byte depth diff is shorter than its fixed block"
         );
     }
 
