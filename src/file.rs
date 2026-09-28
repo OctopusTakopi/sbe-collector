@@ -51,6 +51,9 @@ enum Step {
     SetAside,
     Append,
     Resume,
+    Finish,
+    Trailer,
+    Sync,
 }
 
 /// Never fails outside tests.
@@ -377,9 +380,27 @@ fn merge_sidecar(daily: &mut File, sidecar: &Path) -> Merge {
     Merge::Done
 }
 
+/// How sealing a sink failed.
+enum SealError {
+    /// The frame is unfinished: the batch could not be written, or `finish`
+    /// failed. The batch is kept.
+    Unfinished(io::Error),
+    /// The frame is finished but its trailer or fsync failed: the file is
+    /// whole as far as this process can tell.
+    Unsynced(io::Error),
+}
+
+impl From<SealError> for io::Error {
+    fn from(error: SealError) -> Self {
+        match error {
+            SealError::Unfinished(error) | SealError::Unsynced(error) => error,
+        }
+    }
+}
+
 /// Write the batched records, finish the zstd frame, append the trailer,
-/// and fsync.
-fn seal(mut encoder: Encoder, batch: &mut BytesMut, path: &Path) -> io::Result<()> {
+/// and fsync. The batch is cleared once the frame is finished.
+fn seal(mut encoder: Encoder, batch: &mut BytesMut, path: &Path) -> Result<(), SealError> {
     let context = |what: &str, error: io::Error| {
         io::Error::new(
             error.kind(),
@@ -388,15 +409,28 @@ fn seal(mut encoder: Encoder, batch: &mut BytesMut, path: &Path) -> io::Result<(
     };
     encoder
         .write_all(batch)
-        .map_err(|error| context("write records to", error))?;
+        .map_err(|error| SealError::Unfinished(context("write records to", error)))?;
+    let mut file = fault(Step::Finish)
+        .and_then(|()| encoder.finish())
+        .map_err(|error| SealError::Unfinished(context("finish zstd stream", error)))?;
     batch.clear();
-    let mut file = encoder
-        .finish()
-        .map_err(|error| context("finish zstd stream", error))?;
-    append_trailer(&mut file).map_err(|error| context("append trailer to", error))?;
+    let end = file
+        .metadata()
+        .map_err(|error| SealError::Unsynced(context("append trailer to", error)))?
+        .len();
+    if let Err(error) = fault(Step::Trailer).and_then(|()| file.write_all(&trailer(end))) {
+        let error = context("append trailer to", error);
+        // A torn trailer reads as a torn frame.
+        return Err(match file.set_len(end) {
+            Ok(()) => SealError::Unsynced(error),
+            Err(_) => SealError::Unfinished(error),
+        });
+    }
     // No retry: Linux may drop the dirty pages of a failed fsync and mark
     // them clean, so a second attempt can succeed with the data gone.
-    file.sync_all().map_err(|error| context("sync", error))
+    fault(Step::Sync)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| SealError::Unsynced(context("sync", error)))
 }
 
 /// Keep writing a sealed sidecar after its merge failed: a new frame after
@@ -624,20 +658,42 @@ impl RotatingFile {
         (self.sink.is_sidecar() || !self.pending.is_empty()) && self.retry.is_due(Instant::now())
     }
 
-    /// Seal the open sink. A sealed sidecar's path comes back: it still has
-    /// to be appended once its daily file is free.
+    /// Seal the open sink, reporting any failure. A sidecar whose frame is
+    /// finished comes back even if its trailer or fsync failed: it is whole,
+    /// and still to be appended once its daily file is free. Anything else
+    /// that fails is an error.
     fn finalize(&mut self) -> io::Result<Option<PathBuf>> {
         match mem::replace(&mut self.sink, Sink::Closed) {
             Sink::Closed => Ok(None),
-            Sink::Daily(encoder) => seal(
-                encoder,
-                &mut self.batch,
-                &day_file(&self.prefix, self.day.date, ""),
-            )
-            .map(|()| None),
-            Sink::Sidecar { encoder, path } => {
-                seal(encoder, &mut self.batch, &path).map(|()| Some(path))
+            Sink::Daily(encoder) => {
+                let path = day_file(&self.prefix, self.day.date, "");
+                seal(encoder, &mut self.batch, &path).map_err(|error| {
+                    let error = io::Error::from(error);
+                    self.faults
+                        .report(&path, &error, "failed to seal the daily file");
+                    error
+                })?;
+                Ok(None)
             }
+            Sink::Sidecar { encoder, path } => match seal(encoder, &mut self.batch, &path) {
+                Ok(()) => Ok(Some(path)),
+                Err(SealError::Unsynced(error)) => {
+                    self.faults.report(
+                        &path,
+                        &error,
+                        "sealed overlap sidecar may not be durable; it will still be merged",
+                    );
+                    Ok(Some(path))
+                }
+                Err(SealError::Unfinished(error)) => {
+                    self.faults.report(
+                        &path,
+                        &error,
+                        "failed to seal overlap sidecar; leaving it on disk unfinished",
+                    );
+                    Err(error)
+                }
+            },
         }
     }
 
@@ -657,15 +713,23 @@ impl RotatingFile {
         let Sink::Sidecar { encoder, path } = mem::replace(&mut self.sink, Sink::Closed) else {
             unreachable!("checked above");
         };
-        if let Err(error) = seal(encoder, &mut self.batch, &path) {
-            // An unfinished frame is never appended (see `lock_daily`); the
-            // records still batched go to the daily file instead.
-            self.faults.report(
+        match seal(encoder, &mut self.batch, &path) {
+            Ok(()) => {}
+            Err(SealError::Unsynced(error)) => self.faults.report(
                 &path,
                 &error,
-                "failed to seal handover sidecar; leaving it on disk unfinished",
-            );
-            return Switch::Switched(daily);
+                "sealed handover sidecar may not be durable; merging it all the same",
+            ),
+            Err(SealError::Unfinished(error)) => {
+                // An unfinished frame is never appended (see `lock_daily`);
+                // the records still batched go to the daily file instead.
+                self.faults.report(
+                    &path,
+                    &error,
+                    "failed to seal handover sidecar; leaving it on disk unfinished",
+                );
+                return Switch::Switched(daily);
+            }
         }
         match self.merge(&mut daily, &path) {
             Progress::Failed => self.resume_or_queue(path, daily),
@@ -750,23 +814,16 @@ impl RotatingFile {
     fn rotate(&mut self, timestamp: Timestamp) -> io::Result<()> {
         let progress = self.release_sidecar()?;
         self.retry.record(progress, Instant::now());
-        match self.finalize() {
-            Ok(None) => {}
-            Ok(Some(path)) => {
-                warn!(
-                    path = %path.display(),
-                    "UTC date changed before switch; keeping the overlap sidecar until the daily file is free"
-                );
-                self.pending.push(PendingSidecar {
-                    date: self.day.date,
-                    path,
-                });
-            }
-            Err(error) => self.faults.report(
-                &self.prefix,
-                &error,
-                "failed to finalize file on rotation; continuing with the new file",
-            ),
+        // A failure is reported by `finalize`; the new day starts regardless.
+        if let Ok(Some(path)) = self.finalize() {
+            warn!(
+                path = %path.display(),
+                "UTC date changed before switch; keeping the overlap sidecar until the daily file is free"
+            );
+            self.pending.push(PendingSidecar {
+                date: self.day.date,
+                path,
+            });
         }
         let day = UtcDay::containing(timestamp)?;
         let sink = self.open_sink(day.date)?;
@@ -854,11 +911,9 @@ impl RotatingFile {
 }
 
 impl Drop for RotatingFile {
-    /// Best effort; `close` is the path that reports failures.
+    /// Best effort; `finalize` reports failures, `close` also returns them.
     fn drop(&mut self) {
-        if let Err(error) = self.finalize() {
-            warn!(path = %self.prefix.display(), %error, "failed to finalize file on drop");
-        }
+        let _ = self.finalize();
     }
 }
 
@@ -1328,8 +1383,10 @@ mod tests {
     }
 
     fn ends_with_own_trailer(bytes: &[u8]) -> bool {
-        let start = bytes.len() - TRAILER_LEN;
-        bytes[start..] == trailer(start as u64)
+        bytes
+            .len()
+            .checked_sub(TRAILER_LEN)
+            .is_some_and(|start| bytes[start..] == trailer(start as u64))
     }
 
     #[test]
@@ -1601,6 +1658,116 @@ mod tests {
         // Sealing the daily file at close lets the queued sidecar in.
         assert!(challenger.close().is_err());
         assert_merged(&dir, &[b"incumbent", b"overlap", b"daily", b"still-daily"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn seal_tells_an_unfinished_frame_from_an_unsynced_one() {
+        let dir = test_dir("seal");
+        let seal_with = |name: &str, step: Step| {
+            let path = dir.join(name);
+            let encoder = Encoder::new(File::create(&path).unwrap(), ZSTD_LEVEL).unwrap();
+            let mut batch = BytesMut::from(&b"record"[..]);
+            arm(&[step]);
+            let sealed = seal(encoder, &mut batch, &path);
+            (sealed, batch, std::fs::read(&path).unwrap())
+        };
+
+        let (sealed, batch, _) = seal_with("finish.zst", Step::Finish);
+        assert!(matches!(sealed, Err(SealError::Unfinished(_))));
+        assert_eq!(&batch[..], b"record", "an unfinished frame keeps its batch");
+
+        let (sealed, batch, bytes) = seal_with("trailer.zst", Step::Trailer);
+        assert!(matches!(sealed, Err(SealError::Unsynced(_))));
+        assert!(batch.is_empty());
+        assert_eq!(zstd::decode_all(bytes.as_slice()).unwrap(), b"record");
+        assert!(!ends_with_own_trailer(&bytes));
+
+        let (sealed, batch, bytes) = seal_with("sync.zst", Step::Sync);
+        assert!(matches!(sealed, Err(SealError::Unsynced(_))));
+        assert!(batch.is_empty());
+        assert_eq!(zstd::decode_all(bytes.as_slice()).unwrap(), b"record");
+        assert!(ends_with_own_trailer(&bytes));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rotation_queues_a_whole_sidecar_whose_fsync_failed() {
+        let dir = test_dir("rotate-unsynced");
+        let mut incumbent = writer(&dir, "incumbent");
+        incumbent.write(sbe(day_one(), b"incumbent")).unwrap();
+        let mut challenger = writer(&dir, "challenger");
+        challenger.write(sbe(day_one(), b"overlap")).unwrap();
+        arm(&[Step::Sync]);
+        challenger.write(sbe(day_two(), b"next-day")).unwrap();
+        assert_eq!(challenger.files["btcusdt"].pending.len(), 1);
+
+        incumbent.close().unwrap();
+        assert!(
+            challenger.close().is_err(),
+            "a degraded run must not exit clean"
+        );
+        assert_eq!(
+            names(&dir),
+            ["btcusdt_20270115.zst", "btcusdt_20270116.zst"]
+        );
+        let day_one = decoded(&dir.join("btcusdt_20270115.zst"));
+        for payload in [&b"incumbent"[..], b"overlap"] {
+            assert!(contains(&day_one, payload), "yesterday missing {payload:?}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rotation_leaves_an_unfinished_sidecar_on_disk() {
+        let dir = test_dir("rotate-unfinished");
+        let mut incumbent = writer(&dir, "incumbent");
+        incumbent.write(sbe(day_one(), b"incumbent")).unwrap();
+        let mut challenger = writer(&dir, "challenger");
+        challenger.write(sbe(day_one(), b"overlap")).unwrap();
+        arm(&[Step::Finish]);
+        challenger.write(sbe(day_two(), b"next-day")).unwrap();
+        assert!(challenger.files["btcusdt"].pending.is_empty());
+
+        incumbent.close().unwrap();
+        assert!(challenger.close().is_err());
+        assert!(names(&dir).contains(&"btcusdt_20270115_challenger.zst".to_owned()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn switch_merges_a_whole_sidecar_whose_fsync_failed() {
+        let dir = test_dir("switch-unsynced");
+        let mut challenger = released_overlap(&dir);
+        arm(&[Step::Sync]);
+        challenger.write(sbe(day_one(), b"after")).unwrap();
+        assert!(matches!(challenger.files["btcusdt"].sink, Sink::Daily(_)));
+        assert!(challenger.close().is_err());
+        assert_merged(&dir, &[b"incumbent", b"overlap", b"after"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn switch_rewrites_the_batch_of_an_unfinished_sidecar() {
+        let dir = test_dir("switch-unfinished");
+        let mut challenger = released_overlap(&dir);
+        arm(&[Step::Finish]);
+        challenger.write(sbe(day_one(), b"after")).unwrap();
+        assert!(matches!(challenger.files["btcusdt"].sink, Sink::Daily(_)));
+        assert!(challenger.close().is_err());
+
+        assert_eq!(
+            names(&dir),
+            ["btcusdt_20270115.zst", "btcusdt_20270115_challenger.zst"]
+        );
+        assert_eq!(
+            decoded(&dir.join("btcusdt_20270115.zst")),
+            decoded_records(&[
+                (day_one(), b"incumbent"),
+                (day_one(), b"overlap"),
+                (day_one(), b"after"),
+            ])
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
