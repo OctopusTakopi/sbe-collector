@@ -27,7 +27,9 @@ quality logs, and the handover protocol match. Only the wire format and the
 exchange name differ.
 
 `scripts/run_sbe.sh` starts a tmux session and will kill an existing one. Use
-it for a cold start, not for an upgrade.
+it for a cold start, not for an upgrade. `tmux kill-session` delivers SIGHUP,
+which drains and exits like SIGTERM, unless SIGHUP was already ignored when the
+collector started (`nohup`): then it stays ignored.
 
 ## Build and run
 
@@ -55,6 +57,11 @@ the tradeoff for keeping one file per symbol per UTC day. Nothing is appended
 after such a tail, since a decoder cannot step past it: the next writer moves
 the file aside to `<symbol>_<date>_unterminated-<ns>.zst` and starts the day
 again in a fresh daily file.
+
+A cleanly sealed file ends with a clean-close trailer: a 24-byte zstd
+skippable frame holding `COLLECTR` and the offset it starts at, so the next
+writer can trust the file's tail without walking every block. `zstd -dc`,
+libzstd readers, `reader` and `gap_detector` skip it.
 
 During a rolling replace the new process may write
 `<symbol>_<date>_<run-id>.zst` until it gets the daily-file lock, then it

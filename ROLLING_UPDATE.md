@@ -28,5 +28,11 @@ switch), that sidecar's finished zstd frame is appended into
 before the switch, the sidecar stays on disk. Overlap intentionally favors no
 gaps over no duplicates.
 
+An incumbent stopped by a signal releases the socket at once, before it has
+finished draining, so a replacement started right away (as
+`scripts/run_sbe.sh` does) becomes the incumbent. A challenger whose incumbent
+disappears before reporting its drain chooses its role again rather than
+exiting.
+
 The first upgrade from a binary without UDS support is necessarily a normal
 stop/start.
