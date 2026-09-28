@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use jiff::{Span, Timestamp};
+use jiff::{SignedDuration, Timestamp};
 use tokio::sync::mpsc::Sender;
 use tracing::{error, warn};
 
@@ -13,10 +13,8 @@ use crate::{
 
 /// Depth levels requested per snapshot.
 ///
-/// Must move together with [`SNAPSHOT_WEIGHT`]: Binance charges `/api/v3/depth`
-/// 5 at a limit up to 100, 25 to 500, 50 to 1000 and 250 to 5000. Dropping to
-/// 1000 would cost a fifth of the budget per fetch, at the price of a shallower
-/// book in the recording.
+/// Moves with [`SNAPSHOT_WEIGHT`]: Binance charges `/api/v3/depth` 5 at a limit
+/// up to 100, 25 to 500, 50 to 1000 and 250 to 5000.
 const SNAPSHOT_LIMIT: u32 = 5_000;
 
 /// What Binance charges for a [`SNAPSHOT_LIMIT`]-deep snapshot.
@@ -24,48 +22,56 @@ pub const SNAPSHOT_WEIGHT: u32 = 250;
 
 /// Minimum spacing between snapshot requests.
 ///
-/// The round used to issue every symbol back to back — seven full-depth
-/// snapshots inside 50 ms, 1,750 request weight in one burst. The weight window
-/// admits that, but it only knows what this process has spent, so four restarts
-/// inside a minute stack four bursts past Binance's 6,000 allowance with
-/// nothing in a position to notice. Spacing the requests means a restart costs
-/// one snapshot rather than a whole round.
+/// The weight window only knows what this process spent, so back-to-back
+/// rounds from a few quick restarts would stack past Binance's 6,000
+/// allowance. Spaced out, a restart costs one snapshot rather than a round.
 const SNAPSHOT_PACE: Duration = Duration::from_secs(2);
 
 /// How often every symbol's book is recorded.
 const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
-/// How long to wait before the first request of the process.
-///
-/// A collector that crash-loops then spends no weight at all, instead of
-/// burning a round every time it comes up.
+/// Held back before the first request, so a crash-looping collector spends
+/// no weight at all.
 const SNAPSHOT_START_DELAY: Duration = Duration::from_secs(5);
 
-/// Extract when a ban lifts from a 418/429 reply.
+/// How long to stand down after a 418/429 whose expiry cannot be read.
+const UNREADABLE_BAN: SignedDuration = SignedDuration::from_mins(2);
+
+/// When the ban announced by a 418/429 reply lifts.
 ///
-/// Binance answers with `Retry-After` in seconds and, for `-1003`, repeats the
-/// expiry as a millisecond epoch in the message: `IP banned until 1785050129644`.
-/// The header is preferred as the more structured of the two.
-fn ban_expiry(retry_after: Option<&str>, body: &[u8], now: Timestamp) -> Option<Timestamp> {
-    if let Some(seconds) = retry_after.and_then(|value| value.trim().parse::<i64>().ok()) {
-        return now.checked_add(Span::new().try_seconds(seconds).ok()?).ok();
-    }
-    let body = std::str::from_utf8(body).ok()?;
-    let rest = body.split("banned until ").nth(1)?;
-    let millis: i64 = rest
-        .trim_start()
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect::<String>()
-        .parse()
-        .ok()?;
-    Timestamp::from_millisecond(millis).ok()
+/// Binance sends `Retry-After` in seconds and, for `-1003`, repeats the expiry
+/// as a millisecond epoch in the message: `IP banned until 1785050129644`. The
+/// header wins. A reply stating neither still bans for [`UNREADABLE_BAN`]:
+/// unreadable must never mean "not banned".
+fn ban_expiry(retry_after: Option<&str>, body: &[u8], now: Timestamp) -> Timestamp {
+    retry_after
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .and_then(|seconds| {
+            now.checked_add(SignedDuration::from_secs(seconds.into()))
+                .ok()
+        })
+        .or_else(|| stated_expiry(body))
+        .unwrap_or_else(|| {
+            warn!("rate-limited with no readable ban expiry; backing off");
+            now.checked_add(UNREADABLE_BAN).unwrap_or(Timestamp::MAX)
+        })
 }
 
-/// Fetch the full depth snapshot for `symbol` from the REST API.
-///
-/// Takes the throttler so a ban in the reply gates every later request rather
-/// than only failing this one — see [`Throttler::note_ban`].
+/// The epoch-millisecond expiry in a `-1003` message.
+fn stated_expiry(body: &[u8]) -> Option<Timestamp> {
+    let rest = std::str::from_utf8(body)
+        .ok()?
+        .split("banned until ")
+        .nth(1)?
+        .trim_start();
+    let digits = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .map_or(rest, |end| &rest[..end]);
+    Timestamp::from_millisecond(digits.parse().ok()?).ok()
+}
+
+/// Fetch the full depth snapshot for `symbol` from the REST API. A ban in the
+/// reply is recorded on `throttler`, so it gates every later request.
 async fn fetch_snapshot(
     client: &reqwest::Client,
     throttler: &Throttler,
@@ -90,20 +96,8 @@ async fn fetch_snapshot(
     let body = response.bytes().await?;
     if !status.is_success() {
         // 418 is Binance's ban; 429 is the warning shot before one.
-        if status.as_u16() == 418 || status.as_u16() == 429 {
-            match ban_expiry(retry_after.as_deref(), &body, Timestamp::now()) {
-                Some(until) => throttler.note_ban(until),
-                None => {
-                    // Better to sit out a fixed spell than keep sending into a
-                    // ban whose length could not be read.
-                    warn!(%status, "rate-limited with no readable expiry; backing off");
-                    if let Ok(span) = Span::new().try_minutes(2)
-                        && let Ok(until) = Timestamp::now().checked_add(span)
-                    {
-                        throttler.note_ban(until);
-                    }
-                }
-            }
+        if matches!(status.as_u16(), 418 | 429) {
+            throttler.note_ban(ban_expiry(retry_after.as_deref(), &body, Timestamp::now()));
         }
         let preview = &body[..body.len().min(1024)];
         anyhow::bail!(
@@ -197,31 +191,39 @@ mod tests {
 
     #[test]
     fn the_ban_expiry_is_read_from_the_message() {
-        let until = ban_expiry(None, BAN_BODY, Timestamp::now()).expect("expiry in the body");
+        let until = ban_expiry(None, BAN_BODY, Timestamp::now());
 
         assert_eq!(until.as_millisecond(), 1_785_050_129_644);
     }
 
-    /// `Retry-After` is the structured answer and wins over the prose.
     #[test]
     fn retry_after_is_preferred() {
         let now = Timestamp::from_millisecond(1_785_050_000_000).unwrap();
 
-        let until = ban_expiry(Some("120"), BAN_BODY, now).expect("expiry from the header");
+        let until = ban_expiry(Some("120"), BAN_BODY, now);
 
         assert_eq!(until.as_millisecond(), 1_785_050_000_000 + 120_000);
     }
 
-    /// A reply that says nothing usable must not be read as "not banned".
     #[test]
-    fn an_unreadable_reply_yields_no_expiry() {
-        assert!(ban_expiry(None, b"{}", Timestamp::now()).is_none());
-        assert!(ban_expiry(Some("soon"), b"nothing here", Timestamp::now()).is_none());
-        assert!(ban_expiry(None, b"banned until soon", Timestamp::now()).is_none());
+    fn an_unreadable_reply_still_bans() {
+        let now = Timestamp::from_millisecond(1_785_050_000_000).unwrap();
+        for (retry_after, body) in [
+            (None, &b"{}"[..]),
+            (Some("soon"), b"nothing here"),
+            (None, b"banned until soon"),
+            (Some("-5"), b"{}"),
+        ] {
+            assert_eq!(
+                ban_expiry(retry_after, body, now).as_millisecond(),
+                1_785_050_000_000 + 120_000,
+                "{retry_after:?} {body:?}"
+            );
+        }
     }
 
-    /// Once a ban is recorded, nothing is sent until it lifts — the behaviour
-    /// that keeps Binance's two minutes from escalating into days.
+    /// Once a ban is recorded, nothing is sent until it lifts: what keeps
+    /// Binance's two minutes from escalating into days.
     #[tokio::test]
     async fn a_recorded_ban_stops_every_request() {
         let throttler = Throttler::new(crate::throttler::SNAPSHOT_WEIGHT_BUDGET);
@@ -230,10 +232,10 @@ mod tests {
             Some(1)
         );
 
-        // Relative to now, not to the expiry captured in `BAN_BODY`: that one
-        // is a real timestamp from a real ban, and once it passed, the ban
-        // under test was already over and this asserted nothing.
-        let until = Timestamp::now().checked_add(Span::new().hours(24)).unwrap();
+        // Relative to now: `BAN_BODY`'s real expiry has long passed.
+        let until = Timestamp::now()
+            .checked_add(SignedDuration::from_hours(24))
+            .unwrap();
         throttler.note_ban(until);
 
         assert_eq!(
@@ -248,8 +250,8 @@ mod tests {
     async fn a_ban_is_never_shortened() {
         let throttler = Throttler::new(crate::throttler::SNAPSHOT_WEIGHT_BUDGET);
         let now = Timestamp::now();
-        let far = now.checked_add(Span::new().hours(24)).unwrap();
-        let near = now.checked_add(Span::new().minutes(1)).unwrap();
+        let far = now.checked_add(SignedDuration::from_hours(24)).unwrap();
+        let near = now.checked_add(SignedDuration::from_mins(1)).unwrap();
 
         throttler.note_ban(far);
         throttler.note_ban(near);
