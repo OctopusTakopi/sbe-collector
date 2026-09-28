@@ -1335,6 +1335,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "jiff",
+ "libc",
  "reqwest",
  "rustls",
  "serde",

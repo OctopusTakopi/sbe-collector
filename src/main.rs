@@ -87,6 +87,43 @@ struct Args {
     handover_socket: Option<PathBuf>,
 }
 
+/// What a hangup does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hangup {
+    /// Drain and exit, as for SIGTERM: `tmux kill-session` delivers SIGHUP,
+    /// and unhandled it kills the process before buffered records are
+    /// written.
+    Drain,
+    /// SIGHUP was ignored at startup (`nohup`). Installing a handler would
+    /// replace that inherited ignore.
+    Ignore,
+}
+
+impl Hangup {
+    fn for_disposition(handler: libc::sighandler_t) -> Self {
+        if handler == libc::SIG_IGN {
+            Self::Ignore
+        } else {
+            Self::Drain
+        }
+    }
+
+    /// From SIGHUP's disposition before any handler is installed.
+    fn inherited() -> std::io::Result<Self> {
+        // SAFETY: with a null new action `sigaction` only writes the current
+        // one into `old`, a live local for which all-zero bytes are valid.
+        let (status, old) = unsafe {
+            let mut old: libc::sigaction = std::mem::zeroed();
+            let status = libc::sigaction(libc::SIGHUP, std::ptr::null(), &mut old);
+            (status, old)
+        };
+        if status != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self::for_disposition(old.sa_sigaction))
+    }
+}
+
 enum Shutdown {
     Signal,
     Writer,
@@ -100,6 +137,10 @@ enum Shutdown {
 async fn main() -> anyhow::Result<()> {
     init_tracing();
     let args = Args::parse();
+    let hangup = Hangup::inherited()?;
+    if hangup == Hangup::Ignore {
+        info!("SIGHUP is ignored (inherited, e.g. from nohup); a hangup will not stop collection");
+    }
     let api_key = std::env::var("BINANCE_API_KEY").unwrap_or_default();
     if api_key.is_empty() {
         bail!("BINANCE_API_KEY env var must be set for the SBE stream endpoint");
@@ -189,7 +230,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let shutdown = select! {
-        result = shutdown_signal() => {
+        result = shutdown_signal(hangup) => {
             let signal = result?;
             info!(signal, "shutdown signal received");
             Shutdown::Signal
@@ -356,25 +397,42 @@ fn root_cause(
     }
 }
 
-async fn shutdown_signal() -> std::io::Result<&'static str> {
+async fn shutdown_signal(hangup: Hangup) -> std::io::Result<&'static str> {
     use signal::unix::{SignalKind, signal as unix_signal};
     let mut sigterm = unix_signal(SignalKind::terminate())?;
-    // `tmux kill-session` delivers SIGHUP; unhandled, it kills the process
-    // before buffered records are written.
-    let mut sighup = unix_signal(SignalKind::hangup())?;
+    let mut sighup = match hangup {
+        Hangup::Drain => Some(unix_signal(SignalKind::hangup())?),
+        Hangup::Ignore => None,
+    };
+    let sighup = async {
+        match &mut sighup {
+            Some(sighup) => {
+                sighup.recv().await;
+            }
+            None => std::future::pending().await,
+        }
+    };
     select! {
         result = signal::ctrl_c() => {
             result?;
             Ok("SIGINT")
         }
         _ = sigterm.recv() => Ok("SIGTERM"),
-        _ = sighup.recv() => Ok("SIGHUP"),
+        () = sighup => Ok("SIGHUP"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_an_ignored_sighup_stays_ignored() {
+        assert_eq!(Hangup::for_disposition(libc::SIG_IGN), Hangup::Ignore);
+        assert_eq!(Hangup::for_disposition(libc::SIG_DFL), Hangup::Drain);
+        let handler = only_an_ignored_sighup_stays_ignored as fn() as libc::sighandler_t;
+        assert_eq!(Hangup::for_disposition(handler), Hangup::Drain);
+    }
 
     /// The handover identity carries the CLI spelling, so it must round-trip.
     #[test]
