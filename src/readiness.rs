@@ -1,103 +1,79 @@
-use std::{
-    collections::HashMap,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
-};
+use std::collections::HashMap;
 
 use tokio::sync::watch;
 
+/// Whether the writer and every required source are live, published to the
+/// handover supervisor.
 #[derive(Clone)]
-pub struct Readiness {
-    inner: Arc<Inner>,
-}
+pub struct Readiness(watch::Sender<ReadinessState>);
 
-struct Inner {
-    required_sources: usize,
-    live_sources: Mutex<HashMap<String, usize>>,
-    writer_ready: AtomicBool,
-    outage_epoch: AtomicU64,
-    ready_tx: watch::Sender<ReadinessState>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct ReadinessState {
-    pub ready: bool,
+    required_sources: usize,
+    /// Live sessions per logical source.
+    live_sources: HashMap<String, usize>,
+    writer_ready: bool,
+    /// Bumped whenever a source loses its last live session. A watch can
+    /// coalesce a drop-and-reconnect into "still ready"; the epoch cannot.
     pub outage_epoch: u64,
 }
 
+impl ReadinessState {
+    pub fn is_ready(&self) -> bool {
+        self.writer_ready && self.live_sources.len() >= self.required_sources
+    }
+}
+
+/// One live session of a source; dropping it revokes that liveness.
 pub struct SourceLease {
-    inner: Arc<Inner>,
+    readiness: Readiness,
     source: String,
 }
 
 impl Readiness {
     pub fn new(required_sources: usize) -> (Self, watch::Receiver<ReadinessState>) {
-        let (ready_tx, ready_rx) = watch::channel(ReadinessState {
-            ready: false,
+        let (tx, rx) = watch::channel(ReadinessState {
+            required_sources,
+            live_sources: HashMap::with_capacity(required_sources),
+            writer_ready: false,
             outage_epoch: 0,
         });
-        (
-            Self {
-                inner: Arc::new(Inner {
-                    required_sources,
-                    live_sources: Mutex::new(HashMap::with_capacity(required_sources)),
-                    writer_ready: AtomicBool::new(false),
-                    outage_epoch: AtomicU64::new(0),
-                    ready_tx,
-                }),
-            },
-            ready_rx,
-        )
+        (Self(tx), rx)
     }
 
-    /// Mark one live session for a logical source. Dropping the returned lease
-    /// revokes that session's liveness; overlapping replacement sessions are
-    /// reference-counted so retiring either one cannot hide the other.
+    /// Overlapping sessions of one source are counted, so retiring either
+    /// cannot hide the other.
     pub fn source_live(&self, source: impl Into<String>) -> SourceLease {
         let source = source.into();
-        let mut live = self.inner.live_sources.lock().unwrap();
-        *live.entry(source.clone()).or_default() += 1;
-        self.publish(live.len());
+        self.0
+            .send_modify(|state| match state.live_sources.get_mut(&source) {
+                Some(sessions) => *sessions += 1,
+                None => {
+                    state.live_sources.insert(source.clone(), 1);
+                }
+            });
         SourceLease {
-            inner: self.inner.clone(),
+            readiness: self.clone(),
             source,
         }
     }
 
     pub fn mark_writer_ready(&self) {
-        self.inner.writer_ready.store(true, Ordering::Release);
-        let live = self.inner.live_sources.lock().unwrap().len();
-        self.publish(live);
-    }
-
-    fn publish(&self, live_sources: usize) {
-        let ready = live_sources >= self.inner.required_sources
-            && self.inner.writer_ready.load(Ordering::Acquire);
-        self.inner.ready_tx.send_replace(ReadinessState {
-            ready,
-            outage_epoch: self.inner.outage_epoch.load(Ordering::Acquire),
-        });
+        self.0.send_modify(|state| state.writer_ready = true);
     }
 }
 
 impl Drop for SourceLease {
     fn drop(&mut self) {
-        let mut live = self.inner.live_sources.lock().unwrap();
-        let Some(count) = live.get_mut(&self.source) else {
-            return;
-        };
-        *count -= 1;
-        if *count == 0 {
-            live.remove(&self.source);
-            self.inner.outage_epoch.fetch_add(1, Ordering::AcqRel);
-        }
-        let ready = live.len() >= self.inner.required_sources
-            && self.inner.writer_ready.load(Ordering::Acquire);
-        self.inner.ready_tx.send_replace(ReadinessState {
-            ready,
-            outage_epoch: self.inner.outage_epoch.load(Ordering::Acquire),
+        self.readiness.0.send_modify(|state| {
+            let Some(sessions) = state.live_sources.get_mut(&self.source) else {
+                return;
+            };
+            *sessions -= 1;
+            if *sessions == 0 {
+                state.live_sources.remove(&self.source);
+                state.outage_epoch += 1;
+            }
         });
     }
 }
@@ -112,13 +88,24 @@ mod tests {
         let connection_0 = readiness.source_live("connection-0");
         let duplicate_0 = readiness.source_live("connection-0");
         readiness.mark_writer_ready();
-        assert!(!ready.borrow().ready);
+        assert!(!ready.borrow().is_ready());
         let connection_1 = readiness.source_live("connection-1");
-        assert!(ready.borrow().ready);
+        assert!(ready.borrow().is_ready());
         drop(duplicate_0);
-        assert!(ready.borrow().ready);
+        assert!(ready.borrow().is_ready());
         drop(connection_1);
-        assert!(!ready.borrow().ready);
+        assert!(!ready.borrow().is_ready());
         drop(connection_0);
+    }
+
+    #[test]
+    fn only_losing_a_sources_last_session_is_an_outage() {
+        let (readiness, ready) = Readiness::new(1);
+        let first = readiness.source_live("source");
+        let overlap = readiness.source_live("source");
+        drop(first);
+        assert_eq!(ready.borrow().outage_epoch, 0);
+        drop(overlap);
+        assert_eq!(ready.borrow().outage_epoch, 1);
     }
 }

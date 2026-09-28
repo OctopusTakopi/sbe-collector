@@ -189,7 +189,7 @@ async fn wait_until_stably_ready(
 ) -> anyhow::Result<()> {
     timeout(READY_TIMEOUT, async {
         loop {
-            while !ready.borrow_and_update().ready {
+            while !ready.borrow_and_update().is_ready() {
                 ready
                     .changed()
                     .await
@@ -204,8 +204,8 @@ async fn wait_until_stably_ready(
                     biased;
                     result = ready.changed() => {
                         result.map_err(|_| anyhow!("readiness sender closed"))?;
-                        let state = *ready.borrow_and_update();
-                        if !state.ready || state.outage_epoch != outage_epoch {
+                        let state = ready.borrow_and_update();
+                        if !state.is_ready() || state.outage_epoch != outage_epoch {
                             break;
                         }
                     }
@@ -466,8 +466,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(80)).await;
         drop(first);
-        // Reconnect without yielding: a boolean watch can coalesce this
-        // false->true transition, while the outage epoch cannot.
+        // Reconnect without yielding, so only the outage epoch shows it.
         let _second = readiness.source_live("source");
         assert!(
             timeout(Duration::from_millis(150), &mut waiter)
