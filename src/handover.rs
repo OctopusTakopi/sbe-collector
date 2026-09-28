@@ -90,8 +90,50 @@ impl TakeoverRequest {
 }
 
 enum Role {
-    Incumbent(UnixListener),
+    Incumbent(Listener),
     Challenger(UnixStream),
+}
+
+/// A bound handover socket and the inode its bind created. Releasing it
+/// unlinks the path only while the path still names that inode: once this
+/// process stops answering, another may clear the path as stale and bind its
+/// own socket there.
+struct Listener {
+    socket: UnixListener,
+    inode: (u64, u64),
+}
+
+impl Listener {
+    fn bind(path: &Path) -> io::Result<Self> {
+        let socket = UnixListener::bind(path)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        let metadata = std::fs::symlink_metadata(path)?;
+        Ok(Self {
+            socket,
+            inode: (metadata.dev(), metadata.ino()),
+        })
+    }
+
+    /// Unlink `path` if it still names this socket, then stop listening.
+    fn release(self, path: &Path) {
+        let unlinked = match std::fs::symlink_metadata(path) {
+            Ok(metadata) if (metadata.dev(), metadata.ino()) == self.inode => {
+                std::fs::remove_file(path)
+            }
+            Ok(_) => {
+                tracing::info!(
+                    path = %path.display(),
+                    "handover socket path now names another socket; leaving it"
+                );
+                Ok(())
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = unlinked {
+            tracing::warn!(path = %path.display(), %error, "failed to unlink handover socket");
+        }
+    }
 }
 
 pub async fn run(
@@ -101,6 +143,7 @@ pub async fn run(
     mut ready: watch::Receiver<ReadinessState>,
     takeover_tx: mpsc::Sender<TakeoverRequest>,
     quality: QualityReporter,
+    mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -109,7 +152,16 @@ pub async fn run(
 
     match select_role(&path).await? {
         Role::Incumbent(listener) => {
-            server_loop(listener, &path, &identity, &run_id, takeover_tx, quality).await
+            server_loop(
+                listener,
+                &path,
+                &identity,
+                &run_id,
+                takeover_tx,
+                quality,
+                &mut shutdown,
+            )
+            .await
         }
         Role::Challenger(mut stream) => {
             write_message(
@@ -178,7 +230,16 @@ pub async fn run(
                     }
                 },
             };
-            server_loop(listener, &path, &identity, &run_id, takeover_tx, quality).await
+            server_loop(
+                listener,
+                &path,
+                &identity,
+                &run_id,
+                takeover_tx,
+                quality,
+                &mut shutdown,
+            )
+            .await
         }
     }
 }
@@ -220,112 +281,31 @@ async fn wait_until_stably_ready(
 }
 
 async fn server_loop(
-    listener: UnixListener,
+    listener: Listener,
     path: &Path,
     identity: &Identity,
     run_id: &str,
     takeover_tx: mpsc::Sender<TakeoverRequest>,
     quality: QualityReporter,
+    shutdown: &mut watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     tracing::info!(path = %path.display(), "UDS handover listener ready");
     loop {
-        let (mut stream, _) = listener.accept().await?;
-        let peer_allowed = match same_uid(&stream, path) {
-            Ok(allowed) => allowed,
-            Err(error) => {
-                tracing::warn!(%error, "cannot authenticate UDS handover peer");
-                continue;
-            }
+        let mut stream = tokio::select! {
+            biased;
+            () = stop_requested(shutdown) => break,
+            accepted = listener.socket.accept() => accepted?.0,
         };
-        if !peer_allowed {
-            let _ = write_message(
-                &mut stream,
-                &Message::Reject {
-                    reason: "peer uid does not own the handover socket".to_owned(),
-                },
-            )
-            .await;
-            continue;
-        }
-
-        let hello = match timeout(HANDSHAKE_TIMEOUT, read_message(&mut stream)).await {
-            Ok(Ok(message)) => message,
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "invalid UDS handover hello");
-                continue;
-            }
-            Err(_) => {
-                tracing::warn!("UDS handover peer timed out before hello");
-                continue;
-            }
-        };
-        let peer_run_id = match hello {
-            Message::Hello {
-                protocol_version,
-                run_id: peer_run_id,
-                identity: peer_identity,
-            } if protocol_version == PROTOCOL_VERSION && peer_identity == *identity => peer_run_id,
-            Message::Hello {
-                protocol_version, ..
-            } => {
-                if let Err(error) = write_message(
-                    &mut stream,
-                    &Message::Reject {
-                        reason: format!(
-                            "protocol/configuration mismatch (peer protocol {protocol_version})"
-                        ),
-                    },
-                )
-                .await
-                {
-                    tracing::warn!(%error, "handover peer disconnected before rejection");
-                }
-                continue;
-            }
-            message => {
-                if let Err(error) = write_message(
-                    &mut stream,
-                    &Message::Reject {
-                        reason: format!("expected hello, got {message:?}"),
-                    },
-                )
-                .await
-                {
-                    tracing::warn!(%error, "handover peer disconnected before rejection");
-                }
-                continue;
-            }
-        };
-
-        if let Err(error) = write_message(
-            &mut stream,
-            &Message::HelloAck {
-                run_id: run_id.to_owned(),
+        // Shutting down drops a challenger mid-handshake: it sees EOF and
+        // chooses its role again.
+        let peer_run_id = tokio::select! {
+            biased;
+            () = stop_requested(shutdown) => break,
+            peer = negotiate(&mut stream, path, identity, run_id) => match peer {
+                Some(peer_run_id) => peer_run_id,
+                None => continue,
             },
-        )
-        .await
-        {
-            tracing::warn!(%error, "handover challenger disconnected before acknowledgement");
-            continue;
-        }
-        let ready = match timeout(READY_TIMEOUT, read_message(&mut stream)).await {
-            Ok(Ok(Message::Ready { run_id })) if run_id == peer_run_id => true,
-            Ok(Ok(message)) => {
-                tracing::warn!(?message, "handover peer did not send matching readiness");
-                false
-            }
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "handover challenger disconnected before readiness");
-                false
-            }
-            Err(_) => {
-                tracing::warn!("handover challenger did not become ready in time");
-                false
-            }
         };
-        if !ready {
-            continue;
-        }
 
         quality.report(QualityEvent::Handover {
             at_ns: QualityEvent::now_ns(),
@@ -353,6 +333,110 @@ async fn server_loop(
         }
         return Ok(());
     }
+    tracing::info!(path = %path.display(), "shutting down; releasing the handover socket");
+    listener.release(path);
+    Ok(())
+}
+
+/// Resolves once the process is asked to stop; never if it no longer can be.
+async fn stop_requested(shutdown: &mut watch::Receiver<bool>) {
+    if shutdown.wait_for(|&stop| stop).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Authenticate a connected challenger, check that it records the same
+/// streams, and wait for its readiness. Its run id once it is ready; `None`
+/// if it was turned away or left.
+async fn negotiate(
+    stream: &mut UnixStream,
+    path: &Path,
+    identity: &Identity,
+    run_id: &str,
+) -> Option<String> {
+    let peer_allowed = match same_uid(stream, path) {
+        Ok(allowed) => allowed,
+        Err(error) => {
+            tracing::warn!(%error, "cannot authenticate UDS handover peer");
+            return None;
+        }
+    };
+    if !peer_allowed {
+        let _ = write_message(
+            stream,
+            &Message::Reject {
+                reason: "peer uid does not own the handover socket".to_owned(),
+            },
+        )
+        .await;
+        return None;
+    }
+
+    let hello = match timeout(HANDSHAKE_TIMEOUT, read_message(stream)).await {
+        Ok(Ok(message)) => message,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "invalid UDS handover hello");
+            return None;
+        }
+        Err(_) => {
+            tracing::warn!("UDS handover peer timed out before hello");
+            return None;
+        }
+    };
+    let peer_run_id = match hello {
+        Message::Hello {
+            protocol_version,
+            run_id: peer_run_id,
+            identity: peer_identity,
+        } if protocol_version == PROTOCOL_VERSION && peer_identity == *identity => peer_run_id,
+        Message::Hello {
+            protocol_version, ..
+        } => {
+            reject(
+                stream,
+                format!("protocol/configuration mismatch (peer protocol {protocol_version})"),
+            )
+            .await;
+            return None;
+        }
+        message => {
+            reject(stream, format!("expected hello, got {message:?}")).await;
+            return None;
+        }
+    };
+
+    if let Err(error) = write_message(
+        stream,
+        &Message::HelloAck {
+            run_id: run_id.to_owned(),
+        },
+    )
+    .await
+    {
+        tracing::warn!(%error, "handover challenger disconnected before acknowledgement");
+        return None;
+    }
+    match timeout(READY_TIMEOUT, read_message(stream)).await {
+        Ok(Ok(Message::Ready { run_id })) if run_id == peer_run_id => Some(peer_run_id),
+        Ok(Ok(message)) => {
+            tracing::warn!(?message, "handover peer did not send matching readiness");
+            None
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "handover challenger disconnected before readiness");
+            None
+        }
+        Err(_) => {
+            tracing::warn!("handover challenger did not become ready in time");
+            None
+        }
+    }
+}
+
+async fn reject(stream: &mut UnixStream, reason: String) {
+    if let Err(error) = write_message(stream, &Message::Reject { reason }).await {
+        tracing::warn!(%error, "handover peer disconnected before rejection");
+    }
 }
 
 async fn select_role(path: &Path) -> anyhow::Result<Role> {
@@ -360,7 +444,7 @@ async fn select_role(path: &Path) -> anyhow::Result<Role> {
         match UnixStream::connect(path).await {
             Ok(stream) => return Ok(Role::Challenger(stream)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return match bind_listener(path) {
+                return match Listener::bind(path) {
                     Ok(listener) => Ok(Role::Incumbent(listener)),
                     Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
                         Ok(Role::Challenger(UnixStream::connect(path).await?))
@@ -379,7 +463,7 @@ async fn select_role(path: &Path) -> anyhow::Result<Role> {
     // Three refused connections identify a stale pathname left by an
     // ungraceful exit; a merely racing incumbent was given time to listen.
     remove_socket(path)?;
-    match bind_listener(path) {
+    match Listener::bind(path) {
         Ok(listener) => Ok(Role::Incumbent(listener)),
         Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
             Ok(Role::Challenger(UnixStream::connect(path).await?))
@@ -388,10 +472,10 @@ async fn select_role(path: &Path) -> anyhow::Result<Role> {
     }
 }
 
-async fn bind_after_handover(path: &Path) -> anyhow::Result<UnixListener> {
+async fn bind_after_handover(path: &Path) -> anyhow::Result<Listener> {
     timeout(HANDSHAKE_TIMEOUT, async {
         loop {
-            match bind_listener(path) {
+            match Listener::bind(path) {
                 Ok(listener) => return Ok(listener),
                 Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
                     tokio::time::sleep(BIND_RETRY).await;
@@ -403,12 +487,6 @@ async fn bind_after_handover(path: &Path) -> anyhow::Result<UnixListener> {
     .await
     .map_err(|_| anyhow!("timed out taking ownership of {}", path.display()))?
     .map_err(Into::into)
-}
-
-fn bind_listener(path: &Path) -> io::Result<UnixListener> {
-    let listener = UnixListener::bind(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(listener)
 }
 
 fn remove_socket(path: &Path) -> anyhow::Result<()> {
@@ -495,6 +573,7 @@ mod tests {
         takeover: mpsc::Receiver<TakeoverRequest>,
         _readiness: Readiness,
         _source: Option<SourceLease>,
+        _shutdown: watch::Sender<bool>,
     }
 
     impl Fixture {
@@ -525,6 +604,7 @@ mod tests {
                 readiness.source_live("source")
             });
             let (takeover_tx, takeover) = mpsc::channel(1);
+            let (shutdown, shutdown_rx) = watch::channel(false);
             let task = tokio::spawn(run(
                 self.path.clone(),
                 self.identity.clone(),
@@ -532,12 +612,14 @@ mod tests {
                 ready_rx,
                 takeover_tx,
                 QualityReporter::disabled(),
+                shutdown_rx,
             ));
             Peer {
                 task,
                 takeover,
                 _readiness: readiness,
                 _source: source,
+                _shutdown: shutdown,
             }
         }
 
@@ -561,6 +643,57 @@ mod tests {
             })
             .await
             .unwrap();
+        }
+    }
+
+    /// A handover supervisor on its own thread and runtime, as a separate
+    /// process runs it. Never ready, so as a challenger it stays
+    /// mid-handshake.
+    struct Process {
+        thread: std::thread::JoinHandle<anyhow::Result<()>>,
+        shutdown: watch::Sender<bool>,
+    }
+
+    impl Process {
+        fn spawn(fixture: &Fixture, run_id: &str) -> Self {
+            let (shutdown, shutdown_rx) = watch::channel(false);
+            let path = fixture.path.clone();
+            let identity = fixture.identity.clone();
+            let run_id = run_id.to_owned();
+            let thread = std::thread::spawn(move || {
+                let (_readiness, ready) = Readiness::new(1);
+                let (takeover_tx, _takeover) = mpsc::channel(1);
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(run(
+                        path,
+                        identity,
+                        run_id,
+                        ready,
+                        takeover_tx,
+                        QualityReporter::disabled(),
+                        shutdown_rx,
+                    ))
+            });
+            Self { thread, shutdown }
+        }
+
+        /// Request shutdown, as a signal does, and wait for the supervisor.
+        fn shut_down(self) -> anyhow::Result<()> {
+            self.shutdown.send_replace(true);
+            self.thread.join().unwrap()
+        }
+    }
+
+    impl Fixture {
+        /// Blocking, for peers on their own threads.
+        fn wait_for_socket(&self) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !self.path.exists() {
+                assert!(std::time::Instant::now() < deadline, "no socket appeared");
+                std::thread::sleep(Duration::from_millis(5));
+            }
         }
     }
 
@@ -629,6 +762,7 @@ mod tests {
         mismatch.symbols.push("ethusdt".to_owned());
         let (_readiness, ready) = Readiness::new(1);
         let (takeover_tx, _takeover) = mpsc::channel(1);
+        let (_shutdown, shutdown) = watch::channel(false);
         let error = run(
             fixture.path.clone(),
             mismatch,
@@ -636,6 +770,7 @@ mod tests {
             ready,
             takeover_tx,
             QualityReporter::disabled(),
+            shutdown,
         )
         .await
         .unwrap_err();
@@ -643,6 +778,28 @@ mod tests {
         assert!(old.takeover.try_recv().is_err());
         assert!(!old.task.is_finished());
         stop(old).await;
+    }
+
+    #[test]
+    fn incumbent_shutdown_unlinks_its_socket() {
+        let fixture = Fixture::new("release");
+        let old = Process::spawn(&fixture, "old");
+        fixture.wait_for_socket();
+        old.shut_down().unwrap();
+        assert!(!fixture.path.exists());
+    }
+
+    #[test]
+    fn incumbent_shutdown_leaves_a_socket_bound_since() {
+        let fixture = Fixture::new("rebound");
+        let old = Process::spawn(&fixture, "old");
+        fixture.wait_for_socket();
+        // Another process cleared the path as stale and bound its own socket.
+        std::fs::remove_file(&fixture.path).unwrap();
+        let _other = std::os::unix::net::UnixListener::bind(&fixture.path).unwrap();
+        let other = std::fs::metadata(&fixture.path).unwrap().ino();
+        old.shut_down().unwrap();
+        assert_eq!(std::fs::metadata(&fixture.path).unwrap().ino(), other);
     }
 
     #[test]

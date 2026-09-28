@@ -138,6 +138,7 @@ async fn main() -> anyhow::Result<()> {
         .handover_socket
         .clone()
         .unwrap_or_else(|| args.path.join(".collector.sock"));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (takeover_tx, mut takeover_rx) = mpsc::channel(1);
     let mut handover_task = tokio::spawn(handover::run(
         socket,
@@ -146,10 +147,10 @@ async fn main() -> anyhow::Result<()> {
         ready_rx,
         takeover_tx,
         quality.clone(),
+        shutdown_rx.clone(),
     ));
 
     let (writer_tx, mut writer_rx) = mpsc::channel::<WriteRecord>(WRITER_QUEUE_CAPACITY);
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut collection = match args.exchange {
         Exchange::BinanceSbeSpot => tokio::spawn(binancesbespot::run_collection(
             binancesbespot::Subscription {
@@ -205,6 +206,8 @@ async fn main() -> anyhow::Result<()> {
             info!(peer_run_id = %request.peer_run_id, "ready replacement requested takeover");
             Shutdown::Takeover(request)
         }
+        // Shutdown is requested only after this select, so the supervisor
+        // returning here is always a failure.
         result = &mut handover_task => Shutdown::HandoverFailed(match result {
             Ok(Ok(())) => anyhow!("UDS handover supervisor exited unexpectedly"),
             Ok(Err(error)) => error,
