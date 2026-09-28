@@ -1,40 +1,33 @@
 //! Gap detector for the sbe-collector's recording files.
 //!
-//! Files are zstd streams of length-prefixed records, one file per symbol
-//! per UTC day (`<symbol>_<YYYYMMDD>.zst`):
-//!
-//! ```text
-//! [i64 recv_ns LE][u8 tag][u32 payload_len LE][payload]
-//! ```
-//!
-//! Tag `S` is a raw SBE stream frame, tag `R` a REST depth snapshot (JSON).
-//! This tool scans a data directory, groups the files into per-symbol
-//! series, and reports:
+//! Scans directories for `<symbol>_<YYYYMMDD>.zst` files (plus handover
+//! sidecars and legacy segments), groups them into per-symbol series, and
+//! reports:
 //!
 //! * receive-time gaps above a threshold and receive-time regressions,
-//!   including across the midnight file rotation;
-//! * venue sequence breaks. Redundant connections can interleave, so the
-//!   chains track the running maximum and only forward breaks count:
-//!   - depth diffs (10003): the next event's `firstBookUpdateId` is
-//!     normally `prev lastBookUpdateId + 1` (the collector's own rule);
+//!   including across the midnight rotation;
+//! * venue sequence breaks. Redundant connections interleave, so each chain
+//!   tracks its running maximum and only forward breaks count:
+//!   - depth diffs (10003): `firstBookUpdateId` normally follows the previous
+//!     `lastBookUpdateId + 1` (the collector's own rule);
 //!   - trades (10000): trade ids increment by one per trade;
 //!   - best bid/ask (10001): `bookUpdateId` must not go backwards;
-//! * range accounting for trade ids: with unique ids,
-//!   `(max - min + 1) - count` is the net of missing ids minus late
-//!   duplicates — reorder-proof. `--exact` builds id sets to split that
-//!   into exact missing and exact duplicate counts;
+//! * range accounting for trade ids: ids are unique, so
+//!   `(max - min + 1) - count` nets missing ids against late duplicates
+//!   whatever the order. `--exact` builds id sets to split the two;
 //! * event-time regressions per template;
 //! * missing calendar dates within a series;
-//! * undecodable, malformed, or foreign content (e.g. the JSON-line files
-//!   of the sister collector are detected and skipped).
+//! * undecodable, malformed, or foreign content (such as the JSON-line files
+//!   of the sister collector, which are skipped).
 //!
-//! Sequence state is kept per stream *across* files of a series, so breaks
-//! straddling the rotation boundary are attributed correctly.
+//! Sequence state carries across a series' files, so a break straddling the
+//! rotation is attributed correctly.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     fs::{self, File},
     io::Read,
+    ops::AddAssign,
     path::{Path, PathBuf},
     sync::{
         Mutex,
@@ -46,31 +39,29 @@ use std::{
 use anyhow::{Context as _, Result};
 use clap::Parser;
 use jiff::{Span, Timestamp, civil, tz::TimeZone};
-use sbe_collector::sbe_types::{
-    BestBidAskBlock, DepthDiffBlock, GroupSizeEncoding, MessageHeader, TEMPLATE_BEST_BID_ASK,
-    TEMPLATE_DEPTH_DIFF, TEMPLATE_DEPTH_SNAPSHOT, TEMPLATE_TRADES, TradesBlock,
+use sbe_collector::{
+    record::{HEADER_LEN, Header, Tag},
+    sbe_types::{
+        BestBidAskBlock, DepthDiffBlock, EVENT_TIME, GroupSizeEncoding, MessageHeader,
+        TEMPLATE_BEST_BID_ASK, TEMPLATE_DEPTH_DIFF, TEMPLATE_DEPTH_SNAPSHOT, TEMPLATE_TRADES,
+        TradesBlock,
+    },
 };
 use zerocopy::FromBytes;
 
-/// Files whose tail is newer than this are assumed to still be written by a
-/// live collector, so an unterminated zstd frame is labelled rather than
-/// treated as corruption.
+/// A file whose tail is newer than this is assumed to still be written by a
+/// live collector, so an unterminated zstd frame is labelled as such.
 const LIVE_FILE_WINDOW: Duration = Duration::from_secs(15 * 60);
 
-/// Keep at most this many break timestamps per stream.
+/// Break timestamps kept per stream.
 const MAX_BREAK_TIMES: usize = 16;
 
-/// `[i64 recv_ns LE][u8 tag][u32 payload_len LE]`
-const FRAME_HEADER_LEN: usize = 13;
-const TAG_SBE: u8 = b'S';
-const TAG_REST: u8 = b'R';
-
-/// Sanity ceiling for one payload; real SBE frames are far smaller. A length
-/// beyond this means the stream is corrupt (or the file is a foreign format).
+/// Sanity ceiling for one payload; beyond it the stream is corrupt or
+/// foreign.
 const MAX_PAYLOAD_LEN: u32 = 64 * 1024 * 1024;
 
-/// Duplicate recordings from two rolling processes should arrive close
-/// together. Pairing is also restricted to the processes' observed overlap.
+/// How far apart two rolling processes' copies of one event may be received
+/// to be paired. Pairing is also confined to the runs' observed overlap.
 const OVERLAP_DEDUP_WINDOW_NS: i64 = 5_000_000_000;
 
 #[derive(Parser)]
@@ -106,9 +97,12 @@ struct Args {
     fail_on_gaps: bool,
 }
 
+/// A recording file, as its name describes it.
 struct DatedFile {
+    symbol: String,
     path: PathBuf,
     date: civil::Date,
+    /// Legacy segments only; `i64::MIN` sorts daily files and sidecars first.
     segment_start_ns: i64,
     run_id: Option<String>,
 }
@@ -118,9 +112,8 @@ struct Series {
     files: Vec<DatedFile>,
 }
 
-/// Discover daily files, handover sidecars, and legacy segmented zstd files
-/// under the roots and group them into per-(directory, symbol) series in
-/// recording order.
+/// Discover daily files, handover sidecars and legacy segments under the
+/// roots, grouped into per-(directory, symbol) series in recording order.
 fn discover(roots: &[PathBuf]) -> Result<Vec<Series>> {
     let mut map: BTreeMap<(PathBuf, String), Vec<DatedFile>> = BTreeMap::new();
     let mut stack: Vec<PathBuf> = Vec::new();
@@ -138,9 +131,11 @@ fn discover(roots: &[PathBuf]) -> Result<Vec<Series>> {
             if dir.extension().is_none_or(|ext| ext != "zst") {
                 continue;
             }
-            if let Some((symbol, df)) = dated_file(&dir) {
+            if let Some(file) = dated_file(&dir) {
                 let parent = dir.parent().unwrap_or(Path::new(".")).to_path_buf();
-                map.entry((parent, symbol)).or_default().push(df);
+                map.entry((parent, file.symbol.clone()))
+                    .or_default()
+                    .push(file);
             } else {
                 skipped += 1;
             }
@@ -152,8 +147,7 @@ fn discover(roots: &[PathBuf]) -> Result<Vec<Series>> {
         for entry in fs::read_dir(&dir)
             .with_context(|| format!("cannot read directory {}", dir.display()))?
         {
-            let entry = entry?;
-            stack.push(entry.path());
+            stack.push(entry?.path());
         }
     }
     if skipped > 0 {
@@ -183,70 +177,56 @@ fn discover(roots: &[PathBuf]) -> Result<Vec<Series>> {
     Ok(series)
 }
 
-fn dated_file(path: &Path) -> Option<(String, DatedFile)> {
+fn dated_file(path: &Path) -> Option<DatedFile> {
     if path.extension().is_none_or(|ext| ext != "zst") {
         return None;
     }
     let stem = path.file_stem()?.to_str()?;
-    // Legacy segmented form: <symbol>_<date>_<segment-start-ns>_<run-id>.zst.
-    // `rsplitn` preserves underscores in exchange symbols. The segment start is
-    // epoch nanoseconds, not an 8-digit YYYYMMDD.
+    let file = |symbol: &str, date, segment_start_ns, run_id| DatedFile {
+        symbol: symbol.to_owned(),
+        path: path.to_path_buf(),
+        date,
+        segment_start_ns,
+        run_id,
+    };
+
+    // Legacy segment: <symbol>_<date>_<segment-start-ns>_<run-id>.zst.
+    // `rsplitn` keeps underscores in symbols; the segment start is epoch
+    // nanoseconds, never 8 digits.
     let mut parts = stem.rsplitn(4, '_');
-    let run_id = parts.next()?.to_owned();
-    let segment_start = parts.next();
-    let date_str = parts.next();
-    let symbol = parts.next();
-    if let (Some(segment_start), Some(date_str), Some(symbol)) = (segment_start, date_str, symbol)
+    let run_id = parts.next()?;
+    if let (Some(segment_start), Some(date), Some(symbol)) =
+        (parts.next(), parts.next(), parts.next())
         && segment_start.len() != 8
         && let (Ok(segment_start_ns), Ok(date)) = (
             segment_start.parse::<i64>(),
-            civil::Date::strptime("%Y%m%d", date_str),
+            civil::Date::strptime("%Y%m%d", date),
         )
     {
-        return Some((
-            symbol.to_owned(),
-            DatedFile {
-                path: path.to_path_buf(),
-                date,
-                segment_start_ns,
-                run_id: Some(run_id),
-            },
+        return Some(file(
+            symbol,
+            date,
+            segment_start_ns,
+            Some(run_id.to_owned()),
         ));
     }
 
     // Handover sidecar: <symbol>_<date>_<run-id>.zst.
     let mut parts = stem.rsplitn(3, '_');
-    let sidecar_run = parts.next()?.to_owned();
-    let date_str = parts.next();
-    let symbol = parts.next();
-    if let (Some(date_str), Some(symbol)) = (date_str, symbol)
-        && let Ok(date) = civil::Date::strptime("%Y%m%d", date_str)
+    let run_id = parts.next()?;
+    if let (Some(date), Some(symbol)) = (parts.next(), parts.next())
+        && let Ok(date) = civil::Date::strptime("%Y%m%d", date)
     {
-        return Some((
-            symbol.to_owned(),
-            DatedFile {
-                path: path.to_path_buf(),
-                date,
-                segment_start_ns: i64::MIN,
-                run_id: Some(sidecar_run),
-            },
-        ));
+        return Some(file(symbol, date, i64::MIN, Some(run_id.to_owned())));
     }
 
-    // Daily form: <symbol>_<date>.zst.
-    let (symbol, date_str) = stem.rsplit_once('_')?;
-    let date = civil::Date::strptime("%Y%m%d", date_str).ok()?;
-    Some((
-        symbol.to_owned(),
-        DatedFile {
-            path: path.to_path_buf(),
-            date,
-            segment_start_ns: i64::MIN,
-            run_id: None,
-        },
-    ))
+    // Daily: <symbol>_<date>.zst.
+    let (symbol, date) = stem.rsplit_once('_')?;
+    let date = civil::Date::strptime("%Y%m%d", date).ok()?;
+    Some(file(symbol, date, i64::MIN, None))
 }
 
+/// A run id without its `.late<n>` suffix.
 fn logical_run_id(run_id: &str) -> &str {
     match run_id.rsplit_once(".late") {
         Some((base, suffix))
@@ -258,26 +238,45 @@ fn logical_run_id(run_id: &str) -> &str {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Scanning
-// ---------------------------------------------------------------------------
+/// A venue id chain checked per series. Declared in report order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stream {
+    BestBidAsk,
+    DepthDiff,
+    Trades,
+}
+
+impl Stream {
+    const ALL: [Self; 3] = [Self::BestBidAsk, Self::DepthDiff, Self::Trades];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::BestBidAsk => "best-bid-ask",
+            Self::DepthDiff => "depth-diff",
+            Self::Trades => "trades",
+        }
+    }
+
+    /// Unique per-event ids, so range accounting applies.
+    fn has_point_ids(self) -> bool {
+        self == Self::Trades
+    }
+}
 
 #[derive(Clone, Copy, Default)]
 struct StreamStats {
     messages: u64,
-    /// Forward breaks in the venue id chain, i.e. ids the recording never
-    /// saw between two consecutively recorded events.
+    /// Forward breaks in the venue id chain: ids never seen between two
+    /// consecutively recorded events.
     seq_fwd_events: u64,
     seq_fwd_ids: u64,
-    /// Events that added nothing new: late duplicates or reordered events.
+    /// Events that added nothing new: late duplicates or reorders.
     seq_back_events: u64,
-    /// Range accounting for point-id streams (trades): ids are unique, so
-    /// `(id_max - id_min + 1) - id_count` nets missing ids against late
-    /// duplicates regardless of recording order.
+    /// Range accounting for point-id streams.
     id_min: i64,
     id_max: i64,
     id_count: u64,
-    /// Only populated with `--exact`.
+    /// Only with `--exact`.
     exact_missing: u64,
     exact_dups: u64,
     /// Exchange event times that went backwards.
@@ -286,32 +285,110 @@ struct StreamStats {
 
 impl StreamStats {
     /// Net id deficit over the observed range: positive means at least that
-    /// many ids are missing, negative means at least that many duplicates.
+    /// many ids are missing, negative at least that many duplicates.
     fn net_deficit(&self) -> i64 {
         if self.id_count == 0 {
             return 0;
         }
         (self.id_max - self.id_min + 1) - self.id_count as i64
     }
+
+    fn is_notable(&self) -> bool {
+        self.id_count > 0
+            || self.seq_fwd_events > 0
+            || self.seq_back_events > 0
+            || self.time_regressions > 0
+    }
 }
 
 #[derive(Default)]
 struct StreamState {
     stats: StreamStats,
-    /// depth diff: running max `lastBookUpdateId`; bba: max `bookUpdateId`;
-    /// trades: running max trade id
+    /// Running maximum of the chain's id.
     last_id: Option<i64>,
     last_time: Option<i64>,
-    /// Exact id set, only with `--exact` and only for point-id streams.
+    /// Only with `--exact`, and only for point-id streams.
     ids: Option<HashSet<i64>>,
-    /// Receive times of forward chain breaks, for locating incidents.
+    /// Receive times of forward breaks, for locating incidents.
     break_times: Vec<i64>,
+}
+
+impl StreamState {
+    fn note_break(&mut self, recv: i64) {
+        if self.break_times.len() < MAX_BREAK_TIMES {
+            self.break_times.push(recv);
+        }
+    }
+
+    fn check_time(&mut self, event_time: i64) {
+        if self.last_time.is_some_and(|prev| event_time < prev) {
+            self.stats.time_regressions += 1;
+        }
+        self.last_time = Some(event_time);
+    }
+
+    fn advance(&mut self, id: i64) {
+        self.last_id = Some(self.last_id.map_or(id, |prev| prev.max(id)));
+    }
+
+    /// Continuity of an id that increments by one (trade ids). Tracking the
+    /// running maximum keeps one reorder from poisoning later checks.
+    fn chain(&mut self, id: i64, recv: i64) {
+        if let Some(prev) = self.last_id {
+            if id > prev + 1 {
+                self.stats.seq_fwd_events += 1;
+                self.stats.seq_fwd_ids += (id - prev - 1) as u64;
+                self.note_break(recv);
+            } else if id <= prev {
+                self.stats.seq_back_events += 1;
+            }
+        }
+        self.advance(id);
+    }
+
+    fn observe_point_id(&mut self, id: i64) {
+        let stats = &mut self.stats;
+        if stats.id_count == 0 {
+            stats.id_min = id;
+            stats.id_max = id;
+        } else {
+            stats.id_min = stats.id_min.min(id);
+            stats.id_max = stats.id_max.max(id);
+        }
+        stats.id_count += 1;
+        if let Some(ids) = &mut self.ids {
+            ids.insert(id);
+        }
+    }
+
+    fn into_report(mut self, stream: Stream) -> StreamReport {
+        if let Some(ids) = self.ids
+            && self.stats.id_count > 0
+        {
+            let distinct = ids.len() as u64;
+            let span = (self.stats.id_max - self.stats.id_min + 1) as u64;
+            self.stats.exact_missing = span.saturating_sub(distinct);
+            self.stats.exact_dups = self.stats.id_count.saturating_sub(distinct);
+        }
+        self.break_times.sort_unstable();
+        StreamReport {
+            stream,
+            stats: self.stats,
+            break_times: self.break_times,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
 struct Gap {
     start: i64,
     end: i64,
+}
+
+impl Gap {
+    fn silence_ns(self) -> i64 {
+        self.end - self.start
+    }
 }
 
 #[derive(Default)]
@@ -326,40 +403,21 @@ struct SeriesScan {
     last_recv: Option<i64>,
     prev_recv: Option<i64>,
     gaps: Vec<Gap>,
-    streams: Vec<(&'static str, StreamState)>,
+    /// Indexed by [`Stream`].
+    streams: [Option<StreamState>; 3],
 }
 
-const STREAM_DEPTH_DIFF: &str = "depth-diff";
-const STREAM_TRADES: &str = "trades";
-const STREAM_BBA: &str = "best-bid-ask";
-
 impl SeriesScan {
-    fn stream(&mut self, key: &'static str, point_ids: bool) -> &mut StreamState {
-        let pos = self.streams.iter().position(|(k, _)| *k == key);
-        match pos {
-            Some(i) => &mut self.streams[i].1,
-            None => {
-                let ids = if self.exact && point_ids {
-                    Some(HashSet::new())
-                } else {
-                    None
-                };
-                self.streams.push((
-                    key,
-                    StreamState {
-                        ids,
-                        ..Default::default()
-                    },
-                ));
-                &mut self.streams.last_mut().expect("just pushed").1
-            }
-        }
+    fn stream(&mut self, stream: Stream) -> &mut StreamState {
+        let exact = self.exact;
+        self.streams[stream as usize].get_or_insert_with(|| StreamState {
+            ids: (exact && stream.has_point_ids()).then(HashSet::new),
+            ..StreamState::default()
+        })
     }
 
     fn observe_recv(&mut self, recv: i64, min_gap_ns: i64) {
-        if self.first_recv.is_none() {
-            self.first_recv = Some(recv);
-        }
+        self.first_recv.get_or_insert(recv);
         if let Some(prev) = self.prev_recv {
             if recv < prev {
                 self.recv_regressions += 1;
@@ -374,172 +432,109 @@ impl SeriesScan {
         self.last_recv = Some(recv);
     }
 
-    fn process_record(&mut self, recv: i64, tag: u8, payload: &[u8], min_gap_ns: i64) {
+    fn process_record(&mut self, recv: i64, tag: Tag, payload: &[u8], min_gap_ns: i64) {
         self.observe_recv(recv, min_gap_ns);
         self.rows += 1;
         match tag {
-            TAG_SBE => {
+            Tag::Sbe => {
                 self.sbe_records += 1;
                 self.sbe_payload(recv, payload);
             }
-            TAG_REST => self.rest_records += 1,
-            _ => self.bad_records += 1,
+            Tag::Rest => self.rest_records += 1,
         }
     }
 
     fn sbe_payload(&mut self, recv: i64, payload: &[u8]) {
-        let Ok((header, _)) = MessageHeader::read_from_prefix(payload) else {
+        let Ok((header, body)) = MessageHeader::read_from_prefix(payload) else {
             self.bad_records += 1;
             return;
         };
-        let template_id = header.template_id.get();
-        let body = &payload[std::mem::size_of::<MessageHeader>()..];
-        match template_id {
+        match header.template_id.get() {
             TEMPLATE_DEPTH_DIFF => self.depth_diff(recv, body),
             TEMPLATE_TRADES => self.trades(recv, body, header.block_length.get() as usize),
             TEMPLATE_BEST_BID_ASK => self.best_bid_ask(body),
-            // Depth snapshots (and anything a newer schema adds) are counted
-            // but carry no chain of their own to check.
+            // Counted, but no chain of its own to check.
             TEMPLATE_DEPTH_SNAPSHOT => {}
             _ => self.bad_records += 1,
         }
     }
 
-    /// The collector's own continuity rule: only a diff starting *beyond*
-    /// `prev + 1` leaves a hole; the high-water mark only ever advances, so
-    /// one reordered frame cannot cascade into further breaks.
+    /// The collector's own rule: only a diff starting beyond `prev + 1`
+    /// leaves a hole.
     fn depth_diff(&mut self, recv: i64, body: &[u8]) {
-        let Ok((blk, _)) = DepthDiffBlock::read_from_prefix(body) else {
+        let Ok((block, _)) = DepthDiffBlock::read_from_prefix(body) else {
             self.bad_records += 1;
             return;
         };
-        let st = self.stream(STREAM_DEPTH_DIFF, false);
-        st.stats.messages += 1;
-        check_time(&mut st.stats, &mut st.last_time, blk.event_time.get());
-        let first = blk.first_book_update_id.get();
-        let last = blk.last_book_update_id.get();
-        if let Some(prev) = st.last_id {
-            if last > prev {
-                if first > prev + 1 {
-                    st.stats.seq_fwd_events += 1;
-                    st.stats.seq_fwd_ids += (first - prev - 1) as u64;
-                    note_break(st, recv);
-                }
-            } else {
-                st.stats.seq_back_events += 1;
+        let state = self.stream(Stream::DepthDiff);
+        state.stats.messages += 1;
+        state.check_time(block.event_time.get());
+        let first = block.first_book_update_id.get();
+        let last = block.last_book_update_id.get();
+        if let Some(prev) = state.last_id {
+            if last <= prev {
+                state.stats.seq_back_events += 1;
+            } else if first > prev + 1 {
+                state.stats.seq_fwd_events += 1;
+                state.stats.seq_fwd_ids += (first - prev - 1) as u64;
+                state.note_break(recv);
             }
         }
-        st.last_id = Some(st.last_id.map_or(last, |prev| prev.max(last)));
+        state.advance(last);
     }
 
-    /// Trade ids increment by one per trade, both within a frame's group and
+    /// Trade ids increment by one per trade, within a frame's group and
     /// across frames.
     fn trades(&mut self, recv: i64, body: &[u8], block_length: usize) {
-        let Ok((blk, _)) = TradesBlock::read_from_prefix(body) else {
+        let Ok((block, _)) = TradesBlock::read_from_prefix(body) else {
             self.bad_records += 1;
             return;
         };
-        let st = self.stream(STREAM_TRADES, true);
-        st.stats.messages += 1;
-        check_time(&mut st.stats, &mut st.last_time, blk.event_time.get());
-        let mut off = block_length;
-        if off + std::mem::size_of::<GroupSizeEncoding>() > body.len() {
-            self.bad_records += 1;
-            return;
-        }
-        let Ok((dim, _)) = GroupSizeEncoding::read_from_prefix(&body[off..]) else {
+        let state = self.stream(Stream::Trades);
+        state.stats.messages += 1;
+        state.check_time(block.event_time.get());
+        let Some(Ok((dimension, mut entries))) = body
+            .get(block_length..)
+            .map(GroupSizeEncoding::read_from_prefix)
+        else {
             self.bad_records += 1;
             return;
         };
-        // The wire stride comes from the dimension header, not the
-        // compile-time struct: a newer schema may append fields.
-        let stride = dim.block_length.get() as usize;
-        if stride < 8 {
+        // The wire stride, not the struct size: a newer schema may append
+        // fields to the entry.
+        let stride = usize::from(dimension.block_length.get());
+        if stride < size_of::<i64>() {
             self.bad_records += 1;
             return;
         }
-        off += std::mem::size_of::<GroupSizeEncoding>();
-        for _ in 0..dim.num_in_group.get() {
-            if off + stride > body.len() {
+        for _ in 0..dimension.num_in_group.get() {
+            let Some(entry) = entries.get(..stride) else {
                 break;
-            }
-            let id = i64::from_le_bytes(body[off..off + 8].try_into().expect("8 bytes"));
-            chain(st, id, recv);
-            observe_point_id(st, id);
-            off += stride;
+            };
+            let id = i64::from_le_bytes(entry[..8].try_into().expect("stride >= 8"));
+            state.chain(id, recv);
+            state.observe_point_id(id);
+            entries = &entries[stride..];
         }
     }
 
-    /// `bookUpdateId` must never go backwards; forward jumps are normal,
-    /// since the quote changes less often than the book updates.
+    /// `bookUpdateId` must never go backwards; forward jumps are normal, as
+    /// the quote changes less often than the book.
     fn best_bid_ask(&mut self, body: &[u8]) {
-        let Ok((blk, _)) = BestBidAskBlock::read_from_prefix(body) else {
+        let Ok((block, _)) = BestBidAskBlock::read_from_prefix(body) else {
             self.bad_records += 1;
             return;
         };
-        let st = self.stream(STREAM_BBA, false);
-        st.stats.messages += 1;
-        check_time(&mut st.stats, &mut st.last_time, blk.event_time.get());
-        let id = blk.book_update_id.get();
-        if let Some(prev) = st.last_id
-            && id < prev
-        {
-            st.stats.seq_back_events += 1;
+        let state = self.stream(Stream::BestBidAsk);
+        state.stats.messages += 1;
+        state.check_time(block.event_time.get());
+        let id = block.book_update_id.get();
+        if state.last_id.is_some_and(|prev| id < prev) {
+            state.stats.seq_back_events += 1;
         }
-        st.last_id = Some(st.last_id.map_or(id, |prev| prev.max(id)));
+        state.advance(id);
     }
 }
-
-fn note_break(st: &mut StreamState, recv: i64) {
-    if st.break_times.len() < MAX_BREAK_TIMES {
-        st.break_times.push(recv);
-    }
-}
-
-fn check_time(stats: &mut StreamStats, last: &mut Option<i64>, t: i64) {
-    if let Some(prev) = *last
-        && t < prev
-    {
-        stats.time_regressions += 1;
-    }
-    *last = Some(t);
-}
-
-/// Continuity of a strictly incrementing-by-one venue id (trade ids). The
-/// chain tracks the running maximum, so a reordered or duplicated event
-/// produces at most one backward step and does not poison later checks.
-fn chain(st: &mut StreamState, id: i64, recv: i64) {
-    if let Some(prev) = st.last_id {
-        if id > prev + 1 {
-            st.stats.seq_fwd_events += 1;
-            st.stats.seq_fwd_ids += (id - prev - 1) as u64;
-            note_break(st, recv);
-        } else if id <= prev {
-            st.stats.seq_back_events += 1;
-        }
-    }
-    st.last_id = Some(st.last_id.map_or(id, |prev| prev.max(id)));
-}
-
-/// Track min/max/count of a point-id stream for range accounting.
-fn observe_point_id(st: &mut StreamState, id: i64) {
-    let stats = &mut st.stats;
-    if stats.id_count == 0 {
-        stats.id_min = id;
-        stats.id_max = id;
-    } else {
-        stats.id_min = stats.id_min.min(id);
-        stats.id_max = stats.id_max.max(id);
-    }
-    stats.id_count += 1;
-    if let Some(set) = &mut st.ids {
-        set.insert(id);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Reports
-// ---------------------------------------------------------------------------
 
 struct FileReport {
     path: PathBuf,
@@ -549,11 +544,10 @@ struct FileReport {
     live: bool,
 }
 
-struct RawRecord {
-    recv: i64,
-    tag: u8,
-    payload: Vec<u8>,
-    source: usize,
+struct StreamReport {
+    stream: Stream,
+    stats: StreamStats,
+    break_times: Vec<i64>,
 }
 
 struct SeriesReport {
@@ -568,67 +562,62 @@ struct SeriesReport {
     first_recv: Option<i64>,
     last_recv: Option<i64>,
     gaps: Vec<Gap>,
-    streams: Vec<(&'static str, StreamStats, Vec<i64>)>,
+    /// In [`Stream`] order.
+    streams: Vec<StreamReport>,
 }
 
 impl SeriesReport {
-    /// Issues that indicate lost or unrecordable data (as opposed to
-    /// reordering/duplication artefacts of redundant collection).
+    /// Lost or unrecordable data, as opposed to the reorder and duplicate
+    /// artefacts of redundant collection.
     fn has_issues(&self) -> bool {
         !self.gaps.is_empty()
             || !self.missing_dates.is_empty()
             || self.bad_records > 0
             || self.files.iter().any(|f| f.decode_error.is_some())
-            || self
-                .streams
-                .iter()
-                .any(|(_, s, _)| s.seq_fwd_events > 0 || s.net_deficit() > 0 || s.exact_missing > 0)
+            || self.streams.iter().any(|s| {
+                s.stats.seq_fwd_events > 0 || s.stats.net_deficit() > 0 || s.stats.exact_missing > 0
+            })
     }
 }
 
-/// A first record that does not even hold a plausible tag marks the whole
-/// file as a foreign format rather than as one bad record.
-fn is_foreign(tag: u8) -> bool {
-    !matches!(tag, TAG_SBE | TAG_REST)
-}
-
-fn read_file<F>(df: &DatedFile, mut process: F) -> FileReport
+/// Decode `file`'s records into `process`. A first record that does not even
+/// hold a plausible header marks the whole file as foreign.
+fn read_file<F>(file: &DatedFile, mut process: F) -> FileReport
 where
-    F: FnMut(i64, u8, &[u8]),
+    F: FnMut(i64, Tag, &[u8]),
 {
     let mut report = FileReport {
-        path: df.path.clone(),
+        path: file.path.clone(),
         rows: 0,
         foreign: false,
         decode_error: None,
         live: false,
     };
-    let file = match File::open(&df.path) {
-        Ok(file) => file,
+    let handle = match File::open(&file.path) {
+        Ok(handle) => handle,
         Err(error) => {
             report.decode_error = Some(format!("open failed: {error}"));
             return report;
         }
     };
-    let modified = fs::metadata(&df.path).and_then(|m| m.modified()).ok();
-    let Ok(decoder) = zstd::stream::read::Decoder::new(file) else {
+    let modified = fs::metadata(&file.path).and_then(|m| m.modified()).ok();
+    let Ok(decoder) = zstd::stream::read::Decoder::new(handle) else {
         report.decode_error = Some("not a zstd stream".into());
         return report;
     };
     let mut reader = std::io::BufReader::with_capacity(1 << 20, decoder);
-    let mut header = [0u8; FRAME_HEADER_LEN];
+    let mut header = [0u8; HEADER_LEN];
     let mut payload: Vec<u8> = Vec::with_capacity(1 << 16);
     loop {
-        // Accumulate the fixed header; a short trailing read means the file
-        // ends mid-record.
+        // A short read at the end means the file stops mid-record.
         let mut got = 0usize;
         let mut read_error = None;
-        while got < FRAME_HEADER_LEN {
+        while got < HEADER_LEN {
             match reader.read(&mut header[got..]) {
                 Ok(0) => break,
                 Ok(n) => got += n,
                 Err(error) => {
-                    read_error = Some(format!("{error}"));
+                    read_error = Some(error.to_string());
                     break;
                 }
             }
@@ -638,29 +627,28 @@ where
             break;
         }
         if got == 0 {
-            break; // clean EOF
+            break;
         }
-        if got < FRAME_HEADER_LEN {
+        if got < HEADER_LEN {
             report.decode_error = Some(format!("truncated record header ({got} trailing bytes)"));
             break;
         }
-        let recv = i64::from_le_bytes(header[0..8].try_into().expect("8 bytes"));
-        let tag = header[8];
-        let len = u32::from_le_bytes(header[9..13].try_into().expect("4 bytes"));
-        if report.rows == 0 && (is_foreign(tag) || len > MAX_PAYLOAD_LEN) {
-            report.foreign = true;
+        let Header { recv_ns, tag, len } = Header::parse(&header);
+        let Some(tag) = Tag::from_byte(tag).filter(|_| len <= MAX_PAYLOAD_LEN) else {
+            if report.rows == 0 {
+                report.foreign = true;
+            } else {
+                report.decode_error =
+                    Some(format!("implausible record (tag {tag:#04x}, len {len})"));
+            }
             break;
-        }
-        if is_foreign(tag) || len > MAX_PAYLOAD_LEN {
-            report.decode_error = Some(format!("implausible record (tag {tag:#04x}, len {len})"));
-            break;
-        }
+        };
         payload.resize(len as usize, 0);
         if let Err(error) = reader.read_exact(&mut payload) {
             report.decode_error = Some(format!("truncated payload: {error}"));
             break;
         }
-        process(recv, tag, &payload);
+        process(recv_ns, tag, &payload);
         report.rows += 1;
     }
     if report.decode_error.is_some() {
@@ -673,107 +661,137 @@ where
     report
 }
 
-fn process_records(
-    scan: &mut SeriesScan,
-    mut records: Vec<RawRecord>,
-    min_gap_ns: i64,
-    overlapping_runs: bool,
-) {
-    if !overlapping_runs {
-        for record in records {
-            scan.process_record(record.recv, record.tag, &record.payload, min_gap_ns);
-        }
-        return;
+struct RawRecord {
+    recv: i64,
+    tag: Tag,
+    payload: Vec<u8>,
+    /// Index of the run that wrote it.
+    source: usize,
+}
+
+/// The receive times one run covered.
+#[derive(Clone, Copy)]
+struct RecvSpan {
+    first: i64,
+    last: i64,
+}
+
+impl RecvSpan {
+    fn include(&mut self, recv: i64) {
+        self.first = self.first.min(recv);
+        self.last = self.last.max(recv);
     }
 
-    let mut source_ranges: HashMap<usize, (i64, i64)> = HashMap::new();
+    /// Whether `recv` falls where both spans overlap.
+    fn both_cover(self, other: Self, recv: i64) -> bool {
+        (self.first.max(other.first)..=self.last.min(other.last)).contains(&recv)
+    }
+}
+
+/// The live collector's event identity: Binance stamps SBE `eventTime` per
+/// connection, so the same event from two rolling processes differs only
+/// there and must still collapse to one record.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct OverlapKey {
+    tag: Tag,
+    hash: u128,
+}
+
+impl OverlapKey {
+    fn of(tag: Tag, payload: &[u8]) -> Self {
+        let hash = if tag != Tag::Sbe || payload.len() < EVENT_TIME.end {
+            xxhash_rust::xxh3::xxh3_128(payload)
+        } else {
+            let header = u64::from_le_bytes(
+                payload[..EVENT_TIME.start]
+                    .try_into()
+                    .expect("the 8-byte SBE header"),
+            );
+            xxhash_rust::xxh3::xxh3_128_with_seed(&payload[EVENT_TIME.end..], header)
+        };
+        Self { tag, hash }
+    }
+}
+
+/// A record not yet paired with its copy from another run.
+struct Unpaired {
+    source: usize,
+    recv: i64,
+}
+
+/// Time-merge the records of overlapping runs, dropping each record's copy
+/// from another run at most once, and only inside both runs' observed span.
+fn process_overlapping(scan: &mut SeriesScan, mut records: Vec<RawRecord>, min_gap_ns: i64) {
+    let mut spans: HashMap<usize, RecvSpan> = HashMap::new();
     for record in &records {
-        source_ranges
+        spans
             .entry(record.source)
-            .and_modify(|range| {
-                range.0 = range.0.min(record.recv);
-                range.1 = range.1.max(record.recv);
-            })
-            .or_insert((record.recv, record.recv));
+            .and_modify(|span| span.include(record.recv))
+            .or_insert(RecvSpan {
+                first: record.recv,
+                last: record.recv,
+            });
     }
     records.sort_by_key(|record| (record.recv, record.source));
-    let mut unmatched: HashMap<(u8, u128), VecDeque<(usize, i64)>> = HashMap::new();
+    let mut unpaired: HashMap<OverlapKey, VecDeque<Unpaired>> = HashMap::new();
     for record in records {
-        let key = (record.tag, overlap_key(record.tag, &record.payload));
-        let queue = unmatched.entry(key).or_default();
-        while queue
-            .front()
-            .is_some_and(|(_, recv)| *recv < record.recv.saturating_sub(OVERLAP_DEDUP_WINDOW_NS))
-        {
+        let queue = unpaired
+            .entry(OverlapKey::of(record.tag, &record.payload))
+            .or_default();
+        while queue.front().is_some_and(|earlier| {
+            earlier.recv < record.recv.saturating_sub(OVERLAP_DEDUP_WINDOW_NS)
+        }) {
             queue.pop_front();
         }
 
-        let duplicate = queue.iter().position(|&(source, recv)| {
-            source != record.source
-                && source_ranges
-                    .get(&source)
-                    .zip(source_ranges.get(&record.source))
-                    .is_some_and(|(&(source_min, source_max), &(record_min, record_max))| {
-                        let overlap_start = source_min.max(record_min);
-                        let overlap_end = source_max.min(record_max);
-                        (overlap_start..=overlap_end).contains(&record.recv)
-                            && record.recv.saturating_sub(recv) <= OVERLAP_DEDUP_WINDOW_NS
+        let copy = queue.iter().position(|earlier| {
+            earlier.source != record.source
+                && spans
+                    .get(&earlier.source)
+                    .zip(spans.get(&record.source))
+                    .is_some_and(|(&earlier_span, &span)| {
+                        earlier_span.both_cover(span, record.recv)
+                            && record.recv.saturating_sub(earlier.recv) <= OVERLAP_DEDUP_WINDOW_NS
                     })
         });
-        if let Some(index) = duplicate {
+        if let Some(index) = copy {
             queue.remove(index);
             continue;
         }
 
         scan.process_record(record.recv, record.tag, &record.payload, min_gap_ns);
-        queue.push_back((record.source, record.recv));
+        queue.push_back(Unpaired {
+            source: record.source,
+            recv: record.recv,
+        });
     }
-}
-
-/// Match the live collector's event identity. Binance stamps SBE `eventTime`
-/// per connection, so the same event from two rolling processes differs only
-/// in bytes 8..16 and must still collapse to one record.
-fn overlap_key(tag: u8, payload: &[u8]) -> u128 {
-    if tag != TAG_SBE || payload.len() < 16 {
-        return xxhash_rust::xxh3::xxh3_128(payload);
-    }
-    let header = u64::from_le_bytes(payload[..8].try_into().expect("8-byte SBE header"));
-    xxhash_rust::xxh3::xxh3_128_with_seed(&payload[16..], header)
 }
 
 fn scan_series(series: &Series, min_gap_ns: i64, exact: bool) -> SeriesReport {
     let mut scan = SeriesScan {
         exact,
-        ..Default::default()
+        ..SeriesScan::default()
     };
     let mut files = Vec::with_capacity(series.files.len());
-    let mut first = 0;
-    while first < series.files.len() {
-        let key = (
-            series.files[first].date,
-            series.files[first].segment_start_ns,
-        );
-        let mut end = first + 1;
-        while end < series.files.len()
-            && (series.files[end].date, series.files[end].segment_start_ns) == key
-        {
-            end += 1;
+    // Files of one (date, segment) are written concurrently by different
+    // runs, so they are scanned together.
+    for group in series
+        .files
+        .chunk_by(|a, b| (a.date, a.segment_start_ns) == (b.date, b.segment_start_ns))
+    {
+        let mut runs: HashMap<&str, usize> = HashMap::new();
+        for file in group {
+            let run = file.run_id.as_deref().map(logical_run_id).unwrap_or("");
+            let next = runs.len();
+            runs.entry(run).or_insert(next);
         }
-
-        let mut run_indices: HashMap<&str, usize> = HashMap::new();
-        for df in &series.files[first..end] {
-            let run_id = df.run_id.as_deref().map(logical_run_id).unwrap_or("");
-            let next = run_indices.len();
-            run_indices.entry(run_id).or_insert(next);
-        }
-        let overlapping_runs = run_indices.len() > 1;
-        if overlapping_runs {
+        if runs.len() > 1 {
             let mut records = Vec::new();
             let mut decode_error = false;
-            for df in &series.files[first..end] {
-                let source_key = df.run_id.as_deref().map(logical_run_id).unwrap_or("");
-                let source = *run_indices.get(source_key).expect("run indexed");
-                let report = read_file(df, |recv, tag, payload| {
+            for file in group {
+                let run = file.run_id.as_deref().map(logical_run_id).unwrap_or("");
+                let source = runs[run];
+                let report = read_file(file, |recv, tag, payload| {
                     records.push(RawRecord {
                         recv,
                         tag,
@@ -784,28 +802,24 @@ fn scan_series(series: &Series, min_gap_ns: i64, exact: bool) -> SeriesReport {
                 decode_error |= report.decode_error.is_some();
                 files.push(report);
             }
-            process_records(&mut scan, records, min_gap_ns, true);
+            process_overlapping(&mut scan, records, min_gap_ns);
             if decode_error {
-                // An unreadable tail hides the next receive time. Sequence
-                // state is retained, but a receive gap across it is not.
+                // An unreadable tail hides the next receive time: keep the
+                // sequence state, but measure no receive gap across it.
                 scan.prev_recv = None;
             }
         } else {
-            // Daily files, handover sidecars without a peer, and ordinary
-            // single-run segments stay fully streaming and preserve the order
-            // actually recorded on disk.
-            for df in &series.files[first..end] {
-                let report = read_file(df, |recv, tag, payload| {
+            // A single run streams in the order it was recorded.
+            for file in group {
+                let report = read_file(file, |recv, tag, payload| {
                     scan.process_record(recv, tag, payload, min_gap_ns);
                 });
-                let decode_error = report.decode_error.is_some();
-                files.push(report);
-                if decode_error {
+                if report.decode_error.is_some() {
                     scan.prev_recv = None;
                 }
+                files.push(report);
             }
         }
-        first = end;
     }
 
     let mut missing_dates = Vec::new();
@@ -834,29 +848,13 @@ fn scan_series(series: &Series, min_gap_ns: i64, exact: bool) -> SeriesReport {
         first_recv: scan.first_recv,
         last_recv: scan.last_recv,
         gaps: scan.gaps,
-        streams: scan
-            .streams
+        streams: Stream::ALL
             .into_iter()
-            .map(|(name, mut state)| {
-                let mut stats = state.stats;
-                if let Some(set) = state.ids {
-                    let distinct = set.len() as u64;
-                    if stats.id_count > 0 {
-                        let span = (stats.id_max - stats.id_min + 1) as u64;
-                        stats.exact_missing = span.saturating_sub(distinct);
-                        stats.exact_dups = stats.id_count.saturating_sub(distinct);
-                    }
-                }
-                state.break_times.sort_unstable();
-                (name, stats, state.break_times)
-            })
+            .zip(scan.streams)
+            .filter_map(|(stream, state)| Some(state?.into_report(stream)))
             .collect(),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Formatting
-// ---------------------------------------------------------------------------
 
 fn fmt_ts(ns: i64) -> String {
     let zoned = Timestamp::from_nanosecond(i128::from(ns))
@@ -880,6 +878,7 @@ fn fmt_dur(ns: i64) -> String {
     }
 }
 
+/// `n` with thousands separators.
 fn grouped(mut n: u64) -> String {
     let mut groups = Vec::new();
     loop {
@@ -899,40 +898,32 @@ fn grouped(mut n: u64) -> String {
 fn stream_issues(s: &StreamStats, break_times: &[i64], exact: bool) -> Vec<String> {
     let mut parts = Vec::new();
     if s.id_count > 0 {
+        let range = format!(
+            "ids {}..{}",
+            grouped(s.id_min as u64),
+            grouped(s.id_max as u64)
+        );
+        let observed = grouped(s.id_count);
         let deficit = s.net_deficit();
-        if exact {
-            parts.push(format!(
-                "ids {}..{}: exact {} missing, {} duplicates ({} observed)",
-                grouped(s.id_min as u64),
-                grouped(s.id_max as u64),
+        parts.push(if exact {
+            format!(
+                "{range}: exact {} missing, {} duplicates ({observed} observed)",
                 grouped(s.exact_missing),
                 grouped(s.exact_dups),
-                grouped(s.id_count)
-            ));
+            )
         } else if deficit > 0 {
-            parts.push(format!(
-                "ids {}..{}: net {} missing ({} observed)",
-                grouped(s.id_min as u64),
-                grouped(s.id_max as u64),
-                grouped(deficit as u64),
-                grouped(s.id_count)
-            ));
+            format!(
+                "{range}: net {} missing ({observed} observed)",
+                grouped(deficit as u64)
+            )
         } else if deficit < 0 {
-            parts.push(format!(
-                "ids {}..{}: net {} extra from reorders/dups ({} observed)",
-                grouped(s.id_min as u64),
-                grouped(s.id_max as u64),
-                grouped((-deficit) as u64),
-                grouped(s.id_count)
-            ));
+            format!(
+                "{range}: net {} extra from reorders/dups ({observed} observed)",
+                grouped(deficit.unsigned_abs())
+            )
         } else {
-            parts.push(format!(
-                "ids {}..{}: complete ({} observed)",
-                grouped(s.id_min as u64),
-                grouped(s.id_max as u64),
-                grouped(s.id_count)
-            ));
-        }
+            format!("{range}: complete ({observed} observed)")
+        });
     }
     if s.seq_fwd_events > 0 {
         parts.push(format!(
@@ -958,10 +949,6 @@ fn stream_issues(s: &StreamStats, break_times: &[i64], exact: bool) -> Vec<Strin
         ));
     }
     parts
-}
-
-fn stream_notable(s: &StreamStats) -> bool {
-    s.id_count > 0 || s.seq_fwd_events > 0 || s.seq_back_events > 0 || s.time_regressions > 0
 }
 
 fn print_report(report: &SeriesReport, min_gap_ns: i64, max_reported: usize, exact: bool) {
@@ -1031,20 +1018,20 @@ fn print_report(report: &SeriesReport, min_gap_ns: i64, max_reported: usize, exa
     if report.gaps.is_empty() {
         println!("  recv gaps > {threshold}: none");
     } else {
-        let total: i64 = report.gaps.iter().map(|g| g.end - g.start).sum();
+        let total: i64 = report.gaps.iter().map(|gap| gap.silence_ns()).sum();
         println!(
             "  RECV GAPS > {threshold}: {} (total silence {})",
             report.gaps.len(),
             fmt_dur(total)
         );
         let mut largest: Vec<&Gap> = report.gaps.iter().collect();
-        largest.sort_by_key(|g| std::cmp::Reverse(g.end - g.start));
+        largest.sort_by_key(|gap| std::cmp::Reverse(gap.silence_ns()));
         for gap in largest.iter().take(max_reported) {
             println!(
                 "    {} .. {} ({})",
                 fmt_ts(gap.start),
                 fmt_ts(gap.end),
-                fmt_dur(gap.end - gap.start)
+                fmt_dur(gap.silence_ns())
             );
         }
         if report.gaps.len() > max_reported {
@@ -1052,18 +1039,20 @@ fn print_report(report: &SeriesReport, min_gap_ns: i64, max_reported: usize, exa
         }
     }
 
-    let mut streams: Vec<&(&'static str, StreamStats, Vec<i64>)> = report
+    let mut notable = report
         .streams
         .iter()
-        .filter(|(_, s, _)| stream_notable(s))
-        .collect();
-    if !streams.is_empty() {
-        streams.sort_by(|a, b| a.0.cmp(b.0));
+        .filter(|s| s.stats.is_notable())
+        .peekable();
+    if notable.peek().is_some() {
         println!("  streams:");
-        for (name, s, breaks) in streams {
-            let parts = stream_issues(s, breaks, exact);
-            println!("    {name}: {} msgs", grouped(s.messages));
-            for part in parts {
+        for stream in notable {
+            println!(
+                "    {}: {} msgs",
+                stream.stream.name(),
+                grouped(stream.stats.messages)
+            );
+            for part in stream_issues(&stream.stats, &stream.break_times, exact) {
                 println!("      {part}");
             }
         }
@@ -1071,7 +1060,93 @@ fn print_report(report: &SeriesReport, min_gap_ns: i64, max_reported: usize, exa
     println!();
 }
 
-// ---------------------------------------------------------------------------
+/// What the SUMMARY adds up over every series.
+#[derive(Default)]
+struct Totals {
+    series: usize,
+    rows: u64,
+    recv_gaps: usize,
+    gap_series: usize,
+    silence_ns: i64,
+    fwd_events: u64,
+    fwd_ids: u64,
+    net_missing_ids: i64,
+    exact_missing_ids: u64,
+    back_events: u64,
+    time_regressions: u64,
+    missing_dates: usize,
+    decode_errors: usize,
+    bad_records: u64,
+    foreign_files: usize,
+    with_issues: usize,
+}
+
+impl AddAssign<&SeriesReport> for Totals {
+    fn add_assign(&mut self, report: &SeriesReport) {
+        self.series += 1;
+        self.rows += report.rows;
+        self.recv_gaps += report.gaps.len();
+        self.gap_series += usize::from(!report.gaps.is_empty());
+        self.silence_ns += report.gaps.iter().map(|gap| gap.silence_ns()).sum::<i64>();
+        for StreamReport { stats, .. } in &report.streams {
+            self.fwd_events += stats.seq_fwd_events;
+            self.fwd_ids += stats.seq_fwd_ids;
+            self.net_missing_ids += stats.net_deficit().max(0);
+            self.exact_missing_ids += stats.exact_missing;
+            self.back_events += stats.seq_back_events;
+            self.time_regressions += stats.time_regressions;
+        }
+        self.missing_dates += report.missing_dates.len();
+        for file in &report.files {
+            self.decode_errors += usize::from(file.decode_error.is_some());
+            self.foreign_files += usize::from(file.foreign);
+        }
+        self.bad_records += report.bad_records;
+        self.with_issues += usize::from(report.has_issues());
+    }
+}
+
+fn print_summary(totals: &Totals, args: &Args) {
+    println!("SUMMARY");
+    println!("  series scanned        : {}", totals.series);
+    println!("  records decoded       : {}", grouped(totals.rows));
+    println!(
+        "  recv gaps > {}s  : {} across {} series (total silence {})",
+        args.min_gap,
+        totals.recv_gaps,
+        totals.gap_series,
+        fmt_dur(totals.silence_ns)
+    );
+    println!(
+        "  forward chain breaks  : {} event(s), {} ids",
+        grouped(totals.fwd_events),
+        grouped(totals.fwd_ids)
+    );
+    if args.exact {
+        println!(
+            "  exact missing ids     : {}",
+            grouped(totals.exact_missing_ids)
+        );
+    } else {
+        println!(
+            "  net missing ids       : {} (range accounting)",
+            grouped(totals.net_missing_ids as u64)
+        );
+    }
+    println!("  dup/reordered events  : {}", grouped(totals.back_events));
+    println!(
+        "  time regressions      : {}",
+        grouped(totals.time_regressions)
+    );
+    println!("  missing dates         : {}", totals.missing_dates);
+    println!("  decode errors         : {}", totals.decode_errors);
+    println!("  bad records           : {}", grouped(totals.bad_records));
+    println!(
+        "  foreign files         : {} (skipped)",
+        totals.foreign_files
+    );
+    println!("RESULT: issues found in {} series", totals.with_issues);
+}
 
 fn main() -> Result<()> {
     let args = Args::parse();
@@ -1096,7 +1171,7 @@ fn main() -> Result<()> {
     let cpus = std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(4);
-    // Cap the default so a shared machine is not flooded; --jobs overrides.
+    // Capped so a shared machine is not flooded; --jobs overrides.
     let jobs = if args.jobs == 0 {
         cpus.min(16)
     } else {
@@ -1141,94 +1216,13 @@ fn main() -> Result<()> {
     reports.sort_by(|a, b| a.key.cmp(&b.key));
 
     println!();
+    let mut totals = Totals::default();
     for report in &reports {
         print_report(report, min_gap_ns, args.max_reported, args.exact);
+        totals += report;
     }
-
-    let foreign_files: usize = reports
-        .iter()
-        .flat_map(|r| &r.files)
-        .filter(|f| f.foreign)
-        .count();
-    let decode_errors: usize = reports
-        .iter()
-        .flat_map(|r| &r.files)
-        .filter(|f| f.decode_error.is_some())
-        .count();
-    let recv_gaps: usize = reports.iter().map(|r| r.gaps.len()).sum();
-    let gap_series = reports.iter().filter(|r| !r.gaps.is_empty()).count();
-    let silence_total: i64 = reports
-        .iter()
-        .flat_map(|r| &r.gaps)
-        .map(|g| g.end - g.start)
-        .sum();
-    let fwd_events: u64 = reports
-        .iter()
-        .flat_map(|r| &r.streams)
-        .map(|(_, s, _)| s.seq_fwd_events)
-        .sum();
-    let fwd_ids: u64 = reports
-        .iter()
-        .flat_map(|r| &r.streams)
-        .map(|(_, s, _)| s.seq_fwd_ids)
-        .sum();
-    let net_positive: i64 = reports
-        .iter()
-        .flat_map(|r| &r.streams)
-        .map(|(_, s, _)| s.net_deficit().max(0))
-        .sum();
-    let exact_missing: u64 = reports
-        .iter()
-        .flat_map(|r| &r.streams)
-        .map(|(_, s, _)| s.exact_missing)
-        .sum();
-    let back_events: u64 = reports
-        .iter()
-        .flat_map(|r| &r.streams)
-        .map(|(_, s, _)| s.seq_back_events)
-        .sum();
-    let time_regressions: u64 = reports
-        .iter()
-        .flat_map(|r| &r.streams)
-        .map(|(_, s, _)| s.time_regressions)
-        .sum();
-    let missing_dates: usize = reports.iter().map(|r| r.missing_dates.len()).sum();
-    let bad_records: u64 = reports.iter().map(|r| r.bad_records).sum();
-    let rows: u64 = reports.iter().map(|r| r.rows).sum();
-    let with_issues = reports.iter().filter(|r| r.has_issues()).count();
-
-    println!("SUMMARY");
-    println!("  series scanned        : {}", reports.len());
-    println!("  records decoded       : {}", grouped(rows));
-    println!(
-        "  recv gaps > {}s  : {} across {} series (total silence {})",
-        args.min_gap,
-        recv_gaps,
-        gap_series,
-        fmt_dur(silence_total)
-    );
-    println!(
-        "  forward chain breaks  : {} event(s), {} ids",
-        grouped(fwd_events),
-        grouped(fwd_ids)
-    );
-    if args.exact {
-        println!("  exact missing ids     : {}", grouped(exact_missing));
-    } else {
-        println!(
-            "  net missing ids       : {} (range accounting)",
-            grouped(net_positive as u64)
-        );
-    }
-    println!("  dup/reordered events  : {}", grouped(back_events));
-    println!("  time regressions      : {}", grouped(time_regressions));
-    println!("  missing dates         : {missing_dates}");
-    println!("  decode errors         : {decode_errors}");
-    println!("  bad records           : {}", grouped(bad_records));
-    println!("  foreign files         : {foreign_files} (skipped)");
-
-    println!("RESULT: issues found in {with_issues} series");
-    if args.fail_on_gaps && with_issues > 0 {
+    print_summary(&totals, &args);
+    if args.fail_on_gaps && totals.with_issues > 0 {
         std::process::exit(1);
     }
     Ok(())
@@ -1237,14 +1231,47 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
-    fn record(recv: i64, tag: u8, payload: &[u8]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
-        out.extend_from_slice(&recv.to_le_bytes());
-        out.push(tag);
-        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        out.extend_from_slice(payload);
-        out
+    fn test_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sbe-gap-detector-{tag}-test-{}-{}",
+            std::process::id(),
+            Timestamp::now().as_nanosecond()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn record(recv: i64, tag: Tag, payload: &[u8]) -> Vec<u8> {
+        let header = Header {
+            recv_ns: recv,
+            tag: tag as u8,
+            len: payload.len() as u32,
+        };
+        [&header.encode()[..], payload].concat()
+    }
+
+    fn write_zst(path: &Path, records: &[Vec<u8>]) {
+        let mut encoder =
+            zstd::stream::write::Encoder::new(File::create(path).unwrap(), 1).unwrap();
+        for record in records {
+            encoder.write_all(record).unwrap();
+        }
+        encoder.finish().unwrap();
+    }
+
+    fn daily(path: PathBuf, date: civil::Date) -> Series {
+        Series {
+            key: "test/btcusdt".into(),
+            files: vec![DatedFile {
+                symbol: "btcusdt".into(),
+                path,
+                date,
+                segment_start_ns: i64::MIN,
+                run_id: None,
+            }],
+        }
     }
 
     fn sbe_header(block_length: u16, template_id: u16) -> Vec<u8> {
@@ -1256,8 +1283,8 @@ mod tests {
         out
     }
 
-    /// A `DepthDiffStreamEvent` payload: header plus fixed block. The chain
-    /// checks read only the fixed block, so no groups are needed.
+    /// A `DepthDiffStreamEvent` payload: header plus fixed block, which is
+    /// all the chain checks read.
     fn depth_diff(event_time: i64, first: i64, last: i64) -> Vec<u8> {
         let mut payload = sbe_header(26, TEMPLATE_DEPTH_DIFF);
         payload.extend_from_slice(&event_time.to_le_bytes());
@@ -1287,17 +1314,14 @@ mod tests {
         payload
     }
 
-    fn scan_record(scan: &mut SeriesScan, recv: i64, tag: u8, payload: &[u8]) {
+    fn scan_record(scan: &mut SeriesScan, recv: i64, tag: Tag, payload: &[u8]) {
         scan.process_record(recv, tag, payload, 5_000_000_000);
     }
 
-    fn stats<'a>(scan: &'a SeriesScan, key: &str) -> &'a StreamStats {
-        &scan
-            .streams
-            .iter()
-            .find(|(k, _)| *k == key)
+    fn stats(scan: &SeriesScan, stream: Stream) -> &StreamStats {
+        &scan.streams[stream as usize]
+            .as_ref()
             .expect("stream present")
-            .1
             .stats
     }
 
@@ -1305,9 +1329,9 @@ mod tests {
     fn recv_gap_and_regression() {
         let mut scan = SeriesScan::default();
         let frame = depth_diff(1, 1, 2);
-        scan_record(&mut scan, 1_000_000_000, TAG_SBE, &frame);
-        scan_record(&mut scan, 8_000_000_000, TAG_SBE, &frame);
-        scan_record(&mut scan, 7_000_000_000, TAG_SBE, &frame);
+        scan_record(&mut scan, 1_000_000_000, Tag::Sbe, &frame);
+        scan_record(&mut scan, 8_000_000_000, Tag::Sbe, &frame);
+        scan_record(&mut scan, 7_000_000_000, Tag::Sbe, &frame);
         assert_eq!(scan.gaps.len(), 1);
         assert_eq!(scan.gaps[0].start, 1_000_000_000);
         assert_eq!(scan.gaps[0].end, 8_000_000_000);
@@ -1317,12 +1341,12 @@ mod tests {
     #[test]
     fn depth_diff_chain_hole_overlap_and_reorder() {
         let mut scan = SeriesScan::default();
-        scan_record(&mut scan, 1, TAG_SBE, &depth_diff(1, 10, 20));
-        scan_record(&mut scan, 2, TAG_SBE, &depth_diff(2, 21, 30)); // contiguous
-        scan_record(&mut scan, 3, TAG_SBE, &depth_diff(3, 41, 50)); // 31..40 lost
-        scan_record(&mut scan, 4, TAG_SBE, &depth_diff(4, 35, 50)); // covered straggler
-        scan_record(&mut scan, 5, TAG_SBE, &depth_diff(5, 51, 60)); // contiguous vs max
-        let s = stats(&scan, STREAM_DEPTH_DIFF);
+        scan_record(&mut scan, 1, Tag::Sbe, &depth_diff(1, 10, 20));
+        scan_record(&mut scan, 2, Tag::Sbe, &depth_diff(2, 21, 30)); // contiguous
+        scan_record(&mut scan, 3, Tag::Sbe, &depth_diff(3, 41, 50)); // 31..40 lost
+        scan_record(&mut scan, 4, Tag::Sbe, &depth_diff(4, 35, 50)); // covered straggler
+        scan_record(&mut scan, 5, Tag::Sbe, &depth_diff(5, 51, 60)); // contiguous vs max
+        let s = stats(&scan, Stream::DepthDiff);
         assert_eq!(s.seq_fwd_events, 1);
         assert_eq!(s.seq_fwd_ids, 10);
         assert_eq!(s.seq_back_events, 1);
@@ -1332,11 +1356,11 @@ mod tests {
     #[test]
     fn trade_ids_chain_within_and_across_frames() {
         let mut scan = SeriesScan::default();
-        scan_record(&mut scan, 1, TAG_SBE, &trades(1, &[10, 11, 12]));
-        scan_record(&mut scan, 2, TAG_SBE, &trades(2, &[13, 15])); // 14 not seen yet
-        scan_record(&mut scan, 3, TAG_SBE, &trades(3, &[14])); // arrives late
-        scan_record(&mut scan, 4, TAG_SBE, &trades(4, &[16])); // contiguous vs max
-        let s = stats(&scan, STREAM_TRADES);
+        scan_record(&mut scan, 1, Tag::Sbe, &trades(1, &[10, 11, 12]));
+        scan_record(&mut scan, 2, Tag::Sbe, &trades(2, &[13, 15])); // 14 not seen yet
+        scan_record(&mut scan, 3, Tag::Sbe, &trades(3, &[14])); // arrives late
+        scan_record(&mut scan, 4, Tag::Sbe, &trades(4, &[16])); // contiguous vs max
+        let s = stats(&scan, Stream::Trades);
         assert_eq!(s.seq_fwd_events, 1);
         assert_eq!(s.seq_fwd_ids, 1);
         assert_eq!(s.seq_back_events, 1);
@@ -1355,10 +1379,10 @@ mod tests {
             payload.extend_from_slice(&[0u8; 34]); // exponents + bid/ask
             payload
         };
-        scan_record(&mut scan, 1, TAG_SBE, &bba(100));
-        scan_record(&mut scan, 2, TAG_SBE, &bba(500)); // forward jump: normal
-        scan_record(&mut scan, 3, TAG_SBE, &bba(400)); // backwards: dup/reorder
-        let s = stats(&scan, STREAM_BBA);
+        scan_record(&mut scan, 1, Tag::Sbe, &bba(100));
+        scan_record(&mut scan, 2, Tag::Sbe, &bba(500)); // forward jump: normal
+        scan_record(&mut scan, 3, Tag::Sbe, &bba(400)); // backwards: dup/reorder
+        let s = stats(&scan, Stream::BestBidAsk);
         assert_eq!(s.seq_fwd_events, 0);
         assert_eq!(s.seq_back_events, 1);
     }
@@ -1366,9 +1390,9 @@ mod tests {
     #[test]
     fn event_time_regressions_are_counted_per_stream() {
         let mut scan = SeriesScan::default();
-        scan_record(&mut scan, 1, TAG_SBE, &depth_diff(100, 1, 2));
-        scan_record(&mut scan, 2, TAG_SBE, &depth_diff(90, 3, 4));
-        assert_eq!(stats(&scan, STREAM_DEPTH_DIFF).time_regressions, 1);
+        scan_record(&mut scan, 1, Tag::Sbe, &depth_diff(100, 1, 2));
+        scan_record(&mut scan, 2, Tag::Sbe, &depth_diff(90, 3, 4));
+        assert_eq!(stats(&scan, Stream::DepthDiff).time_regressions, 1);
     }
 
     #[test]
@@ -1385,20 +1409,29 @@ mod tests {
     }
 
     #[test]
-    fn foreign_first_record_is_detected() {
-        assert!(is_foreign(b'0'));
-        assert!(is_foreign(b'{'));
-        assert!(!is_foreign(TAG_SBE));
-        assert!(!is_foreign(TAG_REST));
+    fn a_foreign_first_record_marks_the_file_foreign() {
+        let dir = test_dir("foreign");
+        let path = dir.join("btcusdt_20260802.zst");
+        write_zst(
+            &path,
+            &[b"1785542400000000000 {\"e\":\"trade\"}\n".to_vec()],
+        );
+
+        let report = read_file(&daily(path, civil::date(2026, 8, 2)).files[0], |_, _, _| {
+            panic!("a foreign file yields no records")
+        });
+        assert!(report.foreign);
+        assert!(report.decode_error.is_none());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn segmented_filename_preserves_symbols_with_underscores() {
-        let (symbol, file) = dated_file(Path::new(
+        let file = dated_file(Path::new(
             "btc_usdt_20260820_1787200000000000000_1787200000000000001-42.zst",
         ))
         .unwrap();
-        assert_eq!(symbol, "btc_usdt");
+        assert_eq!(file.symbol, "btc_usdt");
         assert_eq!(file.date, civil::Date::new(2026, 8, 20).unwrap());
         assert_eq!(file.segment_start_ns, 1_787_200_000_000_000_000);
         assert_eq!(file.run_id.as_deref(), Some("1787200000000000001-42"));
@@ -1406,9 +1439,8 @@ mod tests {
 
     #[test]
     fn sidecar_filename_is_grouped_with_the_daily_file() {
-        let (symbol, file) =
-            dated_file(Path::new("btc_usdt_20260821_1787200000000000001-42.zst")).unwrap();
-        assert_eq!(symbol, "btc_usdt");
+        let file = dated_file(Path::new("btc_usdt_20260821_1787200000000000001-42.zst")).unwrap();
+        assert_eq!(file.symbol, "btc_usdt");
         assert_eq!(file.date, civil::Date::new(2026, 8, 21).unwrap());
         assert_eq!(file.segment_start_ns, i64::MIN);
         assert_eq!(file.run_id.as_deref(), Some("1787200000000000001-42"));
@@ -1416,8 +1448,8 @@ mod tests {
 
     #[test]
     fn daily_filename_has_no_run_id() {
-        let (symbol, file) = dated_file(Path::new("btcusdt_20260821.zst")).unwrap();
-        assert_eq!(symbol, "btcusdt");
+        let file = dated_file(Path::new("btcusdt_20260821.zst")).unwrap();
+        assert_eq!(file.symbol, "btcusdt");
         assert_eq!(file.date, civil::Date::new(2026, 8, 21).unwrap());
         assert!(file.run_id.is_none());
     }
@@ -1431,77 +1463,50 @@ mod tests {
         assert_eq!(logical_run_id("run.later"), "run.later");
     }
 
+    /// A single run is scanned in the order it was written, not re-sorted.
     #[test]
     fn non_overlapping_records_preserve_recorded_order() {
+        let dir = test_dir("recorded-order");
+        let path = dir.join("btcusdt_20260802.zst");
         let payload = depth_diff(1, 1, 2);
-        let records = vec![
-            RawRecord {
-                recv: 200,
-                tag: TAG_SBE,
-                payload: payload.clone(),
-                source: 0,
-            },
-            RawRecord {
-                recv: 100,
-                tag: TAG_SBE,
-                payload,
-                source: 0,
-            },
-        ];
-        let mut scan = SeriesScan::default();
-        process_records(&mut scan, records, 1_000, false);
-        assert_eq!(scan.recv_regressions, 1);
+        write_zst(
+            &path,
+            &[
+                record(200, Tag::Sbe, &payload),
+                record(100, Tag::Sbe, &payload),
+            ],
+        );
+
+        let report = scan_series(&daily(path, civil::date(2026, 8, 2)), 1_000, false);
+        assert_eq!(report.recv_regressions, 1);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn overlapping_runs_are_time_merged_and_cross_run_duplicates_are_removed() {
         let ten_old = trades(10, &[10]);
         let mut ten_new = ten_old.clone();
-        ten_new[8..16].copy_from_slice(&11_i64.to_le_bytes());
+        ten_new[EVENT_TIME].copy_from_slice(&11_i64.to_le_bytes());
         let twelve_old = trades(12, &[12]);
         let mut twelve_new = twelve_old.clone();
-        twelve_new[8..16].copy_from_slice(&13_i64.to_le_bytes());
+        twelve_new[EVENT_TIME].copy_from_slice(&13_i64.to_le_bytes());
+        let raw = |recv, tag, payload, source| RawRecord {
+            recv,
+            tag,
+            payload,
+            source,
+        };
         let records = vec![
-            RawRecord {
-                recv: 0,
-                tag: TAG_REST,
-                payload: b"old-start".to_vec(),
-                source: 0,
-            },
-            RawRecord {
-                recv: 4,
-                tag: TAG_SBE,
-                payload: twelve_old,
-                source: 0,
-            },
-            RawRecord {
-                recv: 1,
-                tag: TAG_SBE,
-                payload: ten_old,
-                source: 0,
-            },
-            RawRecord {
-                recv: 2,
-                tag: TAG_SBE,
-                payload: ten_new,
-                source: 1,
-            },
-            RawRecord {
-                recv: 3,
-                tag: TAG_SBE,
-                payload: twelve_new,
-                source: 1,
-            },
-            RawRecord {
-                recv: 5,
-                tag: TAG_REST,
-                payload: b"new-end".to_vec(),
-                source: 1,
-            },
+            raw(0, Tag::Rest, b"old-start".to_vec(), 0),
+            raw(4, Tag::Sbe, twelve_old, 0),
+            raw(1, Tag::Sbe, ten_old, 0),
+            raw(2, Tag::Sbe, ten_new, 1),
+            raw(3, Tag::Sbe, twelve_new, 1),
+            raw(5, Tag::Rest, b"new-end".to_vec(), 1),
         ];
         let mut scan = SeriesScan::default();
-        process_records(&mut scan, records, 5_000_000_000, true);
-        let stats = stats(&scan, STREAM_TRADES);
+        process_overlapping(&mut scan, records, 5_000_000_000);
+        let stats = stats(&scan, Stream::Trades);
         assert_eq!(scan.rows, 4);
         assert_eq!(scan.recv_regressions, 0);
         assert!(scan.gaps.is_empty());
@@ -1513,7 +1518,7 @@ mod tests {
     fn overlap_dedup_is_one_to_one_and_stops_at_the_observed_overlap() {
         let raw = |recv, payload: &'static [u8], source| RawRecord {
             recv,
-            tag: TAG_REST,
+            tag: Tag::Rest,
             payload: payload.to_vec(),
             source,
         };
@@ -1529,7 +1534,7 @@ mod tests {
             raw(20, b"new-end", 1),
         ];
         let mut scan = SeriesScan::default();
-        process_records(&mut scan, records, 100, true);
+        process_overlapping(&mut scan, records, 100);
         assert_eq!(scan.rows, 6);
     }
 
@@ -1542,50 +1547,31 @@ mod tests {
         assert_eq!(grouped(12_345_678), "12,345,678");
     }
 
-    /// End-to-end over a real zstd file: records in, report out.
+    /// End to end over a real zstd file: records in, report out.
     #[test]
     fn scans_a_written_file_end_to_end() {
-        use std::io::Write;
-
-        let dir = std::env::temp_dir().join(format!(
-            "sbe-gap-detector-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = test_dir("end-to-end");
         let path = dir.join("btcusdt_20260802.zst");
-        {
-            let file = File::create(&path).unwrap();
-            let mut encoder = zstd::stream::write::Encoder::new(file, 1).unwrap();
-            for frame in [
-                record(1_000_000_000, TAG_SBE, &depth_diff(1, 1, 10)),
-                record(2_000_000_000, TAG_SBE, &depth_diff(2, 11, 20)),
-                record(9_000_000_000, TAG_SBE, &depth_diff(3, 21, 30)), // 7s silence
-                record(9_500_000_000, TAG_REST, b"{}"),
-            ] {
-                encoder.write_all(&frame).unwrap();
-            }
-            encoder.finish().unwrap();
-        }
+        write_zst(
+            &path,
+            &[
+                record(1_000_000_000, Tag::Sbe, &depth_diff(1, 1, 10)),
+                record(2_000_000_000, Tag::Sbe, &depth_diff(2, 11, 20)),
+                record(9_000_000_000, Tag::Sbe, &depth_diff(3, 21, 30)), // 7s silence
+                record(9_500_000_000, Tag::Rest, b"{}"),
+            ],
+        );
 
-        let series = Series {
-            key: "test/btcusdt".into(),
-            files: vec![DatedFile {
-                path: path.clone(),
-                date: civil::Date::new(2026, 8, 2).unwrap(),
-                segment_start_ns: i64::MIN,
-                run_id: None,
-            }],
-        };
-        let report = scan_series(&series, 5_000_000_000, false);
+        let report = scan_series(
+            &daily(path.clone(), civil::date(2026, 8, 2)),
+            5_000_000_000,
+            false,
+        );
         assert_eq!(report.rows, 4);
         assert_eq!(report.sbe_records, 3);
         assert_eq!(report.rest_records, 1);
         assert_eq!(report.gaps.len(), 1);
-        assert_eq!(report.gaps[0].end - report.gaps[0].start, 7_000_000_000);
+        assert_eq!(report.gaps[0].silence_ns(), 7_000_000_000);
         assert_eq!(report.files[0].path, path);
 
         fs::remove_dir_all(&dir).unwrap();

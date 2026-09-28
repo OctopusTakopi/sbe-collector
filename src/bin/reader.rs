@@ -1,7 +1,6 @@
-//! Example: read and print records from a .zst data file produced by sbe-collector.
+//! Print the records of `.zst` files written by sbe-collector.
 //!
-//! Usage:
-//!   cargo run --bin reader -- <file.zst> [<file2.zst> ...]
+//! Usage: `reader <file.zst> [<file2.zst> ...]`
 
 use std::{
     env,
@@ -10,368 +9,309 @@ use std::{
     path::Path,
 };
 
-use sbe_collector::sbe_types::{
-    self, DepthEntry, GroupSize16Encoding, GroupSizeEncoding, MessageHeader, TEMPLATE_BEST_BID_ASK,
-    TEMPLATE_DEPTH_DIFF, TEMPLATE_DEPTH_SNAPSHOT, TEMPLATE_TRADES, TradeEntry, TradesBlock,
+use sbe_collector::{
+    record::{HEADER_LEN, Header, Tag},
+    sbe_types::{
+        BestBidAskBlock, DepthDiffBlock, DepthEntry, DepthSnapshotBlock, GroupSize16Encoding,
+        GroupSizeEncoding, MessageHeader, TEMPLATE_BEST_BID_ASK, TEMPLATE_DEPTH_DIFF,
+        TEMPLATE_DEPTH_SNAPSHOT, TEMPLATE_TRADES, TradeEntry, TradesBlock,
+    },
 };
+use serde_json::Value;
 use zerocopy::FromBytes;
 use zstd::stream::read::Decoder as ZstdDecoder;
 
-const TAG_SBE: u8 = b'S';
-const TAG_REST: u8 = b'R';
-const FRAME_HEADER_LEN: usize = 13; // 8 (nanos) + 1 (tag) + 4 (payload_len)
+/// Entries printed per group before `...`.
+const SHOWN: usize = 5;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
     let files: Vec<String> = env::args().skip(1).collect();
     if files.is_empty() {
         eprintln!("Usage: reader <file.zst> [<file2.zst> ...]");
         std::process::exit(1);
     }
-
     for path in &files {
-        println!("=== {} ===", path);
-        if let Err(e) = read_file(Path::new(path)) {
-            eprintln!("Error reading {}: {}", path, e);
+        println!("=== {path} ===");
+        if let Err(error) = read_file(Path::new(path)) {
+            eprintln!("Error reading {path}: {error}");
         }
     }
-    Ok(())
+}
+
+#[derive(Default)]
+struct Counts {
+    records: usize,
+    sbe: usize,
+    rest: usize,
 }
 
 fn read_file(path: &Path) -> io::Result<()> {
-    let file = File::open(path)?;
-    let zstd_reader = ZstdDecoder::new(BufReader::new(file))?;
-    let mut reader = BufReader::new(zstd_reader);
-
-    let mut header_buf = [0u8; FRAME_HEADER_LEN];
-    let mut record_count = 0usize;
-    let mut sbe_count = 0usize;
-    let mut rest_count = 0usize;
-
+    let decoder = ZstdDecoder::new(BufReader::new(File::open(path)?))?;
+    let mut reader = BufReader::new(decoder);
+    let mut header = [0u8; HEADER_LEN];
+    let mut payload = Vec::new();
+    let mut counts = Counts::default();
     loop {
-        match reader.read_exact(&mut header_buf) {
+        match reader.read_exact(&mut header) {
             Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e),
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(error),
         }
-
-        let nanos = i64::from_le_bytes(header_buf[0..8].try_into().unwrap());
-        let tag = header_buf[8];
-        let payload_len = u32::from_le_bytes(header_buf[9..13].try_into().unwrap()) as usize;
-
-        let mut payload = vec![0u8; payload_len];
+        let Header { recv_ns, tag, len } = Header::parse(&header);
+        payload.resize(len as usize, 0);
         reader.read_exact(&mut payload)?;
-
-        record_count += 1;
-
-        match tag {
-            TAG_REST => {
-                rest_count += 1;
-                print_rest_record(nanos, &payload);
+        counts.records += 1;
+        match Tag::from_byte(tag) {
+            Some(Tag::Rest) => {
+                counts.rest += 1;
+                print_rest_record(recv_ns, &payload);
             }
-            TAG_SBE => {
-                sbe_count += 1;
-                print_sbe_record(nanos, &payload);
+            Some(Tag::Sbe) => {
+                counts.sbe += 1;
+                print_sbe_record(recv_ns, &payload);
             }
-            other => {
-                println!("[{nanos}] unknown tag: 0x{other:02x}, payload_len={payload_len}");
-            }
+            None => println!("[{recv_ns}] unknown tag: 0x{tag:02x}, payload_len={len}"),
         }
     }
-
     println!(
         "--- total: {} records ({} SBE stream, {} REST snapshot) ---",
-        record_count, sbe_count, rest_count
+        counts.records, counts.sbe, counts.rest
     );
     Ok(())
 }
 
 fn print_rest_record(nanos: i64, payload: &[u8]) {
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(payload) else {
+    let Ok(snapshot) = serde_json::from_slice::<Value>(payload) else {
         println!("[{nanos}] R <invalid JSON>");
         return;
     };
-
-    let last_update_id = v["lastUpdateId"].as_u64().unwrap_or(0);
-    let bids = v["bids"].as_array();
-    let asks = v["asks"].as_array();
-
+    let bids = snapshot["bids"].as_array();
+    let asks = snapshot["asks"].as_array();
     println!(
         "[{nanos}] R SNAPSHOT lastUpdateId={} bids={} asks={}",
-        last_update_id,
-        bids.map_or(0, |a| a.len()),
-        asks.map_or(0, |a| a.len()),
+        snapshot["lastUpdateId"].as_u64().unwrap_or(0),
+        bids.map_or(0, Vec::len),
+        asks.map_or(0, Vec::len),
     );
-
-    if let Some(bids) = bids {
-        println!("  Bids:");
-        for b in bids.iter().take(5) {
-            if let Some(pair) = b.as_array() {
-                println!(
-                    "    {} @ {}",
-                    pair[0].as_str().unwrap_or("?"),
-                    pair[1].as_str().unwrap_or("?")
-                );
-            }
-        }
-    }
-    if let Some(asks) = asks {
-        println!("  Asks:");
-        for a in asks.iter().take(5) {
-            if let Some(pair) = a.as_array() {
-                println!(
-                    "    {} @ {}",
-                    pair[0].as_str().unwrap_or("?"),
-                    pair[1].as_str().unwrap_or("?")
-                );
-            }
+    for (label, levels) in [("Bids", bids), ("Asks", asks)] {
+        let Some(levels) = levels else {
+            continue;
+        };
+        println!("  {label}:");
+        for level in levels.iter().take(SHOWN).filter_map(Value::as_array) {
+            let field = |index: usize| level.get(index).and_then(Value::as_str).unwrap_or("?");
+            println!("    {} @ {}", field(0), field(1));
         }
     }
 }
 
-fn print_sbe_record(nanos: i64, data: &[u8]) {
-    if data.len() < 8 {
-        println!("[{nanos}] S <too short: {} bytes>", data.len());
-        return;
-    }
-
-    let Ok((header, _)) = MessageHeader::read_from_prefix(data) else {
-        println!("[{nanos}] S <invalid SBE header>");
-        return;
-    };
-
-    let template_id = header.template_id.get();
-    let block_len = header.block_length.get() as usize;
-
-    // Find symbol using the subscribed-set-free tail matcher (no known symbols
-    // in the reader, so we fall back to the validated heuristic, but now using
-    // the correct forward-reading approach).
-    let symbol_str = extract_symbol(data);
-
-    let msg_type = match template_id {
+fn template_name(template_id: u16) -> Option<&'static str> {
+    Some(match template_id {
         TEMPLATE_TRADES => "TRADES",
         TEMPLATE_BEST_BID_ASK => "BEST_BID_ASK",
         TEMPLATE_DEPTH_SNAPSHOT => "DEPTH_SNAPSHOT",
         TEMPLATE_DEPTH_DIFF => "DEPTH_DIFF",
-        other => {
-            return println!(
-                "[{nanos}] S template={other} {symbol_str} block_len={block_len} total={}b",
-                data.len()
-            );
-        }
+        _ => return None,
+    })
+}
+
+/// `mantissa × 10^exponent`; floating point is for display only.
+fn decimal(mantissa: i64, exponent: i8) -> f64 {
+    (mantissa as f64) * 10f64.powi(i32::from(exponent))
+}
+
+fn print_sbe_record(nanos: i64, data: &[u8]) {
+    let Ok((header, body)) = MessageHeader::read_from_prefix(data) else {
+        println!("[{nanos}] S <too short: {} bytes>", data.len());
+        return;
     };
+    let template_id = header.template_id.get();
+    let block_len = header.block_length.get() as usize;
+    let symbol = extract_symbol(data);
+    let Some(name) = template_name(template_id) else {
+        println!(
+            "[{nanos}] S template={template_id} {symbol} block_len={block_len} total={}b",
+            data.len()
+        );
+        return;
+    };
+    let groups = size_of::<MessageHeader>() + block_len;
 
     match template_id {
-        // ── TradesStreamEvent ────────────────────────────────────────────────
-        // Fixed block (blockLength=18): TradesBlock
-        // Group header: GroupSizeEncoding (6 bytes, uint32 numInGroup)  ← 6 bytes!
-        // Entries: TradeEntry (25 bytes each: id+price+qty+isBuyerMaker)
-        TEMPLATE_TRADES if data.len() >= 8 + block_len => {
-            if let Ok((blk, _)) = TradesBlock::read_from_prefix(&data[8..]) {
-                let mut off = 8 + block_len;
-                // GroupSizeEncoding for trades: 6 bytes, numInGroup is uint32.
-                let (count, entry_len) = read_trades_group_header(data, &mut off).unwrap_or((0, 0));
-                println!(
-                    "[{nanos}] S {msg_type} {symbol_str} trades={count} t={}",
-                    blk.event_time.get()
-                );
-                // Print first few trade entries.
-                let scale = |m: i64, e: i8| (m as f64) * 10f64.powi(e as i32);
-                for i in 0..count {
-                    if off + entry_len.max(std::mem::size_of::<TradeEntry>()) > data.len() {
-                        break;
-                    }
-                    if let Ok((entry, _)) = TradeEntry::read_from_prefix(&data[off..]) {
-                        if i < 5 {
-                            println!(
-                                "  trade id={} price={:.6} qty={:.6} buyer_maker={}",
-                                entry.id.get(),
-                                scale(entry.price.get(), blk.price_exponent),
-                                scale(entry.qty.get(), blk.qty_exponent),
-                                entry.is_buyer_maker,
-                            );
-                        }
-                    } else {
-                        break;
-                    }
-                    // Skip the wire blockLength, not the compile-time struct
-                    // size: a newer schema version appends fields to the entry,
-                    // and only the dimension header knows the true stride.
-                    off += entry_len;
-                }
-                if count > 5 {
-                    println!("  ...");
-                }
+        // Unlike the others, an unreadable trades block prints nothing.
+        TEMPLATE_TRADES if data.len() >= groups => {
+            if let Ok((block, _)) = TradesBlock::read_from_prefix(body) {
+                print_trades(nanos, symbol, data, groups, &block);
             }
             return;
         }
-
-        // ── BestBidAskStreamEvent ────────────────────────────────────────────
-        // Fixed block (blockLength=50): BestBidAskBlock. No groups.
-        TEMPLATE_BEST_BID_ASK if data.len() >= 8 + block_len => {
-            use sbe_types::BestBidAskBlock;
-            if let Ok((bba, _)) = BestBidAskBlock::read_from_prefix(&data[8..]) {
-                let scale = |m: i64, e: i8| (m as f64) * 10f64.powi(e as i32);
+        TEMPLATE_BEST_BID_ASK if data.len() >= groups => {
+            if let Ok((block, _)) = BestBidAskBlock::read_from_prefix(body) {
                 println!(
-                    "[{nanos}] S {msg_type} {symbol_str} bid={:.6} ask={:.6} t={}",
-                    scale(bba.bid_price.get(), bba.price_exponent),
-                    scale(bba.ask_price.get(), bba.price_exponent),
-                    bba.event_time.get(),
+                    "[{nanos}] S {name} {symbol} bid={:.6} ask={:.6} t={}",
+                    decimal(block.bid_price.get(), block.price_exponent),
+                    decimal(block.ask_price.get(), block.price_exponent),
+                    block.event_time.get(),
                 );
                 return;
             }
         }
-
-        // ── DepthDiffStreamEvent ──────────────────────────────────────────────
-        // Fixed block (blockLength=26): DepthDiffBlock.
-        // Groups: bids + asks, each with GroupSize16Encoding (4 bytes, uint16 numInGroup).
-        TEMPLATE_DEPTH_DIFF if data.len() >= 8 + block_len => {
-            use sbe_types::DepthDiffBlock;
-            if let Ok((blk, _)) = DepthDiffBlock::read_from_prefix(&data[8..]) {
-                let mut off = 8 + block_len;
+        TEMPLATE_DEPTH_DIFF if data.len() >= groups => {
+            if let Ok((block, _)) = DepthDiffBlock::read_from_prefix(body) {
                 println!(
-                    "[{nanos}] S {msg_type} {symbol_str} t={} uid={}-{}",
-                    blk.event_time.get(),
-                    blk.first_book_update_id.get(),
-                    blk.last_book_update_id.get(),
+                    "[{nanos}] S {name} {symbol} t={} uid={}-{}",
+                    block.event_time.get(),
+                    block.first_book_update_id.get(),
+                    block.last_book_update_id.get(),
                 );
                 print_depth_levels(
                     data,
-                    &mut off,
-                    blk.price_exponent,
-                    blk.qty_exponent,
-                    "diffBids",
-                    "diffAsks",
+                    groups,
+                    [block.price_exponent, block.qty_exponent],
+                    ["diffBids", "diffAsks"],
                 );
                 return;
             }
         }
-
-        // ── DepthSnapshotStreamEvent ──────────────────────────────────────────
-        // Fixed block (blockLength=18): DepthSnapshotBlock.
-        // Groups: bids + asks, each with GroupSize16Encoding (4 bytes, uint16 numInGroup).
-        TEMPLATE_DEPTH_SNAPSHOT if data.len() >= 8 + block_len => {
-            use sbe_types::DepthSnapshotBlock;
-            if let Ok((blk, _)) = DepthSnapshotBlock::read_from_prefix(&data[8..]) {
-                let mut off = 8 + block_len;
+        TEMPLATE_DEPTH_SNAPSHOT if data.len() >= groups => {
+            if let Ok((block, _)) = DepthSnapshotBlock::read_from_prefix(body) {
                 println!(
-                    "[{nanos}] S {msg_type} {symbol_str} t={} uid={}",
-                    blk.event_time.get(),
-                    blk.book_update_id.get(),
+                    "[{nanos}] S {name} {symbol} t={} uid={}",
+                    block.event_time.get(),
+                    block.book_update_id.get(),
                 );
                 print_depth_levels(
                     data,
-                    &mut off,
-                    blk.price_exponent,
-                    blk.qty_exponent,
-                    "snapshotBids",
-                    "snapshotAsks",
+                    groups,
+                    [block.price_exponent, block.qty_exponent],
+                    ["snapshotBids", "snapshotAsks"],
                 );
                 return;
             }
         }
-
         _ => {}
     }
-
     println!(
-        "[{nanos}] S {msg_type} {symbol_str} block_len={block_len} total={}b",
+        "[{nanos}] S {name} {symbol} block_len={block_len} total={}b",
         data.len()
     );
 }
 
+fn print_trades(nanos: i64, symbol: &str, data: &[u8], mut offset: usize, block: &TradesBlock) {
+    let group = read_group::<GroupSizeEncoding>(data, &mut offset).unwrap_or_default();
+    println!(
+        "[{nanos}] S TRADES {symbol} trades={} t={}",
+        group.count,
+        block.event_time.get()
+    );
+    for _ in 0..group.count.min(SHOWN) {
+        if offset + group.stride.max(size_of::<TradeEntry>()) > data.len() {
+            break;
+        }
+        let Ok((entry, _)) = TradeEntry::read_from_prefix(&data[offset..]) else {
+            break;
+        };
+        println!(
+            "  trade id={} price={:.6} qty={:.6} buyer_maker={}",
+            entry.id.get(),
+            decimal(entry.price.get(), block.price_exponent),
+            decimal(entry.qty.get(), block.qty_exponent),
+            entry.is_buyer_maker,
+        );
+        offset += group.stride;
+    }
+    if group.count > SHOWN {
+        println!("  ...");
+    }
+}
+
+/// Both depth groups, bids then asks, from `offset`.
 fn print_depth_levels(
     data: &[u8],
-    offset: &mut usize,
-    p_exp: i8,
-    q_exp: i8,
-    bid_label: &str,
-    ask_label: &str,
+    mut offset: usize,
+    [price_exponent, qty_exponent]: [i8; 2],
+    labels: [&str; 2],
 ) {
-    let scale = |m: i64, e: i8| (m as f64) * 10f64.powi(e as i32);
-
-    // Both bid and ask groups use GroupSize16Encoding (4 bytes, uint16 numInGroup).
-    for label in [bid_label, ask_label] {
-        if let Some((count, entry_len)) = read_depth_group_header(data, offset) {
-            println!("  {} ({}):", label, count);
-            for i in 0..count {
-                if let Ok((entry, _)) = DepthEntry::read_from_prefix(&data[*offset..]) {
-                    if i < 5 {
-                        println!(
-                            "    {:.6} @ {:.6}",
-                            scale(entry.price.get(), p_exp),
-                            scale(entry.qty.get(), q_exp)
-                        );
-                    }
-                    *offset += entry_len;
-                } else {
-                    break;
-                }
+    for label in labels {
+        let Some(group) = read_group::<GroupSize16Encoding>(data, &mut offset) else {
+            continue;
+        };
+        println!("  {label} ({}):", group.count);
+        for index in 0..group.count {
+            let Some(Ok((entry, _))) = data.get(offset..).map(DepthEntry::read_from_prefix) else {
+                break;
+            };
+            if index < SHOWN {
+                println!(
+                    "    {:.6} @ {:.6}",
+                    decimal(entry.price.get(), price_exponent),
+                    decimal(entry.qty.get(), qty_exponent)
+                );
             }
-            if count > 5 {
-                println!("    ...");
-            }
+            offset += group.stride;
+        }
+        if group.count > SHOWN {
+            println!("    ...");
         }
     }
 }
 
-/// Read a `GroupSize16Encoding` header (4 bytes) used by Depth Snapshot/Diff groups.
-/// Returns (numInGroup as usize, entry_block_length).
-fn read_depth_group_header(data: &[u8], offset: &mut usize) -> Option<(usize, usize)> {
-    const GSE_LEN: usize = std::mem::size_of::<GroupSize16Encoding>(); // 4
-    if *offset + GSE_LEN > data.len() {
-        return None;
-    }
-    let Ok((gse, _)) = GroupSize16Encoding::read_from_prefix(&data[*offset..]) else {
-        return None;
-    };
-    *offset += GSE_LEN;
-    Some((
-        gse.num_in_group.get() as usize,
-        gse.block_length.get() as usize,
-    ))
+/// A repeating group: `count` entries of `stride` bytes each. The stride is
+/// the wire `blockLength`, not a struct size: a newer schema version appends
+/// fields to entries.
+#[derive(Default)]
+struct Group {
+    count: usize,
+    stride: usize,
 }
 
-/// Read a `GroupSizeEncoding` header (6 bytes) used by the TradesStreamEvent
-/// group. Returns (numInGroup as usize, entry_block_length).
-fn read_trades_group_header(data: &[u8], offset: &mut usize) -> Option<(usize, usize)> {
-    const GSE_LEN: usize = std::mem::size_of::<GroupSizeEncoding>(); // 6
-    if *offset + GSE_LEN > data.len() {
-        return None;
-    }
-    let Ok((gse, _)) = GroupSizeEncoding::read_from_prefix(&data[*offset..]) else {
-        return None;
-    };
-    *offset += GSE_LEN;
-    Some((
-        gse.num_in_group.get() as usize,
-        gse.block_length.get() as usize,
-    ))
+/// A group dimension composite.
+trait Dimension: FromBytes {
+    fn group(&self) -> Group;
 }
 
-/// Extract the terminal `VarString8` symbol appended by the Binance stream bridge.
+impl Dimension for GroupSizeEncoding {
+    fn group(&self) -> Group {
+        Group {
+            count: self.num_in_group.get() as usize,
+            stride: usize::from(self.block_length.get()),
+        }
+    }
+}
+
+impl Dimension for GroupSize16Encoding {
+    fn group(&self) -> Group {
+        Group {
+            count: usize::from(self.num_in_group.get()),
+            stride: usize::from(self.block_length.get()),
+        }
+    }
+}
+
+/// The group dimension at `*offset`, stepping past it.
+fn read_group<D: Dimension>(data: &[u8], offset: &mut usize) -> Option<Group> {
+    let (dimension, _) = D::read_from_prefix(data.get(*offset..)?).ok()?;
+    *offset += size_of::<D>();
+    Some(dimension.group())
+}
+
+/// The symbol the stream bridge appends to every frame as a `VarString8`.
 ///
-/// The reader has no list of known symbols, so we can only use a heuristic. We
-/// try each possible length from largest (19) down and accept the first suffix
-/// whose preceding byte equals the suffix length AND all bytes are ASCII
-/// alphanumeric. This is the same heuristic as before, preserved because the
-/// reader has no subscribed-symbol list to match against.
-///
-/// In production the collector (mod.rs) uses exact symbol matching which is
-/// immune to false positives.
+/// With no subscription list to match against, take the longest suffix of
+/// 2 to 19 alphanumeric or `_` bytes whose preceding byte equals its length.
 fn extract_symbol(data: &[u8]) -> &str {
     let n = data.len();
-    for sym_len in (2..20).rev() {
-        if n < sym_len + 1 {
+    for symbol_len in (2..20).rev() {
+        if n < symbol_len + 1 || data[n - symbol_len - 1] as usize != symbol_len {
             continue;
         }
-        let len_pos = n - sym_len - 1;
-        if data[len_pos] as usize == sym_len {
-            let s = &data[n - sym_len..];
-            if s.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_')
-                && let Ok(sym) = std::str::from_utf8(s)
-            {
-                return sym;
-            }
+        let symbol = &data[n - symbol_len..];
+        if symbol
+            .iter()
+            .all(|&byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            && let Ok(symbol) = std::str::from_utf8(symbol)
+        {
+            return symbol;
         }
     }
     "unknown"

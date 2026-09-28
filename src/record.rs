@@ -2,7 +2,7 @@
 
 pub const HEADER_LEN: usize = 13;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum Tag {
     /// Raw SBE stream frame.
