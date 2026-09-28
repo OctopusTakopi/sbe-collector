@@ -1,0 +1,66 @@
+=== btcusdt_20260801.zst ===
+[1785542400000000000] S TRADES BTCUSDT trades=7 t=1785542400000001
+  trade id=100 price=65433.100000 qty=1.501000 buyer_maker=0
+  trade id=101 price=65433.110000 qty=1.501010 buyer_maker=1
+  trade id=102 price=65433.120000 qty=1.501020 buyer_maker=0
+  trade id=103 price=65433.130000 qty=1.501030 buyer_maker=1
+  trade id=104 price=65433.140000 qty=1.501040 buyer_maker=0
+  ...
+[1785542400000000001] S TRADES BTCUSDT trades=2 t=1785542400000002
+  trade id=107 price=65433.170000 qty=1.501070 buyer_maker=1
+  trade id=108 price=65433.180000 qty=1.501080 buyer_maker=0
+[1785542400000000002] S TRADES BTCUSDT trades=2 t=1785542400000003
+  trade id=109 price=65433.190000 qty=1.501090 buyer_maker=1
+  trade id=110 price=65433.200000 qty=1.501100 buyer_maker=0
+[1785542400000000003] S BEST_BID_ASK BTCUSDT bid=65432.100000 ask=65432.110000 t=1785542400000004
+[1785542400000000004] S DEPTH_DIFF BTCUSDT t=1785542400000005 uid=10-20
+  diffBids (2):
+    65432.000000 @ 0.100000
+    65432.010000 @ 0.200000
+  diffAsks (6):
+    65433.000000 @ 0.100000
+    65433.010000 @ 0.200000
+    65433.020000 @ 0.300000
+    65433.030000 @ 0.400000
+    65433.040000 @ 0.500000
+    ...
+[1785542400000000005] S DEPTH_SNAPSHOT BTCUSDT t=1785542400000006 uid=21
+  snapshotBids (7):
+    65432.000000 @ 1.000000
+    65432.100000 @ 2.000000
+    65432.200000 @ 3.000000
+    65432.300000 @ 4.000000
+    65432.400000 @ 5.000000
+    ...
+  snapshotAsks (3):
+    65433.000000 @ 1.000000
+    65433.100000 @ 2.000000
+    65433.200000 @ 3.000000
+[1785542400000000006] S template=12345 BTCUSDT block_len=4 total=20b
+[1785542400000000007] S <too short: 5 bytes>
+[1785542400000000008] S TRADES unknown block_len=18 total=20b
+[1785542400000000009] S BEST_BID_ASK unknown bid=65432.100000 ask=65432.110000 t=1785542400000010
+[1785542400000000010] S DEPTH_DIFF unknown t=1785542400000011 uid=21-22
+  diffBids (4):
+    65432.000000 @ 0.100000
+[1785542400000000011] R SNAPSHOT lastUpdateId=21 bids=7 asks=2
+  Bids:
+    65432.10 @ 0.5
+    65432.09 @ 1.0
+    65432.08 @ 1.5
+    65432.07 @ 2.0
+    65432.06 @ 2.5
+  Asks:
+    65432.11 @ 0.1
+    65432.12 @ ?
+[1785542400000000012] R <invalid JSON>
+[1785542400000000013] R SNAPSHOT lastUpdateId=0 bids=0 asks=0
+[1785542400000000014] unknown tag: 0x58, payload_len=4
+--- total: 15 records (11 SBE stream, 3 REST snapshot) ---
+=== ethusdt_20260801.zst ===
+[1785542400000000015] S BEST_BID_ASK ETHUSDT bid=65432.100000 ask=65432.110000 t=1
+--- total: 1 records (1 SBE stream, 0 REST snapshot) ---
+=== xrpusdt_20260801.zst ===
+[1785542400000000016] S BEST_BID_ASK XRPUSDT bid=65432.100000 ask=65432.110000 t=3
+--- total: 1 records (1 SBE stream, 0 REST snapshot) ---
+=== missing.zst ===

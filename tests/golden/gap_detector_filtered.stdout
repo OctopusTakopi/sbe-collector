@@ -1,0 +1,26 @@
+
+./ethusdt
+  files: ./ethusdt_20260801.zst, ./ethusdt_20260801_1785542400000000001-42.zst
+  records: 6 (6 stream, 0 rest snapshots) | recv span: 2026-08-01 00:00:00.000Z .. 2026-08-01 00:00:03.000Z | bad records: 0
+  recv gaps > 5.000s: none
+  streams:
+    trades: 6 msgs
+      ids 1..5: net 1 extra from reorders/dups (6 observed)
+      1 forward chain break(s), 1 ids
+      breaks at: 2026-08-01 00:00:03.000Z
+      2 duplicate/reordered event(s)
+      1 time regression(s)
+
+SUMMARY
+  series scanned        : 1
+  records decoded       : 6
+  recv gaps > 5s  : 0 across 0 series (total silence 0.000s)
+  forward chain breaks  : 1 event(s), 1 ids
+  net missing ids       : 0 (range accounting)
+  dup/reordered events  : 2
+  time regressions      : 1
+  missing dates         : 0
+  decode errors         : 0
+  bad records           : 0
+  foreign files         : 0 (skipped)
+RESULT: issues found in 1 series

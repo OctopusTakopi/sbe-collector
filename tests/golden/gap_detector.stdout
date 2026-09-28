@@ -1,0 +1,80 @@
+
+./adausdt
+  files: ./adausdt_20260801_1785542400000000000_run-1.zst, ./adausdt_20260801_1785549600000000000_run-1.zst
+  records: 2 (2 stream, 0 rest snapshots) | recv span: 2026-08-01 00:00:00.000Z .. 2026-08-01 02:00:00.000Z | bad records: 0
+  RECV GAPS > 5.000s: 1 (total silence 2h00m00s)
+    2026-08-01 00:00:00.000Z .. 2026-08-01 02:00:00.000Z (2h00m00s)
+  streams:
+    trades: 2 msgs
+      ids 1..5: complete (5 observed)
+
+./btcusdt
+  files: ./btcusdt_20260801.zst, ./btcusdt_20260803.zst
+  records: 16 (15 stream, 1 rest snapshots) | recv span: 2026-08-01 00:00:00.000Z .. 2026-08-03 00:00:50.000Z | bad records: 1
+  MISSING DATES: 2026-08-02
+  receive time regressions: 1 (arrival-vs-dequeue ordering)
+  RECV GAPS > 5.000s: 4 (total silence 48h00m45s)
+    2026-08-01 00:00:11.000Z .. 2026-08-03 00:00:00.000Z (47h59m48s)
+    2026-08-03 00:00:20.000Z .. 2026-08-03 00:00:50.000Z (30.000s)
+    2026-08-03 00:00:00.000Z .. 2026-08-03 00:00:20.000Z (20.000s)
+    2026-08-01 00:00:01.000Z .. 2026-08-01 00:00:08.000Z (7.000s)
+  streams:
+    best-bid-ask: 3 msgs
+      1 duplicate/reordered event(s)
+    depth-diff: 4 msgs
+      1 forward chain break(s), 10 ids
+      breaks at: 2026-08-01 00:00:08.000Z
+      1 duplicate/reordered event(s)
+      1 time regression(s)
+    trades: 6 msgs
+      ids 1,000..1,009: complete (10 observed)
+      1 forward chain break(s), 2 ids
+      breaks at: 2026-08-01 00:00:09.000Z
+      2 duplicate/reordered event(s)
+
+./empty/dogeusdt
+  files: ./empty/dogeusdt_20260801.zst
+  (no records decoded)
+  recv gaps > 5.000s: none
+
+./ethusdt
+  files: ./ethusdt_20260801.zst, ./ethusdt_20260801_1785542400000000001-42.zst
+  records: 6 (6 stream, 0 rest snapshots) | recv span: 2026-08-01 00:00:00.000Z .. 2026-08-01 00:00:03.000Z | bad records: 0
+  recv gaps > 5.000s: none
+  streams:
+    trades: 6 msgs
+      ids 1..5: net 1 extra from reorders/dups (6 observed)
+      1 forward chain break(s), 1 ids
+      breaks at: 2026-08-01 00:00:03.000Z
+      2 duplicate/reordered event(s)
+      1 time regression(s)
+
+./solusdt
+  files: ./solusdt_20260801.zst
+    ./solusdt_20260801.zst: foreign format (not sbe-collector records), skipped
+  recv gaps > 5.000s: none
+
+./xrpusdt
+  files: ./xrpusdt_20260801.zst, ./xrpusdt_20260802.zst
+    ./xrpusdt_20260801.zst: decode error after 2 records: incomplete frame
+    ./xrpusdt_20260802.zst: unterminated zstd stream after 2 records (file modified recently — still being written?): incomplete frame
+  records: 4 (4 stream, 0 rest snapshots) | recv span: 2026-08-01 00:00:00.000Z .. 2026-08-01 00:00:01.000Z | bad records: 0
+  recv gaps > 5.000s: none
+  streams:
+    best-bid-ask: 4 msgs
+      1 duplicate/reordered event(s)
+      1 time regression(s)
+
+SUMMARY
+  series scanned        : 6
+  records decoded       : 28
+  recv gaps > 5s  : 5 across 2 series (total silence 50h00m45s)
+  forward chain breaks  : 3 event(s), 13 ids
+  net missing ids       : 0 (range accounting)
+  dup/reordered events  : 7
+  time regressions      : 3
+  missing dates         : 1
+  decode errors         : 2
+  bad records           : 1
+  foreign files         : 1 (skipped)
+RESULT: issues found in 4 series
