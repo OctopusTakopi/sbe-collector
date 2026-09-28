@@ -456,12 +456,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "glidesort"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2e102e6eb644d3e0b186fc161e4460417880a0a0b87d235f2e5b8fb30f2e9e0"
-
-[[package]]
 name = "h2"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1197,8 +1191,6 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
- "serde",
- "serde_json",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
@@ -1339,18 +1331,14 @@ dependencies = [
  "bytes",
  "clap",
  "fastwebsockets",
- "glidesort",
  "http-body-util",
  "hyper",
  "hyper-util",
- "itoa",
  "jiff",
  "reqwest",
  "rustls",
- "rustls-pki-types",
  "serde",
  "serde_json",
- "smallvec",
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
