@@ -51,7 +51,10 @@ records:
 
 Tag `S` is a raw SBE frame from the stream. Tag `R` is a REST depth snapshot
 as JSON. A crash mid-day can leave today's file without a zstd footer; that is
-the tradeoff for keeping one file per symbol per UTC day.
+the tradeoff for keeping one file per symbol per UTC day. Nothing is appended
+after such a tail, since a decoder cannot step past it: the next writer moves
+the file aside to `<symbol>_<date>_unterminated-<ns>.zst` and starts the day
+again in a fresh daily file.
 
 During a rolling replace the new process may write
 `<symbol>_<date>_<run-id>.zst` until it gets the daily-file lock, then it

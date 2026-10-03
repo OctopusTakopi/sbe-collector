@@ -69,7 +69,28 @@ struct Args {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), anyhow::Error> {
-    tracing_subscriber::fmt::init();
+    // Logs go to the tmux pane. Once tmux is gone every write fails (EIO), and
+    // by default tracing-subscriber reports that with `eprintln!` — which
+    // panics on the same dead terminal, and `panic = "abort"` then kills the
+    // process mid-shutdown with nothing flushed. Drop failed log lines instead.
+    // Otherwise as `fmt::init()`: `RUST_LOG` targets, `INFO` by default.
+    {
+        use tracing_subscriber::{
+            filter::{LevelFilter, Targets},
+            layer::SubscriberExt,
+            util::SubscriberInitExt,
+        };
+        let targets = std::env::var("RUST_LOG")
+            .ok()
+            .and_then(|spec| spec.parse::<Targets>().ok())
+            .unwrap_or_else(|| Targets::new().with_default(LevelFilter::INFO));
+        tracing_subscriber::fmt()
+            .log_internal_errors(false)
+            .with_max_level(LevelFilter::TRACE)
+            .finish()
+            .with(targets)
+            .init();
+    }
 
     let args = Args::parse();
 
@@ -361,12 +382,16 @@ async fn shutdown_signal() -> std::io::Result<&'static str> {
     #[cfg(unix)]
     {
         let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
+        // `tmux kill-session` (run_sbe.sh cold restart) delivers SIGHUP; without
+        // a handler it kills the process before buffered records are written.
+        let mut sighup = signal::unix::signal(signal::unix::SignalKind::hangup())?;
         select! {
             result = signal::ctrl_c() => {
                 result?;
                 Ok("SIGINT")
             }
             _ = sigterm.recv() => Ok("SIGTERM"),
+            _ = sighup.recv() => Ok("SIGHUP"),
         }
     }
 

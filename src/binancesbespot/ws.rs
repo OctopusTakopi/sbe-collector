@@ -628,12 +628,14 @@ pub(crate) async fn keep_connection(
                     info!(connection, ?end, "the relieved session ended");
                 });
                 // A planned handover on a healthy session is not a failure, and
-                // the announcement exists precisely so the replacement can be
-                // opened at once. A short-lived one still pays the backoff — a
-                // venue rolling its pool can announce a shutdown seconds after
-                // the handshake, and answering each one immediately would spend
-                // this IP's connection-attempt budget in a burst. That costs the
-                // recording nothing, since the old session delivers throughout.
+                // with no promised lead time (withdrawn 2026-06-09) the
+                // replacement has to be opened at once. A short-lived one still
+                // pays the backoff — a venue rolling its pool can announce a
+                // shutdown seconds after the handshake, and answering each one
+                // immediately would spend this IP's connection-attempt budget in
+                // a burst. The old session delivers until the venue actually
+                // cuts it; a cut inside the backoff is a hole only when no
+                // redundant connection is running.
                 back_off(&mut error_count, Some(lifetime)).await;
             }
             // Clean disconnect (ws_tx dropped) — exit. Dropping `lingering`
