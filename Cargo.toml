@@ -30,6 +30,11 @@ reqwest = "0.13"
 url = "2.5"
 libc = "0.2.189"
 
+# OKX login signature
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+
 [profile.release]
 opt-level = 3
 lto = "fat"

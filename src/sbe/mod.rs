@@ -1,6 +1,7 @@
 //! SBE framing every venue's schema shares, and each venue's fixed layouts.
 
 pub mod binance;
+pub mod okx;
 
 use std::ops::Range;
 
@@ -9,6 +10,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 pub(crate) type U16LE = zerocopy::byteorder::U16<LittleEndian>;
 pub(crate) type U32LE = zerocopy::byteorder::U32<LittleEndian>;
+pub(crate) type I32LE = zerocopy::byteorder::I32<LittleEndian>;
 pub(crate) type I64LE = zerocopy::byteorder::I64<LittleEndian>;
 
 #[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned, Debug, Copy, Clone)]

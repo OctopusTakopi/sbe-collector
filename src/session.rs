@@ -134,6 +134,8 @@ pub(crate) enum Verdict {
     Continue,
     /// Open a replacement; this session keeps delivering meanwhile.
     Relieve(Reason),
+    /// Drop this socket and reconnect.
+    End(Loss),
 }
 
 /// Why a session asked for its replacement.
@@ -142,6 +144,9 @@ pub(crate) enum Reason {
     /// The venue announced it will close this connection.
     ServerShutdown,
     Age,
+    /// The venue reported an error on a session already carrying the feed;
+    /// a fresh one resubscribes everything.
+    VenueError,
 }
 
 impl Reason {
@@ -149,6 +154,7 @@ impl Reason {
         match self {
             Reason::ServerShutdown => "server shutdown announced",
             Reason::Age => "connection age limit",
+            Reason::VenueError => "the venue reported an error",
         }
     }
 }
@@ -175,6 +181,12 @@ pub(crate) enum Loss {
     ClosedByServer,
     #[error("a frame that must not be shed could not be queued")]
     Undeliverable,
+    /// The venue rejected every subscription: nothing will ever flow.
+    #[error("every subscription was refused: {0}")]
+    Refused(String),
+    /// The venue rejected a request in a way a reconnect may cure.
+    #[error("the venue rejected a request: {0}")]
+    Rejected(String),
     #[error("not every subscription was answered within {SUBSCRIBE_TIMEOUT:?}")]
     Unanswered,
     #[error("{0:#}")]
@@ -475,6 +487,7 @@ where
                     slot.request_replacement(id, reason);
                 }
             }
+            Verdict::End(loss) => return SessionEnd::Lost(loss),
         }
     }
 }
@@ -511,6 +524,14 @@ impl Pacer {
         }
         *next = Some(tokio::time::Instant::now() + CONNECT_SPACING);
     }
+}
+
+/// A refusal no retry can cure ends the slot, and with it the collection, but
+/// only while the slot has never carried the feed: credentials or symbols
+/// wrong from the start. A slot that was delivering keeps retrying rather than
+/// take the process down mid-recording.
+fn give_up(ever_live: bool, refusal: impl std::fmt::Display) -> Option<anyhow::Error> {
+    (!ever_live).then(|| anyhow::anyhow!("{refusal}"))
 }
 
 /// Open one socket for the slot: its handshake, then the upgrade.
@@ -590,15 +611,13 @@ async fn keep_connection<P: Protocol>(
         let opened = Instant::now();
         let conn = match connect(&*protocol, &tls, connection, &mut first_attempt).await {
             Ok(conn) => conn,
-            // Credentials wrong from the start: no retry can cure them. A
-            // slot that was delivering keeps retrying rather than take the
-            // process down mid-recording.
-            Err(ConnectError::Unauthorized) if !ever_live => {
-                return Err(anyhow::anyhow!(
-                    "{}: {}",
-                    P::SOURCE,
-                    ConnectError::Unauthorized
-                ));
+            Err(ConnectError::Unauthorized)
+                if let Some(error) = give_up(
+                    ever_live,
+                    format!("{}: {}", P::SOURCE, ConnectError::Unauthorized),
+                ) =>
+            {
+                return Err(error);
             }
             Err(err) => {
                 error!(
@@ -686,6 +705,11 @@ async fn keep_connection<P: Protocol>(
                 back_off(&mut error_count, None).await;
             }
             Step::Ended(SessionEnd::Lost(loss)) => {
+                if let Loss::Refused(_) = &loss
+                    && let Some(error) = give_up(ever_live, format!("{}: {loss}", P::SOURCE))
+                {
+                    return Err(error);
+                }
                 // The lifetime separates the venue recycling a healthy
                 // connection from this side failing.
                 let lifetime = opened.elapsed();
@@ -744,8 +768,8 @@ mod tests {
 
     const TEST_SESSION: SessionId = 7;
 
-    /// Asks for a replacement on the text `relieve`; each `ack` answers one
-    /// of `pending` subscriptions.
+    /// Asks for a replacement on the text `relieve` and gives up on `refuse`;
+    /// each `ack` answers one of `pending` subscriptions.
     #[derive(Default)]
     struct Script {
         pending: usize,
@@ -755,6 +779,7 @@ mod tests {
         fn on_text(&mut self, text: &[u8]) -> Verdict {
             match text {
                 b"relieve" => Verdict::Relieve(Reason::ServerShutdown),
+                b"refuse" => Verdict::End(Loss::Refused("all of them".to_owned())),
                 b"ack" => {
                     self.pending = self.pending.saturating_sub(1);
                     Verdict::Continue
@@ -1070,6 +1095,25 @@ mod tests {
         ));
         assert!(harness.data.recv().await.is_some());
         assert!(harness.ready.borrow().is_ready());
+    }
+
+    #[tokio::test]
+    async fn a_session_that_gives_up_is_lost() {
+        let mut harness = Harness::start(None);
+
+        harness.send_text("refuse").await;
+
+        assert!(matches!(
+            harness.session.await.unwrap(),
+            SessionEnd::Lost(Loss::Refused(_))
+        ));
+    }
+
+    #[test]
+    fn only_a_slot_that_never_carried_the_feed_gives_up() {
+        let error = give_up(false, "okx-sbe: every subscription was refused").unwrap();
+        assert_eq!(error.to_string(), "okx-sbe: every subscription was refused");
+        assert!(give_up(true, "refused").is_none());
     }
 
     #[tokio::test(start_paused = true)]

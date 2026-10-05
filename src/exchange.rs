@@ -14,7 +14,7 @@ use std::{
 
 use clap::ValueEnum;
 
-use crate::sbe::binance;
+use crate::sbe::{binance, okx};
 
 /// An exchange's SBE feed. The default is the exchange of a directory
 /// recorded before markers existed.
@@ -23,6 +23,9 @@ pub enum Exchange {
     #[default]
     #[value(name = "binancesbespot")]
     BinanceSbeSpot,
+    /// OKX's `public-sbe` endpoint, every instrument type on one connection.
+    #[value(name = "okxsbe")]
+    OkxSbe,
 }
 
 /// The file naming a directory's exchange: one line, its command-line
@@ -35,6 +38,7 @@ impl Exchange {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::BinanceSbeSpot => "binancesbespot",
+            Self::OkxSbe => "okxsbe",
         }
     }
 
@@ -44,12 +48,16 @@ impl Exchange {
     ///
     /// Binance stamps `eventTime` when it serialises for a particular
     /// connection: redundant connections receive one event with stamps
-    /// 18-37 us apart.
+    /// 18-37 us apart. OKX stamps the gateway's `outTime`, and its REST
+    /// snapshot has none.
     pub fn stamp(self, template_id: u16) -> Option<Range<usize>> {
         match self {
             Self::BinanceSbeSpot => (binance::TEMPLATE_TRADES..=binance::TEMPLATE_DEPTH_DIFF)
                 .contains(&template_id)
                 .then_some(binance::EVENT_TIME),
+            Self::OkxSbe => okx::STREAM_TEMPLATES
+                .contains(&template_id)
+                .then_some(okx::OUT_TIME),
         }
     }
 
@@ -157,6 +165,37 @@ mod tests {
         assert_eq!(exchange.stamp(10_004), None);
         assert_eq!(exchange.frame_stamp(&[0, 0, 0x13, 0x27]), Some(8..16));
         assert_eq!(exchange.frame_stamp(&[0, 0, 0x13]), None);
+    }
+
+    #[test]
+    fn okx_stamps_out_time_on_stream_templates_only() {
+        let exchange = Exchange::OkxSbe;
+        for template_id in 1_000..=1_005 {
+            assert_eq!(exchange.stamp(template_id), Some(24..32));
+        }
+        assert_eq!(
+            exchange.stamp(1_006),
+            None,
+            "the REST snapshot has no outTime"
+        );
+        assert_eq!(exchange.stamp(10_000), None);
+    }
+
+    #[test]
+    fn a_directory_marked_for_another_exchange_is_refused() {
+        let dir = test_dir("other");
+        Exchange::OkxSbe.claim(&dir).unwrap();
+
+        let error = Exchange::BinanceSbeSpot.claim(&dir).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "{} holds okxsbe recordings, not binancesbespot",
+                dir.display()
+            )
+        );
+        assert_eq!(Exchange::of_recordings_in(&dir).unwrap(), Exchange::OkxSbe);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

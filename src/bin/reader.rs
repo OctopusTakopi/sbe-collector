@@ -22,6 +22,7 @@ use sbe_collector::{
             TEMPLATE_BEST_BID_ASK, TEMPLATE_DEPTH_DIFF, TEMPLATE_DEPTH_SNAPSHOT, TEMPLATE_TRADES,
             TradeEntry, TradesBlock,
         },
+        okx::{self, BboTbtBlock},
         read_group,
     },
 };
@@ -89,12 +90,14 @@ fn read_file(path: &Path, exchange: Exchange) -> io::Result<()> {
                 counts.rest += 1;
                 match exchange {
                     Exchange::BinanceSbeSpot => print_rest_record(recv_ns, &payload),
+                    Exchange::OkxSbe => println!("[{recv_ns}] R {} bytes", payload.len()),
                 }
             }
             Some(Tag::Sbe) => {
                 counts.sbe += 1;
                 match exchange {
                     Exchange::BinanceSbeSpot => print_sbe_record(recv_ns, &payload),
+                    Exchange::OkxSbe => print_okx_record(recv_ns, &payload),
                 }
             }
             None => println!("[{recv_ns}] unknown tag: 0x{tag:02x}, payload_len={len}"),
@@ -220,6 +223,39 @@ fn print_sbe_record(nanos: i64, data: &[u8]) {
     }
     println!(
         "[{nanos}] S {name} {symbol} block_len={block_len} total={}b",
+        data.len()
+    );
+}
+
+/// An OKX stream frame. The stream carries no symbol, only the instrument's
+/// code; the file name says which instrument it is.
+fn print_okx_record(nanos: i64, data: &[u8]) {
+    let Ok((header, body)) = MessageHeader::read_from_prefix(data) else {
+        println!("[{nanos}] S <too short: {} bytes>", data.len());
+        return;
+    };
+    let template_id = header.template_id.get();
+    let code = okx::inst_id_code(data).map_or_else(|| "?".to_owned(), |code| code.to_string());
+    if template_id == okx::TEMPLATE_BBO_TBT
+        && let Ok((block, _)) = BboTbtBlock::read_from_prefix(body)
+    {
+        let [px, sz] = [block.px_exponent, block.sz_exponent];
+        println!(
+            "[{nanos}] S BBO_TBT code={code} bid={:.6}x{:.6} ask={:.6}x{:.6} orders={}/{} seq={} t={}",
+            decimal(block.bid_px.get(), px),
+            decimal(block.bid_sz.get(), sz),
+            decimal(block.ask_px.get(), px),
+            decimal(block.ask_sz.get(), sz),
+            block.bid_ord_count.get(),
+            block.ask_ord_count.get(),
+            block.seq_id.get(),
+            block.ts_us.get(),
+        );
+        return;
+    }
+    println!(
+        "[{nanos}] S template={template_id} code={code} block_len={} total={}b",
+        header.block_length.get(),
         data.len()
     );
 }

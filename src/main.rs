@@ -4,6 +4,7 @@ mod error;
 mod feed;
 mod file;
 mod handover;
+mod okxsbe;
 mod quality;
 mod readiness;
 mod session;
@@ -12,7 +13,7 @@ mod ws;
 
 use std::{path::PathBuf, time::Duration};
 
-use anyhow::{Context, anyhow, bail};
+use anyhow::{Context, anyhow};
 use clap::Parser;
 use sbe_collector::exchange::Exchange;
 use tokio::{
@@ -35,7 +36,7 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 const HANDOVER_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Parser, Debug)]
-#[command(version, about = "Binance SBE stream collector")]
+#[command(version, about = "SBE market-data collector for Binance spot and OKX")]
 struct Args {
     /// Directory where collected data files are written.
     path: PathBuf,
@@ -43,7 +44,8 @@ struct Args {
     /// Exchange to collect.
     exchange: Exchange,
 
-    /// Symbols to subscribe to (e.g. btcusdt ethusdt).
+    /// Symbols to subscribe to, as the exchange names them: btcusdt for
+    /// Binance, instIds such as BTC-USDT or BTC-USDT-SWAP for OKX.
     symbols: Vec<String>,
 
     /// Number of redundant websocket connections to the exchange.
@@ -103,6 +105,60 @@ impl Hangup {
     }
 }
 
+/// A venue's collection, prepared before anything starts, so missing
+/// credentials or an unknown symbol stop the process before it takes the
+/// handover socket or opens a quality log.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one value, built once at startup"
+)]
+enum Venue {
+    BinanceSbeSpot(binancesbespot::Subscription),
+    OkxSbe(okxsbe::Subscription),
+}
+
+impl Venue {
+    async fn prepare(
+        exchange: Exchange,
+        symbols: &[String],
+        connections: usize,
+    ) -> anyhow::Result<Self> {
+        Ok(match exchange {
+            Exchange::BinanceSbeSpot => Self::BinanceSbeSpot(
+                binancesbespot::Subscription::from_env(symbols, connections)?,
+            ),
+            Exchange::OkxSbe => {
+                Self::OkxSbe(okxsbe::Subscription::prepare(symbols, connections).await?)
+            }
+        })
+    }
+
+    fn spawn(
+        self,
+        writer_tx: mpsc::Sender<WriteRecord>,
+        shutdown: watch::Receiver<bool>,
+        quality: quality::QualityReporter,
+        readiness: Readiness,
+    ) -> JoinHandle<anyhow::Result<()>> {
+        match self {
+            Self::BinanceSbeSpot(subscription) => tokio::spawn(binancesbespot::run_collection(
+                subscription,
+                writer_tx,
+                shutdown,
+                quality,
+                readiness,
+            )),
+            Self::OkxSbe(subscription) => tokio::spawn(okxsbe::run_collection(
+                subscription,
+                writer_tx,
+                shutdown,
+                quality,
+                readiness,
+            )),
+        }
+    }
+}
+
 enum Shutdown {
     Signal,
     Writer,
@@ -120,12 +176,8 @@ async fn main() -> anyhow::Result<()> {
     if hangup == Hangup::Ignore {
         info!("SIGHUP is ignored (inherited, e.g. from nohup); a hangup will not stop collection");
     }
-    let api_key = std::env::var("BINANCE_API_KEY").unwrap_or_default();
-    if api_key.is_empty() {
-        bail!("BINANCE_API_KEY env var must be set for the SBE stream endpoint");
-    }
-
     let connections = usize::from(args.connections);
+    let venue = Venue::prepare(args.exchange, &args.symbols, connections).await?;
     if connections > 1 {
         info!(
             connections,
@@ -178,19 +230,7 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     let (writer_tx, mut writer_rx) = mpsc::channel::<WriteRecord>(WRITER_QUEUE_CAPACITY);
-    let mut collection = match args.exchange {
-        Exchange::BinanceSbeSpot => tokio::spawn(binancesbespot::run_collection(
-            binancesbespot::Subscription {
-                symbols: args.symbols,
-                api_key,
-                connections,
-            },
-            writer_tx,
-            shutdown_rx,
-            quality.clone(),
-            readiness.clone(),
-        )),
-    };
+    let mut collection = venue.spawn(writer_tx, shutdown_rx, quality.clone(), readiness.clone());
 
     let (writer_done_tx, writer_done_rx) = oneshot::channel();
     let writer_thread = {

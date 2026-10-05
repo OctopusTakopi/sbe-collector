@@ -8,10 +8,11 @@
 //!   including across the midnight rotation;
 //! * venue sequence breaks. Redundant connections interleave, so each chain
 //!   tracks its running maximum and only forward breaks count:
-//!   - depth diffs (10003): `firstBookUpdateId` normally follows the previous
-//!     `lastBookUpdateId + 1` (the collector's own rule);
-//!   - trades (10000): trade ids increment by one per trade;
-//!   - best bid/ask (10001): `bookUpdateId` must not go backwards;
+//!   - Binance depth diffs (10003): `firstBookUpdateId` normally follows the
+//!     previous `lastBookUpdateId + 1` (the collector's own rule);
+//!   - Binance trades (10000): trade ids increment by one per trade;
+//!   - best bid/ask, Binance's `bookUpdateId` (10001) and OKX's `bbo-tbt`
+//!     `seqId` (1000): must not go backwards;
 //! * range accounting for trade ids: ids are unique, so
 //!   `(max - min + 1) - count` nets missing ids against late duplicates
 //!   whatever the order. `--exact` builds id sets to split the two;
@@ -53,6 +54,7 @@ use sbe_collector::{
             TEMPLATE_DEPTH_DIFF, TEMPLATE_DEPTH_SNAPSHOT, TEMPLATE_TRADES, TradesBlock,
         },
         event_key,
+        okx::{self, BboTbtBlock},
     },
 };
 use zerocopy::FromBytes;
@@ -338,6 +340,15 @@ struct StreamState {
 }
 
 impl StreamState {
+    /// An id that may jump forward but must not go back, such as a best
+    /// bid/ask's book update id: the quote changes less often than the book.
+    fn non_decreasing(&mut self, id: i64) {
+        if self.last_id.is_some_and(|prev| id < prev) {
+            self.stats.seq_back_events += 1;
+        }
+        self.advance(id);
+    }
+
     fn note_break(&mut self, recv: i64) {
         if self.break_times.len() < MAX_BREAK_TIMES {
             self.break_times.push(recv);
@@ -465,6 +476,7 @@ impl SeriesScan {
                 self.sbe_records += 1;
                 match self.exchange {
                     Exchange::BinanceSbeSpot => self.binance_payload(recv, payload),
+                    Exchange::OkxSbe => self.okx_payload(payload),
                 }
             }
             Tag::Rest => self.rest_records += 1,
@@ -555,11 +567,31 @@ impl SeriesScan {
         let state = self.stream(Stream::BestBidAsk);
         state.stats.messages += 1;
         state.check_time(block.event_time.get());
-        let id = block.book_update_id.get();
-        if state.last_id.is_some_and(|prev| id < prev) {
-            state.stats.seq_back_events += 1;
+        state.non_decreasing(block.book_update_id.get());
+    }
+
+    fn okx_payload(&mut self, payload: &[u8]) {
+        let Ok((header, body)) = MessageHeader::read_from_prefix(payload) else {
+            self.bad_records += 1;
+            return;
+        };
+        match header.template_id.get() {
+            okx::TEMPLATE_BBO_TBT => self.okx_bbo(body),
+            _ => self.bad_records += 1,
         }
-        state.advance(id);
+    }
+
+    /// `seqId` must not go backwards. Each connection samples `bbo-tbt` its
+    /// own way, so a redundant recording's merge reorders, and counts so.
+    fn okx_bbo(&mut self, body: &[u8]) {
+        let Ok((block, _)) = BboTbtBlock::read_from_prefix(body) else {
+            self.bad_records += 1;
+            return;
+        };
+        let state = self.stream(Stream::BestBidAsk);
+        state.stats.messages += 1;
+        state.check_time(block.ts_us.get());
+        state.non_decreasing(block.seq_id.get());
     }
 }
 

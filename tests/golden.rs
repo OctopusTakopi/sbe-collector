@@ -15,6 +15,8 @@ const TRADES: u16 = 10_000;
 const BEST_BID_ASK: u16 = 10_001;
 const DEPTH_SNAPSHOT: u16 = 10_002;
 const DEPTH_DIFF: u16 = 10_003;
+const OKX_BBO_TBT: u16 = 1_000;
+const OKX_BOOKS_L2_TBT: u16 = 1_001;
 
 fn record(recv_ns: i64, tag: u8, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(13 + payload.len());
@@ -109,6 +111,21 @@ fn depth_snapshot(event_time: i64, update_id: i64, bids: u16, asks: u16, sym: &s
     levels(&mut frame, bids, 654_320);
     levels(&mut frame, asks, 654_330);
     symbol(&mut frame, sym);
+    frame
+}
+
+/// An OKX `bbo-tbt` frame for BTC-USDT (code 3); `out_time` is the
+/// gateway's per-connection stamp.
+fn okx_bbo(ts_us: i64, out_time: i64, seq_id: i64) -> Vec<u8> {
+    let mut frame = header(74, OKX_BBO_TBT);
+    for field in [
+        3, ts_us, out_time, seq_id, 857_758, 16_694_228, 857_757, 84_744_091,
+    ] {
+        frame.extend_from_slice(&i64::to_le_bytes(field));
+    }
+    frame.extend_from_slice(&19i32.to_le_bytes());
+    frame.extend_from_slice(&6i32.to_le_bytes());
+    frame.extend_from_slice(&[(-1i8) as u8, (-8i8) as u8]);
     frame
 }
 
@@ -458,4 +475,72 @@ fn trailers_change_neither_reader_nor_gap_detector_output() {
 
     fs::remove_dir_all(&plain).unwrap();
     fs::remove_dir_all(&trailed).unwrap();
+}
+
+/// A directory an `okxsbe` collector recorded, with a handover's sidecar.
+fn okx_fixtures(dir: &Path) {
+    fs::write(dir.join("_exchange"), "okxsbe\n").unwrap();
+    let us = T0 / 1_000;
+    zstd_file(
+        &dir.join("btc-usdt_20260801.zst"),
+        &[
+            sbe(T0, &okx_bbo(us, us + 1_600, 100)),
+            sbe(T0 + 1, &okx_bbo(us + 1_000, us + 2_400, 101)),
+            // Another connection's sample of an earlier book state.
+            sbe(T0 + 2, &okx_bbo(us + 500, us + 2_500, 99)),
+            // A channel this collector does not decode.
+            sbe(T0 + 3, &{
+                let mut frame = header(42, OKX_BOOKS_L2_TBT);
+                frame.extend_from_slice(&3i64.to_le_bytes());
+                frame.extend_from_slice(&[0; 34]);
+                frame
+            }),
+            sbe(T0 + 4, &[1, 2, 3, 4, 5]),
+            // 7 s of silence.
+            sbe(
+                T0 + 7 * SECOND,
+                &okx_bbo(us + 7_000_000, us + 7_001_000, 105),
+            ),
+            record(
+                T0 + 7 * SECOND + 1,
+                b'R',
+                &[0x1a, 0, 0xee, 0x03, 1, 0, 0, 0],
+            ),
+        ],
+    );
+    // The challenger's copies of the same events differ only in `outTime`.
+    zstd_file(
+        &dir.join("btc-usdt_20260801_1785542400000000001-42.zst"),
+        &[
+            sbe(T0 + 6, &okx_bbo(us + 1_000, us + 2_700, 101)),
+            sbe(
+                T0 + 7 * SECOND + 5,
+                &okx_bbo(us + 7_000_000, us + 7_001_200, 105),
+            ),
+            sbe(
+                T0 + 8 * SECOND,
+                &okx_bbo(us + 8_000_000, us + 8_000_300, 106),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn okx_recordings_are_read_and_checked() {
+    let dir = fixture_dir("okx");
+    okx_fixtures(&dir);
+
+    let reader = run(
+        env!("CARGO_BIN_EXE_reader"),
+        &dir,
+        &["btc-usdt_20260801.zst"],
+    );
+    assert!(reader.status.success());
+    assert_golden("reader_okx.stdout", &reader.stdout);
+
+    let gaps = run(env!("CARGO_BIN_EXE_gap_detector"), &dir, &["."]);
+    assert!(gaps.status.success());
+    assert_golden("gap_detector_okx.stdout", &gaps.stdout);
+
+    fs::remove_dir_all(&dir).unwrap();
 }

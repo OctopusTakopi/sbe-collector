@@ -159,7 +159,10 @@ impl Ingest {
 
         if template_id == TEMPLATE_DEPTH_DIFF {
             let Ok((block, _)) = DepthDiffBlock::read_from_prefix(body) else {
-                return Err(ConnectorError::ShortDepthDiff { len: data.len() });
+                return Err(ConnectorError::ShortBlock {
+                    name: "depth diff",
+                    len: data.len(),
+                });
             };
             self.check_continuity(
                 &symbol,
@@ -241,9 +244,23 @@ impl Ingest {
 
 /// What to collect, from the command line.
 pub struct Subscription {
-    pub symbols: Vec<String>,
-    pub api_key: String,
-    pub connections: usize,
+    symbols: Vec<String>,
+    api_key: String,
+    connections: usize,
+}
+
+impl Subscription {
+    pub fn from_env(symbols: &[String], connections: usize) -> anyhow::Result<Self> {
+        let api_key = std::env::var("BINANCE_API_KEY").unwrap_or_default();
+        if api_key.is_empty() {
+            anyhow::bail!("BINANCE_API_KEY env var must be set for the SBE stream endpoint");
+        }
+        Ok(Self {
+            symbols: symbols.to_vec(),
+            api_key,
+            connections,
+        })
+    }
 }
 
 pub async fn run_collection(
