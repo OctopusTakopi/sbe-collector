@@ -1,25 +1,18 @@
 //! Gate's SBE websockets: no login for market data, one JSON subscription
 //! per channel and pair, SBE frames back.
 
-use std::{
-    borrow::Cow,
-    collections::HashMap,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
-};
+use std::{borrow::Cow, collections::HashMap, sync::Arc, time::Duration};
 
 use hyper::header::HeaderMap;
 use jiff::Timestamp;
 use sbe_collector::sbe::gate::{self, Market};
 use serde::Deserialize;
-use tracing::{error, warn};
+use tracing::warn;
 
 use crate::{
-    quality::{QualityEvent, QualityReporter},
-    session::{Handshake, Loss, Protocol, Reason, Session, Verdict},
+    quality::QualityReporter,
+    session::{Handshake, Protocol, Reason, Session, Verdict},
+    subscriptions::{Answers, Topic, Topics},
 };
 
 /// Schema 1 pinned: the layouts `sbe::gate` decodes.
@@ -48,22 +41,12 @@ fn is_refusal(code: i64) -> bool {
     matches!(code, 1 | 2 | 4)
 }
 
-/// One channel of one pair.
-struct Topic {
-    channel: &'static str,
-    /// The subscription payload: the pair, or the `obu` stream name.
-    payload: String,
-    pair: Arc<str>,
-}
-
 /// What every Gate connection slot of one market shares.
 pub(crate) struct Gate {
     market: Market,
-    topics: Arc<[Topic]>,
-    /// Topics whose refusal the quality log already has: once per process,
-    /// not once per session.
-    reported: Arc<[AtomicBool]>,
-    quality: QualityReporter,
+    /// Each channel of each pair, by its subscription payload: the pair, or
+    /// the `obu` stream's name.
+    topics: Arc<Topics<String>>,
 }
 
 impl Gate {
@@ -73,28 +56,22 @@ impl Gate {
             Market::Spot => ["spot.book_ticker", "spot.trades", "spot.obu"],
             Market::Futures => ["futures.book_ticker", "futures.trades", "futures.obu"],
         };
-        let topics: Arc<[Topic]> = pairs
-            .iter()
-            .flat_map(|pair| {
-                let name: Arc<str> = Arc::from(pair.as_str());
-                [
-                    (book_ticker, pair.clone()),
-                    (trades, pair.clone()),
-                    (obu, format!("ob.{pair}.{BOOK_LEVELS}")),
-                ]
-                .map(|(channel, payload)| Topic {
-                    channel,
-                    payload,
-                    pair: Arc::clone(&name),
-                })
+        let topics = pairs.iter().flat_map(|pair| {
+            let instrument: Arc<str> = Arc::from(pair.as_str());
+            [
+                (book_ticker, pair.clone()),
+                (trades, pair.clone()),
+                (obu, format!("ob.{pair}.{BOOK_LEVELS}")),
+            ]
+            .map(|(channel, target)| Topic {
+                channel,
+                instrument: Arc::clone(&instrument),
+                target,
             })
-            .collect();
-        let reported = topics.iter().map(|_| AtomicBool::new(false)).collect();
+        });
         Self {
             market,
-            topics,
-            reported,
-            quality,
+            topics: Arc::new(Topics::new(Self::SOURCE, topics, quality)),
         }
     }
 }
@@ -129,37 +106,25 @@ impl Protocol for Gate {
         let time = Timestamp::now().as_second();
         let requests = self
             .topics
-            .iter()
-            .enumerate()
+            .numbered()
             .map(|(id, topic)| {
                 serde_json::json!({
                     "time": time,
                     "id": id,
                     "channel": topic.channel,
                     "event": "subscribe",
-                    "payload": [topic.payload],
+                    "payload": [topic.target],
                 })
                 .to_string()
             })
             .collect();
         let replies = Replies {
             market: self.market,
-            topics: Arc::clone(&self.topics),
-            answered: vec![Answer::Pending; self.topics.len()],
-            pending: self.topics.len(),
-            reported: Arc::clone(&self.reported),
-            quality: self.quality.clone(),
+            answers: Answers::new(Arc::clone(&self.topics)),
             books: HashMap::new(),
         };
         (replies, requests)
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Answer {
-    Pending,
-    Acked,
-    Refused,
 }
 
 /// A text frame from Gate; fields this does not use are ignored.
@@ -185,35 +150,9 @@ struct ReplyError<'a> {
 /// streams.
 pub(crate) struct Replies {
     market: Market,
-    topics: Arc<[Topic]>,
-    answered: Vec<Answer>,
-    pending: usize,
-    reported: Arc<[AtomicBool]>,
-    quality: QualityReporter,
+    answers: Answers<String>,
     /// Stream name (`ob.BTC_USDT.50`) to the last id this socket applied.
     books: HashMap<Vec<u8>, i64>,
-}
-
-impl Replies {
-    fn answer(&mut self, topic: usize, answer: Answer) {
-        if self.answered[topic] == Answer::Pending {
-            self.pending -= 1;
-        }
-        self.answered[topic] = answer;
-    }
-
-    fn report_refusal(&self, topic: usize, refusal: &str) {
-        let Topic { channel, pair, .. } = &self.topics[topic];
-        if self.reported[topic].swap(true, Ordering::Relaxed) {
-            return;
-        }
-        error!(%pair, channel, refusal, "Gate refused a subscription");
-        self.quality.report(QualityEvent::FeedDegraded {
-            at_ns: QualityEvent::now_ns(),
-            source: format!("{}/{pair}", Gate::SOURCE),
-            detail: format!("{channel} refused: {refusal}"),
-        });
-    }
 }
 
 impl Session for Replies {
@@ -225,35 +164,18 @@ impl Session for Replies {
             );
             return Verdict::Continue;
         };
-        let topic = reply.id.filter(|&topic| topic < self.answered.len());
+        let topic = reply.id.and_then(|id| self.answers.topic(id));
         match (reply.event.as_deref(), topic, reply.error) {
             (Some("subscribe"), Some(topic), None) => {
-                self.answer(topic, Answer::Acked);
+                self.answers.ack(topic);
                 Verdict::Continue
             }
-            (Some("subscribe"), Some(topic), Some(refused)) if is_refusal(refused.code) => {
-                let refusal = format!("{} {}", refused.code, refused.message);
-                self.report_refusal(topic, &refusal);
-                self.answer(topic, Answer::Refused);
-                if self
-                    .answered
-                    .iter()
-                    .all(|&answer| answer == Answer::Refused)
-                {
-                    Verdict::End(Loss::Refused(refusal))
-                } else {
-                    Verdict::Continue
-                }
-            }
-            (_, _, Some(failed)) => {
-                let detail = format!("{} {}", failed.code, failed.message);
-                error!(detail, "Gate rejected a request");
-                if self.settled() {
-                    Verdict::Relieve(Reason::VenueError)
-                } else {
-                    Verdict::End(Loss::Rejected(detail))
-                }
-            }
+            (Some("subscribe"), Some(topic), Some(refused)) if is_refusal(refused.code) => self
+                .answers
+                .refuse(topic, format!("{} {}", refused.code, refused.message)),
+            (_, _, Some(failed)) => self
+                .answers
+                .reject(format!("{} {}", failed.code, failed.message)),
             _ if reply
                 .channel
                 .is_some_and(|channel| channel.ends_with(".pong")) =>
@@ -297,13 +219,14 @@ impl Session for Replies {
     }
 
     fn settled(&self) -> bool {
-        self.pending == 0
+        self.answers.settled()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{quality::QualityEvent, session::Loss};
 
     fn gate(market: Market, quality: QualityReporter) -> Gate {
         Gate::new(

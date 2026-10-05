@@ -1,14 +1,7 @@
 //! OKX's `public-sbe` websocket: a login carried in the upgrade headers, one
 //! JSON subscription per channel and instrument, SBE frames back.
 
-use std::{
-    borrow::Cow,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
-};
+use std::{borrow::Cow, sync::Arc, time::Duration};
 
 use base64::Engine as _;
 use hmac::{Hmac, Mac};
@@ -16,12 +9,13 @@ use hyper::header::{HeaderMap, HeaderValue};
 use jiff::Timestamp;
 use serde::Deserialize;
 use sha2::Sha256;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use super::instruments::Instrument;
 use crate::{
-    quality::{QualityEvent, QualityReporter},
-    session::{Handshake, Loss, Protocol, Reason, Session, Verdict},
+    quality::QualityReporter,
+    session::{Handshake, Protocol, Reason, Session, Verdict},
+    subscriptions::{Answers, Topic, Topics},
 };
 
 const URL: &str = "wss://ws.okx.com:8443/ws/v5/public-sbe";
@@ -87,22 +81,11 @@ impl Credentials {
     }
 }
 
-/// One channel of one instrument.
-struct Topic {
-    channel: &'static str,
-    code: i64,
-    inst_id: Arc<str>,
-}
-
 /// What every OKX connection slot shares.
 pub(crate) struct Okx {
     credentials: Credentials,
-    topics: Arc<[Topic]>,
-    /// Topics whose refusal the quality log already has. A refusal is the
-    /// account's condition and recurs on every reconnect, so it is reported
-    /// once per process, not once per session.
-    reported: Arc<[AtomicBool]>,
-    quality: QualityReporter,
+    /// Each channel of each instrument, by `instIdCode`.
+    topics: Arc<Topics<i64>>,
 }
 
 impl Okx {
@@ -112,23 +95,17 @@ impl Okx {
         channels: &[&'static str],
         quality: QualityReporter,
     ) -> Self {
-        let topics: Arc<[Topic]> = instruments
-            .iter()
-            .flat_map(|instrument| {
-                let inst_id: Arc<str> = Arc::from(instrument.inst_id.as_str());
-                channels.iter().map(move |&channel| Topic {
-                    channel,
-                    code: instrument.code,
-                    inst_id: Arc::clone(&inst_id),
-                })
+        let topics = instruments.iter().flat_map(|instrument| {
+            let inst_id: Arc<str> = Arc::from(instrument.inst_id.as_str());
+            channels.iter().map(move |&channel| Topic {
+                channel,
+                instrument: Arc::clone(&inst_id),
+                target: instrument.code,
             })
-            .collect();
-        let reported = topics.iter().map(|_| AtomicBool::new(false)).collect();
+        });
         Self {
             credentials,
-            topics,
-            reported,
-            quality,
+            topics: Arc::new(Topics::new(Self::SOURCE, topics, quality)),
         }
     }
 }
@@ -161,33 +138,21 @@ impl Protocol for Okx {
     fn open(&self) -> (Replies, Vec<String>) {
         let requests = self
             .topics
-            .iter()
-            .enumerate()
+            .numbered()
             .map(|(id, topic)| {
                 serde_json::json!({
                     "id": id.to_string(),
                     "op": "subscribe",
-                    "args": [{ "channel": topic.channel, "instIdCode": topic.code }],
+                    "args": [{ "channel": topic.channel, "instIdCode": topic.target }],
                 })
                 .to_string()
             })
             .collect();
         let replies = Replies {
-            topics: Arc::clone(&self.topics),
-            answers: vec![Answer::Pending; self.topics.len()],
-            pending: self.topics.len(),
-            reported: Arc::clone(&self.reported),
-            quality: self.quality.clone(),
+            answers: Answers::new(Arc::clone(&self.topics)),
         };
         (replies, requests)
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Answer {
-    Pending,
-    Acked,
-    Refused,
 }
 
 /// A text frame from OKX; fields this does not use are ignored.
@@ -205,35 +170,7 @@ struct Reply<'a> {
 
 /// One session's subscriptions and what OKX answered.
 pub(crate) struct Replies {
-    topics: Arc<[Topic]>,
-    answers: Vec<Answer>,
-    pending: usize,
-    reported: Arc<[AtomicBool]>,
-    quality: QualityReporter,
-}
-
-impl Replies {
-    fn answer(&mut self, topic: usize, answer: Answer) {
-        if self.answers[topic] == Answer::Pending {
-            self.pending -= 1;
-        }
-        self.answers[topic] = answer;
-    }
-
-    fn report_refusal(&self, topic: usize, refusal: &str) {
-        let Topic {
-            channel, inst_id, ..
-        } = &self.topics[topic];
-        if self.reported[topic].swap(true, Ordering::Relaxed) {
-            return;
-        }
-        error!(%inst_id, channel, refusal, "OKX refused a subscription");
-        self.quality.report(QualityEvent::FeedDegraded {
-            at_ns: QualityEvent::now_ns(),
-            source: format!("{}/{inst_id}", Okx::SOURCE),
-            detail: format!("{channel} refused: {refusal}"),
-        });
-    }
+    answers: Answers<i64>,
 }
 
 impl Session for Replies {
@@ -249,34 +186,18 @@ impl Session for Replies {
             .id
             .as_deref()
             .and_then(|id| id.parse::<usize>().ok())
-            .filter(|&topic| topic < self.answers.len());
+            .and_then(|id| self.answers.topic(id));
         let code = reply.code.as_deref().unwrap_or("");
         let refusal = || format!("{code} {}", reply.msg.as_deref().unwrap_or(""));
         match (reply.event.as_deref(), topic) {
             (Some("subscribe"), Some(topic)) => {
-                self.answer(topic, Answer::Acked);
+                self.answers.ack(topic);
                 Verdict::Continue
             }
             (Some("error"), Some(topic)) if matches!(code, TIER_TOO_LOW | NO_SUCH_TOPIC) => {
-                self.report_refusal(topic, &refusal());
-                self.answer(topic, Answer::Refused);
-                if self.answers.iter().all(|&answer| answer == Answer::Refused) {
-                    Verdict::End(Loss::Refused(refusal()))
-                } else {
-                    Verdict::Continue
-                }
+                self.answers.refuse(topic, refusal())
             }
-            // Before the last reply a fresh connection is the cheap retry;
-            // after it, this socket carries the feed and a replacement
-            // takes over make-before-break.
-            (Some("error"), _) => {
-                error!(refusal = %refusal(), "OKX rejected a request");
-                if self.settled() {
-                    Verdict::Relieve(Reason::VenueError)
-                } else {
-                    Verdict::End(Loss::Rejected(refusal()))
-                }
-            }
+            (Some("error"), _) => self.answers.reject(refusal()),
             (Some("notice"), _) if code == NOTICE_SERVICE_UPGRADE => {
                 info!(notice = %refusal(), "OKX announced a service upgrade");
                 Verdict::Relieve(Reason::ServerShutdown)
@@ -292,13 +213,14 @@ impl Session for Replies {
     }
 
     fn settled(&self) -> bool {
-        self.pending == 0
+        self.answers.settled()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{quality::QualityEvent, session::Loss};
 
     fn credentials() -> Credentials {
         Credentials::new("key", "22582BD0CFF14C41EDBF1AB98506286D", "phrase").unwrap()
