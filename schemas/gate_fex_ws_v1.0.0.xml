@@ -1,0 +1,385 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<sbe:messageSchema xmlns:sbe="http://www.fixprotocol.org/ns/sbe"
+                   package="gate_fex_ws_sbe"
+                   id="1"
+                   version="1"
+                   semanticVersion="1.0.0"
+                   description="Gate FEX SBE Schema for WebSocket Market Data"
+                   byteOrder="littleEndian">
+
+    <types>
+        <composite name="messageHeader" description="Template ID and length of message root">
+            <type name="blockLength" primitiveType="uint16"/>
+            <type name="templateId" primitiveType="uint16"/>
+            <type name="schemaId" primitiveType="uint16"/>
+            <type name="version" primitiveType="uint16"/>
+        </composite>
+
+        <composite name="groupSize16Encoding" description="Repeating group dimensions.">
+            <type name="blockLength" primitiveType="uint16"/>
+            <type name="numInGroup" primitiveType="uint16"/>
+        </composite>
+
+        <composite name="varString8" description="Variable length UTF-8 string.">
+            <type name="length" primitiveType="uint8"/>
+            <type name="varData" length="0" primitiveType="uint8" characterEncoding="UTF-8"/>
+        </composite>
+
+        <enum name="Side" encodingType="int8">
+            <validValue name="SELL">0</validValue>
+            <validValue name="BUY">1</validValue>
+        </enum>
+
+        <enum name="Role" encodingType="int8">
+            <validValue name="Maker">0</validValue>
+            <validValue name="Taker">1</validValue>
+        </enum>
+
+        <enum name="PosMarginMode" encodingType="int8">
+            <validValue name="Isolated" description="isolated">0</validValue>
+            <validValue name="Cross" description="cross">1</validValue>
+        </enum>
+
+        <enum name="Event" encodingType="int8">
+            <validValue name="Subscribe">0</validValue>
+            <validValue name="Unsubscribe">1</validValue>
+            <validValue name="Update">2</validValue>
+            <validValue name="All">3</validValue>
+            <validValue name="Api">4</validValue>
+        </enum>
+    </types>
+
+    <sbe:message name="bbo" id="1">
+        <field id="1" name="time" type="int64" description="Timestamp in microseconds when websocket server send"/>
+        <field id="2" name="e" type="Event" description="Event type"/>
+        <field id="3" name="t" type="int64" description="Orderbook update timestamp in microseconds, engine timestamp"/>
+        <field id="4" name="u" type="int64" description="Orderbook id"/>
+        <field id="5" name="pxExponent" type="int8" description="Price exponent for decimal point positioning"/>
+        <field id="6" name="szExponent" type="int8" description="Size exponent for decimal point positioning"/>
+        <field id="7" name="askMantissaPrice" type="int64" description="Mantissa for the best ask price"/>
+        <field id="8" name="askMantissaSize" type="int64" description="Mantissa for the best ask size"/>
+        <field id="9" name="bidMantissaPrice" type="int64" description="Mantissa for the best bid price"/>
+        <field id="10" name="bidMantissaSize" type="int64" description="Mantissa for the best bid size"/>
+
+        <data id="200" name="channel" type="varString8" description="Data channel"/>
+        <data id="201" name="s" type="varString8" description="Symbol/market"/>
+    </sbe:message>
+
+    <sbe:message name="publicTrade" id="2" description="Public trade message">
+        <field id="1" name="time" type="int64" description="Timestamp in microseconds when websocket server send"/>
+        <field id="2" name="e" type="Event" description="Event type"/>
+        <field id="3" name="pxExponent" type="int8" description="Price exponent for decimal point positioning"/>
+        <field id="4" name="szExponent" type="int8" description="Size exponent for decimal point positioning"/>
+
+        <group id="100" name="trades" dimensionType="groupSize16Encoding" description="Trades">
+            <field id="1" name="t" type="int64" description="Timestamp in microseconds when trade was created"/>
+            <field id="2" name="id" type="uint64" description="Trade ID"/>
+            <field id="3" name="size" type="int64" description="Trade size"/>
+            <field id="4" name="price" type="int64" description="Trade price"/>
+        </group>
+
+        <data id="200" name="channel" type="varString8" description="Data channel"/>
+        <data id="201" name="contract" type="varString8" description="Contract symbol (e.g., BTC_USDT)"/>
+    </sbe:message>
+
+
+    <sbe:message name="obu" id="3" description="Order book V2 message">
+        <field id="1" name="time" type="int64" description="Timestamp in microseconds when websocket server send"/>
+        <field id="2" name="e" type="Event" description="Event type"/>
+        <field id="3" name="t" type="int64" description="Orderbook update timestamp in microseconds, engine timestamp"/>
+        <field id="4" name="full" type="uint8" description="Whether this is a full snapshot (1) or incremental update (0)"/>
+        <field id="5" name="firstID" type="int64" description="Orderbook first id (U)"/>
+        <field id="6" name="lastID" type="int64" description="Orderbook last id (u)"/>
+        <field id="7" name="pxExponent" type="int8" description="Price exponent for decimal point positioning"/>
+        <field id="8" name="szExponent" type="int8" description="Size exponent for decimal point positioning"/>
+
+        <group id="100" name="bids" dimensionType="groupSize16Encoding" description="Buy side order book levels">
+            <field id="1" name="pxMantissa" type="int64" description="Price mantissa"/>
+            <field id="2" name="szMantissa" type="int64" description="Size mantissa"/>
+        </group>
+        <group id="101" name="asks" dimensionType="groupSize16Encoding" description="Sell side order book levels">
+            <field id="1" name="pxMantissa" type="int64" description="Price mantissa"/>
+            <field id="2" name="szMantissa" type="int64" description="Size mantissa"/>
+        </group>
+
+        <data id="200" name="channel" type="varString8" description="Data channel"/>
+        <data id="201" name="symbol" type="varString8" description="Symbol/market"/>
+    </sbe:message>
+
+    <sbe:message name="orderBook" id="4" description="Order book snapshot message">
+        <field id="1" name="time" type="int64" description="Timestamp in microseconds when websocket server send"/>
+        <field id="2" name="e" type="Event" description="Event type"/>
+        <field id="3" name="t" type="int64" description="Orderbook timestamp in microseconds, engine timestamp"/>
+        <field id="4" name="id" type="int64" description="Orderbook id"/>
+        <field id="5" name="pxExponent" type="int8" description="Price exponent for decimal point positioning"/>
+        <field id="6" name="szExponent" type="int8" description="Size exponent for decimal point positioning"/>
+        <field id="7" name="level" type="uint8" description="Number of price levels"/>
+
+        <group id="100" name="asks" dimensionType="groupSize16Encoding" description="Ask side order book levels">
+            <field id="1" name="pxMantissa" type="int64" description="Price mantissa"/>
+            <field id="2" name="szMantissa" type="int64" description="Size mantissa"/>
+        </group>
+        <group id="101" name="bids" dimensionType="groupSize16Encoding" description="Bid side order book levels">
+            <field id="1" name="pxMantissa" type="int64" description="Price mantissa"/>
+            <field id="2" name="szMantissa" type="int64" description="Size mantissa"/>
+        </group>
+
+        <data id="200" name="channel" type="varString8" description="Data channel"/>
+        <data id="201" name="contract" type="varString8" description="Contract symbol (e.g., BTC_USDT)"/>
+    </sbe:message>
+
+    <sbe:message name="orderBookUpdate" id="5" description="Order book update result message">
+        <field id="1" name="time" type="int64" description="Timestamp in microseconds when websocket server send"/>
+        <field id="2" name="e" type="Event" description="Event type"/>
+        <field id="3" name="t" type="int64" description="Orderbook update timestamp in microseconds, engine timestamp"/>
+        <field id="4" name="firstID" type="int64" description="Orderbook first id (U)"/>
+        <field id="5" name="lastID" type="int64" description="Orderbook last id (u)"/>
+        <field id="6" name="pxExponent" type="int8" description="Price exponent for decimal point positioning"/>
+        <field id="7" name="szExponent" type="int8" description="Size exponent for decimal point positioning"/>
+        <field id="8" name="level" type="uint8" description="Number of price levels"/>
+
+        <group id="100" name="asks" dimensionType="groupSize16Encoding" description="Ask side order book levels">
+            <field id="1" name="pxMantissa" type="int64" description="Price mantissa"/>
+            <field id="2" name="szMantissa" type="int64" description="Size mantissa"/>
+        </group>
+        <group id="101" name="bids" dimensionType="groupSize16Encoding" description="Bid side order book levels">
+            <field id="1" name="pxMantissa" type="int64" description="Price mantissa"/>
+            <field id="2" name="szMantissa" type="int64" description="Size mantissa"/>
+        </group>
+
+        <data id="200" name="channel" type="varString8" description="Data channel"/>
+        <data id="201" name="symbol" type="varString8" description="Symbol/market"/>
+    </sbe:message>
+
+    <sbe:message name="userTrade" id="6" description="User trade message">
+        <field id="1" name="time" type="int64" description="Timestamp in microseconds when websocket server send"/>
+        <field id="2" name="e" type="Event" description="Event type"/>
+        <field id="3" name="pxExponent" type="int8" description="Price exponent for decimal point positioning"/>
+        <field id="4" name="szExponent" type="int8" description="Size exponent for decimal point positioning"/>
+        <field id="5" name="feeExponent" type="int8" description="Fee exponent for decimal point positioning"/>
+        <field id="6" name="pointExponent" type="int8" description="point exponent for decimal point positioning"/>
+
+        <group id="100" name="trades" dimensionType="groupSize16Encoding" description="User trades">
+            <field id="1" name="id" type="uint64" description="Trade ID"/>
+            <field id="2" name="orderId" type="uint64" description="Order ID"/>
+            <field id="3" name="t" type="int64" description="trade timestamp in microseconds"/>
+            <field id="4" name="sizeMantissa" type="int64" description="Trade size mantissa"/>
+            <field id="5" name="priceMantissa" type="int64" description="Trade price mantissa"/>
+            <field id="6" name="feeMantissa" type="int64" description="Fee mantissa"/>
+            <field id="7" name="pointFee" type="int64" description="Point fee"/>
+            <field id="8" name="closeSizeMantissa" type="int64" description="Close size mantissa"/>
+            <field id="9" name="role" type="Role" description="Trade role (maker/taker)"/>
+            <data id="200" name="contract" type="varString8" description="Contract symbol"/>
+            <data id="201" name="text" type="varString8" description="Trade text"/>
+            <data id="202" name="amendText" type="varString8" description="Amend text"/>
+            <data id="203" name="bizInfo" type="varString8" description="Business info"/>
+        </group>
+
+        <data id="200" name="channel" type="varString8" description="Data channel"/>
+    </sbe:message>
+
+    <sbe:message name="position" id="7" description="Position message">
+        <field id="1" name="time" type="int64" description="Timestamp in microseconds when websocket server send"/>
+        <field id="2" name="e" type="Event" description="Event type"/>
+        <field id="3" name="t" type="int64" description="Position timestamp in microseconds"/>
+        <field id="4" name="updateId" type="uint64" description="Update ID"/>
+        <field id="5" name="crossLeverageLimit" type="int64" description="Cross leverage limit mantissa; value = crossLeverageLimit * 10^crossLeverageLimitExponent"/>
+        <field id="6" name="riskLimit" type="int64" description="Risk limit mantissa; value = riskLimit * 10^riskLimitExponent"/>
+        <field id="7" name="leverage" type="int64" description="Leverage mantissa; value = leverage * 10^leverageExponent"/>
+        <field id="8" name="historyPoint" type="int64" description="History point mantissa; value = historyPoint * 10^historyPointExponent"/>
+        <field id="9" name="margin" type="int64" description="Margin mantissa; value = margin * 10^marginExponent"/>
+        <field id="10" name="realisedPoint" type="int64" description="Realised point mantissa; value = realisedPoint * 10^realisedPointExponent"/>
+        <field id="11" name="lever" type="int8" deprecated="1" description="DEPRECATED: do not use. Leverage multiplier is in leverStr (varString8)."/>
+        <field id="12" name="user" type="int64" description="User ID"/>
+
+        <!-- Price fields with pxExponent -->
+        <field id="13" name="pxExponent" type="int8" description="Price exponent for decimal point positioning"/>
+        <field id="14" name="liqPriceMantissa" type="int64" description="Liquidation price mantissa, use pxExponent"/>
+        <field id="15" name="entryPriceMantissa" type="int64" description="Entry price mantissa, use pxExponent"/>
+
+        <field id="16" name="leverageMaxExponent" type="int64" description="leverage exponent for decimal"/>
+        <field id="17" name="leverageMaxMantissa" type="int64" description="Max leverage mantissa, use leverageMaxExponent"/>
+
+        <!-- Maintenance rate fields with maintenanceRateExponent -->
+        <field id="18" name="maintenanceRateExponent" type="int8" description="Exponent for maintenance rate decimal point positioning"/>
+        <field id="19" name="maintenanceRateMantissa" type="int64" description="Maintenance rate mantissa, use maintenanceRateExponent"/>
+
+        <!-- Size fields with szExponent -->
+        <field id="20" name="szExponent" type="int8" description="Size exponent for decimal point positioning"/>
+        <field id="21" name="size" type="int64" description="Position size, use szExponent"/>
+
+        <!-- Last close PnL fields -->
+        <field id="22" name="lastClosePnlExponent" type="int8" description="Exponent for last close PnL decimal point positioning"/>
+        <field id="23" name="lastClosePnlMantissa" type="int64" description="Last close PnL mantissa, use lastClosePnlExponent"/>
+
+        <!-- Realised PnL fields -->
+        <field id="24" name="realisedPnlExponent" type="int8" description="Exponent for realised PnL decimal point positioning"/>
+        <field id="25" name="realisedPnlMantissa" type="int64" description="Realised PnL mantissa, use realisedPnlExponent"/>
+
+        <!-- History PnL fields -->
+        <field id="26" name="historyPnlExponent" type="int8" description="Exponent for history PnL decimal point positioning"/>
+        <field id="27" name="historyPnlMantissa" type="int64" description="History PnL mantissa, use historyPnlExponent"/>
+
+        <!-- Decimal scaling for economy int64 fields (ids 5–11); exponent applies to same-named mantissa -->
+        <field id="28" name="crossLeverageLimitExponent" type="int8" description="Exponent for crossLeverageLimit (decimal: mantissa * 10^exponent)"/>
+        <field id="29" name="riskLimitExponent" type="int8" description="Exponent for riskLimit"/>
+        <field id="30" name="leverageExponent" type="int8" description="Exponent for leverage"/>
+        <field id="31" name="historyPointExponent" type="int8" description="Exponent for historyPoint"/>
+        <field id="32" name="marginExponent" type="int8" description="Exponent for margin"/>
+        <field id="33" name="realisedPointExponent" type="int8" description="Exponent for realisedPoint"/>
+
+        <data id="200" name="channel" type="varString8" description="Data channel"/>
+        <data id="201" name="contract" type="varString8" description="Contract symbol"/>
+        <data id="202" name="mode" type="varString8" description="Position mode"/>
+        <data id="203" name="posMarginMode" type="varString8" description="Position margin mode"/>
+        <data id="204" name="leverStr" type="varString8" description="Leverage multiplier as UTF-8 decimal string"/>
+    </sbe:message>
+
+    <sbe:message name="candlestick" id="8" description="Candlestick message">
+        <field id="1" name="time" type="int64" description="Timestamp in microseconds when websocket server send"/>
+        <field id="2" name="e" type="Event" description="Event type"/>
+        <field id="3" name="pxExponent" type="int8" description="Price exponent for decimal point positioning"/>
+        <field id="4" name="szExponent" type="int8" description="Size exponent for decimal point positioning"/>
+        <field id="5" name="amountExponent" type="int8" description="Amount exponent for decimal point positioning"/>
+
+        <group id="100" name="candlesticks" dimensionType="groupSize16Encoding" description="Candlesticks">
+            <field id="1" name="t" type="int64" description="Candlestick timestamp in seconds"/>
+            <field id="2" name="openMantissa" type="int64" description="Open price mantissa"/>
+            <field id="3" name="highMantissa" type="int64" description="High price mantissa"/>
+            <field id="4" name="lowMantissa" type="int64" description="Low price mantissa"/>
+            <field id="5" name="closeMantissa" type="int64" description="Close price mantissa"/>
+            <field id="6" name="volumeMantissa" type="int64" description="Volume mantissa"/>
+            <field id="7" name="amountMantissa" type="int64" description="Amount mantissa"/>
+            <field id="8" name="complete" type="uint8" description="Whether candlestick is complete (1) or not (0)"/>
+            <data id="200" name="name" type="varString8" description="Candlestick name (e.g., 1m_BTC_USDT)"/>
+        </group>
+
+        <data id="200" name="channel" type="varString8" description="Data channel"/>
+    </sbe:message>
+
+    <sbe:message name="futuresTicker" id="9" description="Futures tickers message (futures.tickers)">
+        <field id="1" name="time" type="int64" description="Timestamp in microseconds when websocket server send"/>
+        <field id="2" name="e" type="Event" description="Event type"/>
+        <group id="100" name="result" dimensionType="groupSize16Encoding" description="Tickers">
+            <field id="1" name="t" type="int64" description="Ticker timestamp in microseconds"/>
+
+            <!-- Price fields with pxExponent -->
+            <field id="2" name="pxExponent" type="int8" description="Price exponent for decimal point positioning"/>
+            <field id="3" name="lastMantissa" type="int64" description="last price mantissa, use pxExponent"/>
+            <field id="4" name="changePriceMantissa" type="int64" description="change_price mantissa, use pxExponent"/>
+            <field id="5" name="low24hMantissa" type="int64" description="low_24h price mantissa, use pxExponent"/>
+            <field id="6" name="high24hMantissa" type="int64" description="high_24h price mantissa, use pxExponent"/>
+
+            <!-- Mark price fields with markPxExponent -->
+            <field id="7" name="markPxExponent" type="int8" description="Exponent for mark price decimal point positioning"/>
+            <field id="8" name="markPriceMantissa" type="int64" description="mark_price mantissa, use markPxExponent"/>
+
+            <!-- Index price fields with indexPxExponent -->
+            <field id="9" name="indexPxExponent" type="int8" description="Exponent for index price decimal point positioning"/>
+            <field id="10" name="indexPriceMantissa" type="int64" description="index_price mantissa, use indexPxExponent"/>
+
+            <!-- Change percentage fields -->
+            <field id="11" name="changePercentageExponent" type="int8" description="Exponent for change_percentage decimal point positioning"/>
+            <field id="12" name="changePercentageMantissa" type="int64" description="change_percentage mantissa, use changePercentageExponent"/>
+
+            <!-- Funding rate fields -->
+            <field id="13" name="fundingRateExponent" type="int8" description="Exponent for funding_rate decimal point positioning"/>
+            <field id="14" name="fundingRateMantissa" type="int64" description="funding_rate mantissa, use fundingRateExponent"/>
+
+            <!-- Size fields with szExponent -->
+            <field id="15" name="szExponent" type="int8" description="Size exponent for decimal point positioning"/>
+            <field id="16" name="totalSize" type="int64" description="total_size, use szExponent"/>
+
+            <!-- Volume 24h fields -->
+            <field id="17" name="volume24hExponent" type="int8" description="Exponent for volume_24h decimal point positioning"/>
+            <field id="18" name="volume24hMantissa" type="int64" description="volume_24h mantissa, use volume24hExponent"/>
+
+            <!-- Volume 24h base fields -->
+            <field id="19" name="volume24hBaseExponent" type="int8" description="Exponent for volume_24h_base decimal point positioning"/>
+            <field id="20" name="volume24hBaseMantissa" type="int64" description="volume_24h_base mantissa, use volume24hBaseExponent"/>
+
+            <!-- Volume 24h quote fields -->
+            <field id="21" name="volume24hQuoteExponent" type="int8" description="Exponent for volume_24h_quote decimal point positioning"/>
+            <field id="22" name="volume24hQuoteMantissa" type="int64" description="volume_24h_quote mantissa, use volume24hQuoteExponent"/>
+
+            <!-- Volume 24h settle fields -->
+            <field id="23" name="volume24hSettleExponent" type="int8" description="Exponent for volume_24h_settle decimal point positioning"/>
+            <field id="24" name="volume24hSettleMantissa" type="int64" description="volume_24h_settle mantissa, use volume24hSettleExponent"/>
+
+            <data id="200" name="contract" type="varString8" description="Contract (e.g., BTC_USDT)"/>
+            <data id="201" name="quantoBaseRate" type="varString8" description="quanto_base_rate (may be empty)"/>
+            <data id="202" name="priceType" type="varString8" description="price_type"/>
+            <data id="203" name="changeFrom" type="varString8" description="change_from"/>
+        </group>
+
+        <data id="200" name="channel" type="varString8" description="Data channel"/>
+    </sbe:message>
+
+    <!-- futures.orders 推送：与 JSON 结构对应 -->
+    <sbe:message name="orders" id="10" description="Futures orders message (futures.orders channel)">
+        <field id="1" name="time" type="int64" description="Timestamp in microseconds when websocket server send"/>
+        <field id="2" name="e" type="Event" description="Event type"/>
+
+        <group id="100" name="result" dimensionType="groupSize16Encoding" description="Order list">
+            <field id="1" name="createTime" type="int64" description="Order create time in microseconds"/>
+            <field id="2" name="id" type="uint64" description="Order ID"/>
+
+            <field id="3" name="sizeExponent" type="int8" description="Size exponent for size/iceberg/left"/>
+            <field id="4" name="icebergMantissa" type="int64" description="Iceberg mantissa, use sizeExponent"/>
+            <field id="5" name="leftMantissa" type="int64" description="Left size mantissa, use sizeExponent"/>
+            <field id="6" name="sizeMantissa" type="int64" description="Order size mantissa, use sizeExponent"/>
+
+            <field id="7" name="refu" type="int64" description="Refu"/>
+            <field id="8" name="refr" type="int64" description="Refr"/>
+
+            <field id="9" name="finishTime" type="int64" description="Finish time in microseconds"/>
+            <field id="10" name="updateId" type="int8" description="Update ID"/>
+            <field id="11" name="updateTime" type="int64" description="Update time in microseconds"/>
+
+            <field id="12" name="pointFeeExponent" type="int8" description="Point fee exponent"/>
+            <field id="13" name="pointFee" type="int64" description="Point fee, use pointFeeExponent"/>
+
+            <field id="14" name="isClose" type="uint8" description="Is close"/>
+            <field id="15" name="isLiq" type="uint8" description="Is liquidation"/>
+            <field id="16" name="isReduceOnly" type="uint8" description="Is reduce only"/>
+            <field id="17" name="isVoucher" type="uint8" description="Is voucher"/>
+
+            <field id="18" name="pxExponent" type="int8" description="Price exponent for price/fill_price"/>
+            <field id="19" name="fillPriceMantissa" type="int64" description="Fill price mantissa"/>
+            <field id="20" name="priceMantissa" type="int64" description="Price mantissa"/>
+
+            <field id="21" name="feeExponent" type="int8" description="Fee exponent"/>
+            <field id="22" name="feeMantissa" type="int64" description="Fee mantissa"/>
+
+            <field id="23" name="mkfrExponent" type="int8" description="Maker fee rate exponent"/>
+            <field id="24" name="mkfrMantissa" type="int64" description="Maker fee rate mantissa"/>
+
+            <field id="25" name="tkfrExponent" type="int8" description="Taker fee rate exponent"/>
+            <field id="26" name="tkfrMantissa" type="int64" description="Taker fee rate mantissa"/>
+
+            <field id="27" name="posMarginMode" type="PosMarginMode" description="Position margin mode (isolated/cross)"/>
+
+            <field id="28" name="stopProfitPriceMantissa" type="int64" description="Stop profit price mantissa, use pxExponent"/>
+            <field id="29" name="stopLossPriceMantissa" type="int64" description="Stop loss price mantissa, use pxExponent"/>
+            <field id="30" name="user" type="int64" description="User ID"/>
+
+            <data id="200" name="contract" type="varString8" description="Contract (e.g., BTC_USDT)"/>
+            <data id="201" name="role" type="varString8" description="Role"/>
+            <data id="202" name="text" type="varString8" description="Text (e.g., app)"/>
+            <data id="203" name="tif" type="varString8" description="Time in force (e.g., gtc)"/>
+            <data id="204" name="finishAs" type="varString8" description="Finish as (e.g., filled)"/>
+            <data id="205" name="status" type="varString8" description="Status (e.g., finished)"/>
+            <data id="206" name="amendText" type="varString8" description="Amend text"/>
+            <data id="207" name="bizInfo" type="varString8" description="Business info"/>
+            <data id="208" name="stpAct" type="varString8" description="STP act"/>
+            <data id="209" name="stpId" type="varString8" description="STP id"/>
+            <data id="210" name="bbo" type="varString8" description="BBO (e.g., opp)"/>
+            <data id="211" name="marketOrderSlipRatio" type="varString8" description="Market order slip ratio"/>
+            <data id="212" name="leverage" type="varString8" description="Leverage (e.g., 100)"/>
+        </group>
+
+        <data id="200" name="channel" type="varString8" description="Data channel"/>
+    </sbe:message>
+
+</sbe:messageSchema>
+

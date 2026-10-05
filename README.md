@@ -141,3 +141,17 @@ each venue's id chains: depth and trade ids, best bid/offer update ids, Gate's
 `--exchange` overrides. On a file that is still open `reader` exits with
 `incomplete frame` after the last complete record; that is expected.
 `gap_detector` says the same thing as an unterminated zstd stream.
+
+`schemas/` holds each venue's published SBE schema. `scripts/sbe_verify.py`
+decodes a recording from those XML files alone, independently of the Rust
+decoders, and checks every frame against them: header, block and group
+lengths, var data, enum values, and a decode that ends exactly at the frame's
+end. It also checks the frames' instruments against their files, timestamps
+against receive time, quote and book order, and, with `--reader`, that
+`reader` prints the schema's numbers for every record:
+
+```sh
+scripts/sbe_verify.py /data/sbe/okx /data/sbe/gate/spot --reader target/release/reader
+```
+
+It needs only Python 3 and the `zstd` command, and exits 1 on any mismatch.

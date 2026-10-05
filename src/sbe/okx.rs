@@ -1,4 +1,5 @@
-//! Fixed-layout parts of OKX's SBE market-data schema (`okx_sbe_1_0.xml`).
+//! Fixed-layout parts of OKX's SBE market-data schema
+//! (`schemas/okx_sbe_1_0.xml`).
 //!
 //! Every stream template (1000-1005) starts `instIdCode`, `tsUs`, `outTime`,
 //! `seqId`; the stream carries no symbol, only the code `GET

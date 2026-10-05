@@ -1,4 +1,5 @@
-//! Fixed-layout parts of the Binance spot stream schema (`stream_1_0.xml`).
+//! Fixed-layout parts of the Binance spot stream schema
+//! (`schemas/binance_stream_1_0.xml`).
 
 use std::ops::Range;
 

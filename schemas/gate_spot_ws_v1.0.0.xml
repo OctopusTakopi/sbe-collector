@@ -1,0 +1,446 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  spot-ws SBE Schema 草案 — schemaId=1（定点 mantissa 编码，主推版本）
+  生成输出目录约定：ws-idl/spot/v0101/gate_spot_ws_sbe/
+  decimal 字段编码规则：value = mantissa(int64) × 10^exponent(int8)，exponent ≤ 0。
+  时间字段：除 v0 字符串型时间字段外，所有 int64 时间字段统一为微秒时间戳（JSON 源口径见字段 description）。
+  说明文档见 03-sbe-schema-说明.md，字段来源见 02-通道与字段清单.md。
+-->
+<sbe:messageSchema xmlns:sbe="http://www.fixprotocol.org/ns/sbe"
+                   package="gate_spot_ws_sbe"
+                   id="1"
+                   version="1"
+                   semanticVersion="1.0.0"
+                   description="Gate Spot SBE Schema for WebSocket Market Data (mantissa encoding)"
+                   byteOrder="littleEndian">
+
+    <types>
+        <composite name="messageHeader" description="Template ID and length of message root">
+            <type name="blockLength" primitiveType="uint16"/>
+            <type name="templateId" primitiveType="uint16"/>
+            <type name="schemaId" primitiveType="uint16"/>
+            <type name="version" primitiveType="uint16"/>
+        </composite>
+
+        <composite name="groupSize16Encoding" description="Repeating group dimensions.">
+            <type name="blockLength" primitiveType="uint16"/>
+            <type name="numInGroup" primitiveType="uint16"/>
+        </composite>
+
+        <composite name="varString8" description="Variable length UTF-8 string (max 255 bytes).">
+            <type name="length" primitiveType="uint8"/>
+            <type name="varData" length="0" primitiveType="uint8" characterEncoding="UTF-8"/>
+        </composite>
+
+        <enum name="Side" encodingType="int8">
+            <validValue name="SELL">0</validValue>
+            <validValue name="BUY">1</validValue>
+        </enum>
+
+        <enum name="Role" encodingType="int8">
+            <validValue name="MAKER">0</validValue>
+            <validValue name="TAKER">1</validValue>
+        </enum>
+
+        <enum name="Event" encodingType="int8">
+            <validValue name="Subscribe">0</validValue>
+            <validValue name="Unsubscribe">1</validValue>
+            <validValue name="Update">2</validValue>
+            <validValue name="All">3</validValue>
+            <validValue name="Api">4</validValue>
+        </enum>
+
+        <enum name="Bool" encodingType="uint8">
+            <validValue name="FALSE">0</validValue>
+            <validValue name="TRUE">1</validValue>
+        </enum>
+    </types>
+
+    <!-- ============ templateId=1 : bbo  (spot.book_ticker / spot.bt / spot.rpi_bbo) ============ -->
+    <sbe:message name="bbo" id="1" description="Best bid/offer (BookTicker)">
+        <field id="1" name="time" type="int64" description="Server send timestamp in microseconds"/>
+        <field id="2" name="e" type="Event" description="Event type"/>
+        <field id="3" name="t" type="int64" description="Engine timestamp in microseconds (JSON: t, converted from ms)"/>
+        <field id="4" name="u" type="int64" description="Update id (JSON: u)"/>
+        <field id="5" name="pxExponent" type="int8" description="Exponent for bid/ask price"/>
+        <field id="6" name="szExponent" type="int8" description="Exponent for bid/ask size"/>
+        <field id="7" name="bidMantissaPrice" type="int64" description="Best bid price mantissa (JSON: b)"/>
+        <field id="8" name="bidMantissaSize"  type="int64" description="Best bid size mantissa (JSON: B)"/>
+        <field id="9" name="askMantissaPrice" type="int64" description="Best ask price mantissa (JSON: a)"/>
+        <field id="10" name="askMantissaSize" type="int64" description="Best ask size mantissa (JSON: A)"/>
+        <data id="200" name="channel" type="varString8" description="Channel name"/>
+        <data id="201" name="s" type="varString8" description="Currency pair (JSON: s)"/>
+    </sbe:message>
+
+    <!-- ============ templateId=2 : publicTrade  (spot.trades / spot.f_trades / spot.trades_v2) ============ -->
+    <sbe:message name="publicTrade" id="2" description="Public trade (Deal)">
+        <field id="1" name="time" type="int64" description="Server send timestamp in microseconds"/>
+        <field id="2" name="e" type="Event" description="Event type"/>
+        <field id="3" name="pxExponent" type="int8" description="Exponent for price"/>
+        <field id="4" name="szExponent" type="int8" description="Exponent for amount"/>
+        <field id="5" name="id" type="uint64" description="Trade id (JSON: id)"/>
+        <field id="6" name="idMarket" type="uint64" description="Market trade sequence (JSON: id_market)"/>
+        <field id="7" name="createTime" type="int64" description="Trade time in microseconds (JSON: create_time, converted from seconds)"/>
+        <field id="8" name="createTimeUs" type="int64" description="Trade time in microseconds (JSON: create_time_ms, precision-normalized)"/>
+        <field id="9" name="side" type="Side" description="Aggressor side (JSON: side)"/>
+        <field id="10" name="priceMantissa" type="int64" description="Trade price mantissa (JSON: price)"/>
+        <field id="11" name="amountMantissa" type="int64" description="Trade amount mantissa (JSON: amount)"/>
+        <data id="200" name="channel" type="varString8" description="Channel name"/>
+        <data id="201" name="currencyPair" type="varString8" description="Currency pair (JSON: currency_pair)"/>
+        <data id="202" name="range" type="varString8" description="Aggregated trade id range start-end (JSON: range)"/>
+    </sbe:message>
+
+    <!-- ============ templateId=3 : obu  (spot.obu / spot.rvt_obu / spot.rpi_obu) ============ -->
+    <sbe:message name="obu" id="3" description="400-level order book full/incremental update (OrderBookUpdateResult)">
+        <field id="1" name="time" type="int64" description="Server send timestamp in microseconds"/>
+        <field id="2" name="e" type="Event" description="Event type"/>
+        <field id="3" name="t" type="int64" description="Engine timestamp in microseconds (JSON: t, converted from ms)"/>
+        <field id="4" name="full" type="Bool" description="Full snapshot (TRUE) or incremental (FALSE) (JSON: full)"/>
+        <field id="5" name="firstID" type="int64" description="First depth id (JSON: U)"/>
+        <field id="6" name="lastID" type="int64" description="Last depth id (JSON: u)"/>
+        <field id="7" name="pxExponent" type="int8" description="Exponent for level price"/>
+        <field id="8" name="szExponent" type="int8" description="Exponent for level size"/>
+        <group id="100" name="bids" dimensionType="groupSize16Encoding" description="Bid levels (JSON: b)">
+            <field id="1" name="pxMantissa" type="int64" description="Level price mantissa"/>
+            <field id="2" name="szMantissa" type="int64" description="Level size mantissa (0 = delete)"/>
+        </group>
+        <group id="101" name="asks" dimensionType="groupSize16Encoding" description="Ask levels (JSON: a)">
+            <field id="1" name="pxMantissa" type="int64" description="Level price mantissa"/>
+            <field id="2" name="szMantissa" type="int64" description="Level size mantissa (0 = delete)"/>
+        </group>
+        <data id="200" name="channel" type="varString8" description="Channel name"/>
+        <data id="201" name="s" type="varString8" description="Stream key {prefix}{contract}.{level} (JSON: s)"/>
+    </sbe:message>
+
+    <!-- ============ templateId=4 : orderBook  (spot.order_book, full snapshot) ============ -->
+    <sbe:message name="orderBook" id="4" description="Order book full snapshot (UpdateAllDepthMsgV2)">
+        <field id="1" name="time" type="int64" description="Server send timestamp in microseconds"/>
+        <field id="2" name="e" type="Event" description="Event type"/>
+        <field id="3" name="t" type="int64" description="Engine timestamp in microseconds (JSON: t, converted from ms)"/>
+        <field id="4" name="lastUpdateId" type="int64" description="Latest depth update id (JSON: lastUpdateId)"/>
+        <field id="5" name="pxExponent" type="int8" description="Exponent for level price"/>
+        <field id="6" name="szExponent" type="int8" description="Exponent for level size"/>
+        <group id="100" name="bids" dimensionType="groupSize16Encoding" description="Bid levels (JSON: bids)">
+            <field id="1" name="pxMantissa" type="int64" description="Level price mantissa"/>
+            <field id="2" name="szMantissa" type="int64" description="Level size mantissa"/>
+        </group>
+        <group id="101" name="asks" dimensionType="groupSize16Encoding" description="Ask levels (JSON: asks)">
+            <field id="1" name="pxMantissa" type="int64" description="Level price mantissa"/>
+            <field id="2" name="szMantissa" type="int64" description="Level size mantissa"/>
+        </group>
+        <data id="200" name="channel" type="varString8" description="Channel name"/>
+        <data id="201" name="s" type="varString8" description="Currency pair (JSON: s)"/>
+        <data id="202" name="level" type="varString8" description="Depth level (JSON: l; v3 empty, v4 set)"/>
+    </sbe:message>
+
+    <!-- ============ templateId=5 : orderBookUpdate  (spot.order_book_update / spot.ob_update) ============ -->
+    <sbe:message name="orderBookUpdate" id="5" description="Order book incremental update (UpdateDepthMsgV3)">
+        <field id="1" name="time" type="int64" description="Server send timestamp in microseconds"/>
+        <field id="2" name="e" type="Event" description="Event type"/>
+        <field id="3" name="t" type="int64" description="Engine timestamp in microseconds (JSON: t, converted from ms)"/>
+        <field id="4" name="bigE" type="int64" description="Event time in microseconds (JSON: E, converted from seconds)"/>
+        <field id="5" name="full" type="Bool" description="Full snapshot flag (JSON: full)"/>
+        <field id="6" name="firstID" type="int64" description="First update id (JSON: U)"/>
+        <field id="7" name="lastID" type="int64" description="Last update id (JSON: u)"/>
+        <field id="8" name="pxExponent" type="int8" description="Exponent for level price"/>
+        <field id="9" name="szExponent" type="int8" description="Exponent for level size"/>
+        <group id="100" name="bids" dimensionType="groupSize16Encoding" description="Bid changes (JSON: b)">
+            <field id="1" name="pxMantissa" type="int64" description="Level price mantissa"/>
+            <field id="2" name="szMantissa" type="int64" description="Level size mantissa (0 = delete)"/>
+        </group>
+        <group id="101" name="asks" dimensionType="groupSize16Encoding" description="Ask changes (JSON: a)">
+            <field id="1" name="pxMantissa" type="int64" description="Level price mantissa"/>
+            <field id="2" name="szMantissa" type="int64" description="Level size mantissa (0 = delete)"/>
+        </group>
+        <data id="200" name="channel" type="varString8" description="Channel name"/>
+        <data id="201" name="s" type="varString8" description="Currency pair (JSON: s)"/>
+        <data id="202" name="level" type="varString8" description="Depth level (JSON: l)"/>
+        <data id="203" name="eventType" type="varString8" description="Event type string, constant depthUpdate (JSON: e)"/>
+    </sbe:message>
+
+    <!-- ============ templateId=6 : candlestick  (spot.candlesticks) ============ -->
+    <sbe:message name="candlestick" id="6" description="Candlestick (CandleUpdate)">
+        <field id="1" name="time" type="int64" description="Server send timestamp in microseconds"/>
+        <field id="2" name="e" type="Event" description="Event type"/>
+        <field id="3" name="t" type="int64" description="Candlestick timestamp in microseconds (JSON: t, converted from seconds)"/>
+        <field id="4" name="pxExponent" type="int8" description="Exponent for o/h/l/c price"/>
+        <field id="5" name="szExponent" type="int8" description="Exponent for volume (JSON: v)"/>
+        <field id="6" name="amountExponent" type="int8" description="Exponent for amount (JSON: a)"/>
+        <field id="7" name="openMantissa" type="int64" description="Open price mantissa (JSON: o)"/>
+        <field id="8" name="highMantissa" type="int64" description="High price mantissa (JSON: h)"/>
+        <field id="9" name="lowMantissa" type="int64" description="Low price mantissa (JSON: l)"/>
+        <field id="10" name="closeMantissa" type="int64" description="Close price mantissa (JSON: c)"/>
+        <field id="11" name="volumeMantissa" type="int64" description="Base volume mantissa (JSON: v)"/>
+        <field id="12" name="amountMantissa" type="int64" description="Quote amount mantissa, use amountExponent. Large-value field (long-interval candlestick amount); encoder MUST perform int64 overflow check (JSON: a)"/>
+        <field id="13" name="complete" type="Bool" description="Window closed (JSON: w)"/>
+        <data id="200" name="channel" type="varString8" description="Channel name"/>
+        <data id="201" name="name" type="varString8" description="Candlestick name {interval}_{market} (JSON: n)"/>
+    </sbe:message>
+
+    <!-- ============ templateId=7 : ticker  (spot.tickers) ============ -->
+    <sbe:message name="ticker" id="7" description="Spot ticker (gateapi.Ticker)">
+        <field id="1" name="time" type="int64" description="Server send timestamp in microseconds"/>
+        <field id="2" name="e" type="Event" description="Event type"/>
+        <field id="3" name="pxExponent" type="int8" description="Exponent for price fields (last/ask/bid/high/low)"/>
+        <field id="4" name="baseVolExponent" type="int8" description="Exponent for base_volume (separate from quote_volume to avoid mantissa overflow)"/>
+        <field id="5" name="quoteVolExponent" type="int8" description="Exponent for quote_volume (separate from base_volume)"/>
+        <field id="6" name="changePctExponent" type="int8" description="Exponent for change_percentage (4 decimals)"/>
+        <field id="7" name="lastMantissa" type="int64" description="Last price mantissa (JSON: last)"/>
+        <field id="8" name="lowestAskMantissa" type="int64" description="Lowest ask mantissa (JSON: lowest_ask)"/>
+        <field id="9" name="highestBidMantissa" type="int64" description="Highest bid mantissa (JSON: highest_bid)"/>
+        <field id="10" name="high24hMantissa" type="int64" description="24h high mantissa (JSON: high_24h)"/>
+        <field id="11" name="low24hMantissa" type="int64" description="24h low mantissa (JSON: low_24h)"/>
+        <field id="12" name="changePercentageMantissa" type="int64" description="24h change percentage mantissa (JSON: change_percentage)"/>
+        <field id="13" name="baseVolumeMantissa" type="int64" description="24h base volume mantissa, use baseVolExponent (JSON: base_volume)"/>
+        <field id="14" name="quoteVolumeMantissa" type="int64" description="24h quote volume mantissa, use quoteVolExponent. Large-value field; encoder MUST perform int64 overflow check (JSON: quote_volume)"/>
+        <data id="200" name="channel" type="varString8" description="Channel name"/>
+        <data id="201" name="currencyPair" type="varString8" description="Currency pair (JSON: currency_pair)"/>
+    </sbe:message>
+
+    <!-- ============ templateId=8 : userTrade  (spot.usertrades / spot.usertrades_v2) ============ -->
+    <sbe:message name="userTrade" id="8" description="User trades (array of UpdateUserTradesMsg)">
+        <field id="1" name="time" type="int64" description="Server send timestamp in microseconds"/>
+        <field id="2" name="e" type="Event" description="Event type"/>
+        <field id="3" name="pxExponent" type="int8" description="Exponent for price"/>
+        <field id="4" name="szExponent" type="int8" description="Exponent for amount"/>
+        <field id="5" name="feeExponent" type="int8" description="Exponent for fee/point_fee/gt_fee"/>
+        <group id="100" name="trades" dimensionType="groupSize16Encoding" description="User trade list">
+            <field id="1" name="id" type="uint64" description="Trade id (JSON: id)"/>
+            <field id="2" name="userId" type="uint64" description="User id (JSON: user_id)"/>
+            <field id="3" name="idMarket" type="uint64" description="Market trade sequence (JSON: id_market)"/>
+            <field id="4" name="createTime" type="int64" description="Trade time in microseconds (JSON: create_time, converted from seconds)"/>
+            <field id="5" name="createTimeUs" type="int64" description="Trade time in microseconds (JSON: create_time_ms)"/>
+            <field id="6" name="side" type="Side" description="Side (JSON: side)"/>
+            <field id="7" name="role" type="Role" description="Role maker/taker (JSON: role)"/>
+            <field id="8" name="priceMantissa" type="int64" description="Trade price mantissa (JSON: price)"/>
+            <field id="9" name="amountMantissa" type="int64" description="Trade amount mantissa (JSON: amount)"/>
+            <field id="10" name="feeMantissa" type="int64" description="Fee mantissa (JSON: fee; empty in v2)"/>
+            <field id="11" name="pointFeeMantissa" type="int64" description="Point fee mantissa (JSON: point_fee)"/>
+            <field id="12" name="gtFeeMantissa" type="int64" description="GT fee mantissa (JSON: gt_fee)"/>
+            <data id="200" name="orderId" type="varString8" description="Order id (JSON: order_id)"/>
+            <data id="201" name="currencyPair" type="varString8" description="Currency pair (JSON: currency_pair)"/>
+            <data id="202" name="feeCurrency" type="varString8" description="Fee currency (JSON: fee_currency; empty in v2)"/>
+            <data id="203" name="text" type="varString8" description="User text (JSON: text)"/>
+            <data id="204" name="amendText" type="varString8" description="Amend text (JSON: amend_text)"/>
+            <data id="205" name="bizInfo" type="varString8" description="Business info (JSON: biz_info)"/>
+        </group>
+        <data id="200" name="channel" type="varString8" description="Channel name"/>
+    </sbe:message>
+
+    <!-- ============ templateId=9 : orders  (spot.orders / spot.orders_v2) ============ -->
+    <sbe:message name="orders" id="9" description="User orders (array of SendOrder)">
+        <field id="1" name="time" type="int64" description="Server send timestamp in microseconds"/>
+        <field id="2" name="e" type="Event" description="Event type"/>
+        <field id="3" name="pxExponent" type="int8" description="Exponent for price fields: price / avg_deal_price / stop_profit and stop_loss trigger_price and order_price"/>
+        <field id="4" name="szExponent" type="int8" description="Exponent for amount/left/filled_amount"/>
+        <field id="5" name="quoteExponent" type="int8" description="Exponent for filled_total"/>
+        <field id="6" name="feeExponent" type="int8" description="Exponent for fee/point_fee/gt_fee/rebated_fee"/>
+        <field id="7" name="ratioExponent" type="int8" description="Exponent for slippage ratio"/>
+        <group id="100" name="result" dimensionType="groupSize16Encoding" description="Order list">
+            <field id="1" name="user" type="int64" description="User id (JSON: user)"/>
+            <field id="2" name="stpId" type="int64" description="STP group id (JSON: stp_id)"/>
+            <field id="3" name="createTime" type="int64" description="Create time in microseconds (JSON: create_time, converted from seconds)"/>
+            <field id="4" name="updateTime" type="int64" description="Update time in microseconds (JSON: update_time, converted from seconds)"/>
+            <field id="5" name="createTimeMs" type="int64" description="Create time in microseconds (JSON: create_time_ms, converted from ms)"/>
+            <field id="6" name="updateTimeMs" type="int64" description="Update time in microseconds (JSON: update_time_ms, converted from ms)"/>
+            <field id="7" name="side" type="Side" description="Side (JSON: side)"/>
+            <field id="8" name="amountMantissa" type="int64" description="Order amount mantissa (JSON: amount)"/>
+            <field id="9" name="priceMantissa" type="int64" description="Order price mantissa (JSON: price)"/>
+            <field id="10" name="leftMantissa" type="int64" description="Left size mantissa (JSON: left)"/>
+            <field id="11" name="filledAmountMantissa" type="int64" description="Filled amount mantissa (JSON: filled_amount)"/>
+            <field id="12" name="filledTotalMantissa" type="int64" description="Filled total mantissa, use quoteExponent. Large cumulative value possible; encoder MUST perform int64 overflow check (JSON: filled_total)"/>
+            <field id="13" name="avgDealPriceMantissa" type="int64" description="Average deal price mantissa (JSON: avg_deal_price)"/>
+            <field id="14" name="feeMantissa" type="int64" description="Fee mantissa (JSON: fee; empty in v2)"/>
+            <field id="15" name="pointFeeMantissa" type="int64" description="Point fee mantissa (JSON: point_fee; empty in v2)"/>
+            <field id="16" name="gtFeeMantissa" type="int64" description="GT fee mantissa (JSON: gt_fee; empty in v2)"/>
+            <field id="17" name="rebatedFeeMantissa" type="int64" description="Rebated fee mantissa (JSON: rebated_fee; empty in v2)"/>
+            <field id="18" name="slippageMantissa" type="int64" description="Market order slippage ratio mantissa (JSON: slippage)"/>
+            <field id="19" name="gtDiscount" type="Bool" description="GT discount enabled (JSON: gt_discount)"/>
+            <field id="20" name="autoRepay" type="Bool" description="Auto repay (JSON: auto_repay)"/>
+            <field id="21" name="autoBorrow" type="Bool" description="Auto borrow (JSON: auto_borrow)"/>
+            <field id="22" name="hasStopProfit" type="Bool" description="Whether stop_profit present"/>
+            <field id="23" name="stopProfitTriggerMantissa" type="int64" description="Stop profit trigger price mantissa (JSON: stop_profit.trigger_price)"/>
+            <field id="24" name="stopProfitOrderMantissa" type="int64" description="Stop profit order price mantissa (JSON: stop_profit.order_price)"/>
+            <field id="25" name="hasStopLoss" type="Bool" description="Whether stop_loss present"/>
+            <field id="26" name="stopLossTriggerMantissa" type="int64" description="Stop loss trigger price mantissa (JSON: stop_loss.trigger_price)"/>
+            <field id="27" name="stopLossOrderMantissa" type="int64" description="Stop loss order price mantissa (JSON: stop_loss.order_price)"/>
+            <data id="200" name="id" type="varString8" description="Order id (JSON: id)"/>
+            <data id="201" name="currencyPair" type="varString8" description="Currency pair (JSON: currency_pair)"/>
+            <data id="202" name="event" type="varString8" description="Order event put/update/finish (JSON: event)"/>
+            <data id="203" name="type" type="varString8" description="Order type (JSON: type)"/>
+            <data id="204" name="account" type="varString8" description="Account type (JSON: account)"/>
+            <data id="205" name="timeInForce" type="varString8" description="Time in force (JSON: time_in_force)"/>
+            <data id="206" name="text" type="varString8" description="Order source text (JSON: text)"/>
+            <data id="207" name="feeCurrency" type="varString8" description="Fee currency (JSON: fee_currency)"/>
+            <data id="208" name="rebatedFeeCurrency" type="varString8" description="Rebated fee currency (JSON: rebated_fee_currency)"/>
+            <data id="209" name="stpAct" type="varString8" description="STP act (JSON: stp_act)"/>
+            <data id="210" name="finishAs" type="varString8" description="Finish as (JSON: finish_as)"/>
+            <data id="211" name="bizInfo" type="varString8" description="Business info (JSON: biz_info)"/>
+            <data id="212" name="amendText" type="varString8" description="Amend text (JSON: amend_text)"/>
+        </group>
+        <data id="200" name="channel" type="varString8" description="Channel name"/>
+    </sbe:message>
+
+    <!-- ============ templateId=10 : balance  (spot.balances) ============ -->
+    <sbe:message name="balance" id="10" description="Spot account balance change (BalancesMsg)">
+        <field id="1" name="time" type="int64" description="Server send timestamp in microseconds"/>
+        <field id="2" name="e" type="Event" description="Event type"/>
+        <field id="3" name="timestamp" type="int64" description="Timestamp in microseconds (JSON: timestamp, converted from seconds)"/>
+        <field id="4" name="timestampMs" type="int64" description="Timestamp in microseconds (JSON: timestamp_ms, converted from ms)"/>
+        <field id="5" name="amtExponent" type="int8" description="Exponent for all amount fields"/>
+        <field id="6" name="changeMantissa" type="int64" description="Available change mantissa (JSON: change)"/>
+        <field id="7" name="totalMantissa" type="int64" description="Total balance mantissa (JSON: total)"/>
+        <field id="8" name="availableMantissa" type="int64" description="Available balance mantissa (JSON: available)"/>
+        <field id="9" name="freezeMantissa" type="int64" description="Freeze balance mantissa (JSON: freeze)"/>
+        <field id="10" name="freezeChangeMantissa" type="int64" description="Freeze change mantissa (JSON: freeze_change)"/>
+        <data id="200" name="channel" type="varString8" description="Channel name"/>
+        <data id="201" name="user" type="varString8" description="User id (JSON: user)"/>
+        <data id="202" name="currency" type="varString8" description="Currency (JSON: currency)"/>
+        <data id="203" name="changeType" type="varString8" description="Change type (JSON: change_type)"/>
+    </sbe:message>
+
+    <!-- ============ templateId=11 : marginBalance  (spot.margin_balances) ============ -->
+    <sbe:message name="marginBalance" id="11" description="Isolated margin balance change (MarginBalancesMsg)">
+        <field id="1" name="time" type="int64" description="Server send timestamp in microseconds"/>
+        <field id="2" name="e" type="Event" description="Event type"/>
+        <field id="3" name="timestamp" type="int64" description="Timestamp in microseconds (JSON: timestamp, converted from seconds)"/>
+        <field id="4" name="timestampMs" type="int64" description="Timestamp in microseconds (JSON: timestamp_ms, converted from ms)"/>
+        <field id="5" name="amtExponent" type="int8" description="Exponent for all amount fields"/>
+        <field id="6" name="changeMantissa" type="int64" description="Available change mantissa (JSON: change)"/>
+        <field id="7" name="availableMantissa" type="int64" description="Available balance mantissa (JSON: available)"/>
+        <field id="8" name="freezeMantissa" type="int64" description="Freeze balance mantissa (JSON: freeze)"/>
+        <field id="9" name="borrowedMantissa" type="int64" description="Borrowed mantissa (JSON: borrowed)"/>
+        <field id="10" name="interestMantissa" type="int64" description="Interest mantissa (JSON: interest)"/>
+        <data id="200" name="channel" type="varString8" description="Channel name"/>
+        <data id="201" name="user" type="varString8" description="User id (JSON: user)"/>
+        <data id="202" name="currencyPair" type="varString8" description="Margin pair (JSON: currency_pair)"/>
+        <data id="203" name="currency" type="varString8" description="Currency (JSON: currency)"/>
+    </sbe:message>
+
+    <!-- ============ templateId=12 : fundingBalance  (spot.funding_balances) ============ -->
+    <sbe:message name="fundingBalance" id="12" description="Funding account balance change (FundingBalancesMsg)">
+        <field id="1" name="time" type="int64" description="Server send timestamp in microseconds"/>
+        <field id="2" name="e" type="Event" description="Event type"/>
+        <field id="3" name="timestamp" type="int64" description="Timestamp in microseconds (JSON: timestamp, converted from seconds)"/>
+        <field id="4" name="timestampMs" type="int64" description="Timestamp in microseconds (JSON: timestamp_ms, converted from ms)"/>
+        <field id="5" name="amtExponent" type="int8" description="Exponent for all amount fields"/>
+        <field id="6" name="changeMantissa" type="int64" description="Available change mantissa (JSON: change)"/>
+        <field id="7" name="freezeMantissa" type="int64" description="Freeze balance mantissa (JSON: freeze)"/>
+        <field id="8" name="lentMantissa" type="int64" description="Lent amount mantissa (JSON: lent)"/>
+        <data id="200" name="channel" type="varString8" description="Channel name"/>
+        <data id="201" name="user" type="varString8" description="User id (JSON: user)"/>
+        <data id="202" name="currency" type="varString8" description="Currency (JSON: currency)"/>
+    </sbe:message>
+
+    <!-- ============ templateId=13 : crossBalance  (spot.cross_balances) ============ -->
+    <!-- 注：spot.cross_balances 实际推送 BalancesMsg（与 spot.balances 同口径），
+         故字段集与 balance(10) 完全对齐，含 freeze/freeze_change/change_type。 -->
+    <sbe:message name="crossBalance" id="13" description="Cross margin balance change (BalancesMsg)">
+        <field id="1" name="time" type="int64" description="Server send timestamp in microseconds"/>
+        <field id="2" name="e" type="Event" description="Event type"/>
+        <field id="3" name="timestamp" type="int64" description="Timestamp in microseconds (JSON: timestamp, converted from seconds)"/>
+        <field id="4" name="timestampMs" type="int64" description="Timestamp in microseconds (JSON: timestamp_ms, converted from ms)"/>
+        <field id="5" name="amtExponent" type="int8" description="Exponent for all amount fields"/>
+        <field id="6" name="changeMantissa" type="int64" description="Available change mantissa (JSON: change)"/>
+        <field id="7" name="totalMantissa" type="int64" description="Total balance mantissa (JSON: total)"/>
+        <field id="8" name="availableMantissa" type="int64" description="Available balance mantissa (JSON: available)"/>
+        <field id="9" name="freezeMantissa" type="int64" description="Freeze balance mantissa (JSON: freeze)"/>
+        <field id="10" name="freezeChangeMantissa" type="int64" description="Freeze change mantissa (JSON: freeze_change)"/>
+        <data id="200" name="channel" type="varString8" description="Channel name"/>
+        <data id="201" name="user" type="varString8" description="User id (JSON: user)"/>
+        <data id="202" name="currency" type="varString8" description="Currency (JSON: currency)"/>
+        <data id="203" name="changeType" type="varString8" description="Change type (JSON: change_type)"/>
+    </sbe:message>
+
+    <!-- ============ templateId=14 : crossLoan  (spot.cross_loan) ============ -->
+    <sbe:message name="crossLoan" id="14" description="Cross margin loan change (CrossLoanMsg)">
+        <field id="1" name="time" type="int64" description="Server send timestamp in microseconds"/>
+        <field id="2" name="e" type="Event" description="Event type"/>
+        <field id="3" name="timestamp" type="int64" description="Timestamp in microseconds (JSON: timestamp, converted from ms)"/>
+        <field id="4" name="amtExponent" type="int8" description="Exponent for all amount fields"/>
+        <field id="5" name="changeMantissa" type="int64" description="Change mantissa (JSON: change)"/>
+        <field id="6" name="totalMantissa" type="int64" description="Total mantissa (JSON: total)"/>
+        <field id="7" name="availableMantissa" type="int64" description="Available mantissa (JSON: available)"/>
+        <field id="8" name="borrowedMantissa" type="int64" description="Borrowed mantissa (JSON: borrowed)"/>
+        <field id="9" name="interestMantissa" type="int64" description="Interest mantissa (JSON: interest)"/>
+        <data id="200" name="channel" type="varString8" description="Channel name"/>
+        <data id="201" name="user" type="varString8" description="User id (JSON: user)"/>
+        <data id="202" name="currency" type="varString8" description="Currency (JSON: currency)"/>
+    </sbe:message>
+
+    <!-- ============ templateId=15 : priceOrder  (spot.priceorders) ============ -->
+    <sbe:message name="priceOrder" id="15" description="Price-triggered order notification (PriceOrderNotification)">
+        <field id="1" name="time" type="int64" description="Server send timestamp in microseconds"/>
+        <field id="2" name="e" type="Event" description="Event type"/>
+        <field id="3" name="pxExponent" type="int8" description="Exponent for price/trigger price"/>
+        <field id="4" name="szExponent" type="int8" description="Exponent for amount"/>
+        <field id="5" name="firedOrderId" type="int64" description="Fired order id (JSON: fired_order_id)"/>
+        <field id="6" name="instantCancel" type="Bool" description="Instant cancel remaining (JSON: instant_cancel)"/>
+        <field id="7" name="triggerExpiration" type="int64" description="Trigger expiration (JSON: trigger_expiration)"/>
+        <field id="8" name="isStopOrder" type="Bool" description="Is stop order (JSON: is_stop_order)"/>
+        <field id="9" name="triggerPriceMantissa" type="int64" description="Trigger price mantissa (JSON: trigger_price)"/>
+        <field id="10" name="priceMantissa" type="int64" description="Order price mantissa (JSON: price)"/>
+        <field id="11" name="amountMantissa" type="int64" description="Order amount mantissa (JSON: amount)"/>
+        <field id="12" name="hasStopTrigger" type="Bool" description="Whether stop trigger fields present"/>
+        <field id="13" name="stopTriggerPriceMantissa" type="int64" description="Stop trigger price mantissa (JSON: stop_trigger_price)"/>
+        <field id="14" name="stopPriceMantissa" type="int64" description="Stop order price mantissa (JSON: stop_price)"/>
+        <field id="15" name="ctime" type="int64" description="Create time in microseconds (JSON: ctime, converted from ms)"/>
+        <field id="16" name="ftime" type="int64" description="Finish time in microseconds (JSON: ftime, converted from ms)"/>
+        <data id="200" name="channel" type="varString8" description="Channel name"/>
+        <data id="201" name="market" type="varString8" description="Market (JSON: market)"/>
+        <data id="202" name="uid" type="varString8" description="User id (JSON: uid)"/>
+        <data id="203" name="id" type="varString8" description="Auto order id (JSON: id)"/>
+        <data id="204" name="currencyType" type="varString8" description="Base currency (JSON: currency_type)"/>
+        <data id="205" name="exchangeType" type="varString8" description="Quote currency (JSON: exchange_type)"/>
+        <data id="206" name="reason" type="varString8" description="End reason (JSON: reason)"/>
+        <data id="207" name="errMsg" type="varString8" description="Error message (JSON: err_msg)"/>
+        <data id="208" name="triggerRule" type="varString8" description="Trigger rule (JSON: trigger_rule)"/>
+        <data id="209" name="source" type="varString8" description="Order source (JSON: source)"/>
+        <data id="210" name="orderType" type="varString8" description="Order type (JSON: order_type)"/>
+        <data id="211" name="side" type="varString8" description="Side (JSON: side)"/>
+        <data id="212" name="engineType" type="varString8" description="Engine type (JSON: engine_type)"/>
+        <data id="213" name="stopTriggerRule" type="varString8" description="Stop trigger rule (JSON: stop_trigger_rule)"/>
+        <data id="214" name="text" type="varString8" description="Text (JSON: text)"/>
+    </sbe:message>
+
+    <!-- ============ templateId=16 : fastSwap  (spot.fast_swap / spot.fast_swap_deal) ============ -->
+    <sbe:message name="fastSwap" id="16" description="Fast swap maker orders (array of ProviderDealedOrder)">
+        <field id="1" name="time" type="int64" description="Server send timestamp in microseconds"/>
+        <field id="2" name="e" type="Event" description="Event type"/>
+        <field id="3" name="pxExponent" type="int8" description="Exponent for price"/>
+        <field id="4" name="szExponent" type="int8" description="Exponent for amount fields"/>
+        <group id="100" name="orders" dimensionType="groupSize16Encoding" description="Provider dealed orders">
+            <field id="1" name="amountMantissa" type="int64" description="Order amount mantissa (JSON: amount)"/>
+            <field id="2" name="leftAmountMantissa" type="int64" description="Left amount mantissa (JSON: left_amount)"/>
+            <field id="3" name="tradeAmountMantissa" type="int64" description="Trade amount mantissa (JSON: trade_amount)"/>
+            <field id="4" name="priceMantissa" type="int64" description="Price mantissa (JSON: price)"/>
+            <field id="5" name="expiredTime" type="int64" description="Expire time in microseconds (JSON: expired_time)"/>
+            <field id="6" name="createdTime" type="int64" description="Engine create time in microseconds (JSON: created_time)"/>
+            <field id="7" name="requestTime" type="int64" description="Request receive time in microseconds (JSON: request_time)"/>
+            <field id="8" name="providerUid" type="int64" description="Provider user id (JSON: provider_uid)"/>
+            <field id="9" name="orderId" type="int64" description="Order id (JSON: order_id)"/>
+            <field id="10" name="dealOrderId" type="int64" description="Deal order id (JSON: deal_order_id)"/>
+            <data id="200" name="event" type="varString8" description="Event update/delete (JSON: event)"/>
+            <data id="201" name="market" type="varString8" description="Market (JSON: market)"/>
+            <data id="202" name="side" type="varString8" description="Side (JSON: side)"/>
+        </group>
+        <data id="200" name="channel" type="varString8" description="Channel name"/>
+    </sbe:message>
+
+    <!-- ============ templateId=17 : marketChange  (spot.pairs) ============ -->
+    <sbe:message name="marketChange" id="17" description="Trading pair add/remove (MarketChange)">
+        <field id="1" name="time" type="int64" description="Server send timestamp in microseconds"/>
+        <field id="2" name="e" type="Event" description="Event type"/>
+        <group id="100" name="newPairs" dimensionType="groupSize16Encoding" description="Added pairs (JSON: new)">
+            <data id="200" name="pair" type="varString8" description="Currency pair"/>
+        </group>
+        <group id="101" name="removedPairs" dimensionType="groupSize16Encoding" description="Removed pairs (JSON: removed)">
+            <data id="200" name="pair" type="varString8" description="Currency pair"/>
+        </group>
+        <data id="200" name="channel" type="varString8" description="Channel name"/>
+    </sbe:message>
+
+    <!-- 注：spot.apikey_change、spot.system 为系统类推送通道，已决策固定使用 JSON 文本帧、
+         不纳入 SBE、不分配 templateId。templateId 18 预留不使用。 -->
+
+</sbe:messageSchema>

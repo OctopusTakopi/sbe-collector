@@ -1,6 +1,7 @@
 //! Fixed-layout parts of Gate's SBE market-data schemas, schema id 1:
-//! `gate_spot_ws_v1.0.0.xml` for spot and `gate_fex_ws_v1.0.0.xml` for USDT
-//! futures (github.com/gate/gatews, `sbe/schemas/prod`).
+//! `schemas/gate_spot_ws_v1.0.0.xml` for spot and
+//! `schemas/gate_fex_ws_v1.0.0.xml` for USDT futures, as published in
+//! github.com/gate/gatews (`sbe/schemas/prod`).
 //!
 //! The two markets number their templates alike, with identical headers, over
 //! different layouts: futures' best bid/offer puts the ask first and its
