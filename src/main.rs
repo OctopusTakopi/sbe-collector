@@ -113,10 +113,6 @@ impl Hangup {
 /// A venue's collection, prepared before anything starts, so missing
 /// credentials or an unknown symbol stop the process before it takes the
 /// handover socket or opens a quality log.
-#[expect(
-    clippy::large_enum_variant,
-    reason = "one value, built once at startup"
-)]
 enum Venue {
     BinanceSbeSpot(binancesbespot::Subscription),
     OkxSbe(okxsbe::Subscription),

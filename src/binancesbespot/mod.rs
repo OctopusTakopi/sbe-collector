@@ -242,10 +242,11 @@ impl Ingest {
     }
 }
 
-/// What to collect, from the command line.
+/// What to collect, from the command line. Built before anything starts, so
+/// a missing or malformed key stops the process cleanly.
 pub struct Subscription {
+    endpoint: Endpoint,
     symbols: Vec<String>,
-    api_key: String,
     connections: usize,
 }
 
@@ -256,8 +257,8 @@ impl Subscription {
             anyhow::bail!("BINANCE_API_KEY env var must be set for the SBE stream endpoint");
         }
         Ok(Self {
+            endpoint: Endpoint::new(&STREAMS, symbols, &api_key)?,
             symbols: symbols.to_vec(),
-            api_key,
             connections,
         })
     }
@@ -271,11 +272,10 @@ pub async fn run_collection(
     readiness: Readiness,
 ) -> anyhow::Result<()> {
     let Subscription {
+        endpoint,
         symbols,
-        api_key,
         connections,
     } = subscription;
-    let endpoint = Arc::new(Endpoint::new(&STREAMS, &symbols, &api_key)?);
     let symbols: Vec<Symbol> = symbols
         .iter()
         .map(|symbol| Symbol::from(symbol.to_ascii_lowercase()))
@@ -291,7 +291,7 @@ pub async fn run_collection(
 
     let ws_rx = session::spawn_slots(
         &mut ingest.tasks,
-        endpoint,
+        Arc::new(endpoint),
         connections,
         &quality,
         &readiness,
