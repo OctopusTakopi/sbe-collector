@@ -131,38 +131,6 @@ pub struct Level {
     pub sz: I64LE,
 }
 
-/// Where a frame's variable-length data starts: past its root block and
-/// groups. It is the channel's name, then the instrument's.
-fn var_data(market: Market, frame: &[u8]) -> Option<usize> {
-    let (header, _) = MessageHeader::read_from_prefix(frame).ok()?;
-    let groups = match (market, header.template_id.get()) {
-        (_, TEMPLATE_BBO) | (Market::Spot, TEMPLATE_PUBLIC_TRADE) => 0,
-        (Market::Futures, TEMPLATE_PUBLIC_TRADE) => 1,
-        (_, TEMPLATE_OBU) => 2,
-        _ => return None,
-    };
-    let mut offset = size_of::<MessageHeader>() + usize::from(header.block_length.get());
-    for _ in 0..groups {
-        let group = read_group::<GroupSize16Encoding>(frame, &mut offset)?;
-        offset = offset.checked_add(group.count.checked_mul(group.stride)?)?;
-    }
-    Some(offset)
-}
-
-/// The pair or contract a frame is about, as Gate spells it (`BTC_USDT`).
-/// An `obu` frame names its stream, `ob.BTC_USDT.50`, and yields the middle.
-pub fn instrument(market: Market, frame: &[u8]) -> Option<&[u8]> {
-    let mut offset = var_data(market, frame)?;
-    var_str8(frame, &mut offset)?;
-    let name = var_str8(frame, &mut offset)?;
-    if frame.get(2..4)? != TEMPLATE_OBU.to_le_bytes() {
-        return Some(name);
-    }
-    let stream = name.strip_prefix(b"ob.")?;
-    let level = stream.iter().rposition(|&byte| byte == b'.')?;
-    Some(&stream[..level])
-}
-
 /// One `obu` frame's place in its stream's id chain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ObuLink<'a> {
@@ -173,26 +141,66 @@ pub struct ObuLink<'a> {
     pub last_id: i64,
 }
 
-/// The chain link of an `obu` frame; `None` for any other frame.
-pub fn obu_link(market: Market, frame: &[u8]) -> Option<ObuLink<'_>> {
+/// What a frame says about itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Route<'a> {
+    /// The pair or contract, as Gate spells it (`BTC_USDT`).
+    pub instrument: &'a [u8],
+    /// An `obu` frame's place in its stream's id chain.
+    pub obu: Option<ObuLink<'a>>,
+}
+
+/// Route a frame in one walk over it. Past the root block and the groups
+/// come the channel's name and then the instrument's; an `obu` frame names
+/// its stream, `ob.BTC_USDT.50`, whose middle is the pair.
+pub fn route(market: Market, frame: &[u8]) -> Option<Route<'_>> {
     let (header, body) = MessageHeader::read_from_prefix(frame).ok()?;
-    if header.template_id.get() != TEMPLATE_OBU {
-        return None;
+    let template_id = header.template_id.get();
+    let groups = match (market, template_id) {
+        (_, TEMPLATE_BBO) | (Market::Spot, TEMPLATE_PUBLIC_TRADE) => 0,
+        (Market::Futures, TEMPLATE_PUBLIC_TRADE) => 1,
+        (_, TEMPLATE_OBU) => 2,
+        _ => return None,
+    };
+    let mut offset = size_of::<MessageHeader>() + usize::from(header.block_length.get());
+    for _ in 0..groups {
+        let group = read_group::<GroupSize16Encoding>(frame, &mut offset)?;
+        offset = offset.checked_add(group.count.checked_mul(group.stride)?)?;
+    }
+    var_str8(frame, &mut offset)?;
+    let name = var_str8(frame, &mut offset)?;
+    if template_id != TEMPLATE_OBU {
+        return Some(Route {
+            instrument: name,
+            obu: None,
+        });
     }
     let (block, _) = ObuBlock::read_from_prefix(body).ok()?;
-    let mut offset = var_data(market, frame)?;
-    var_str8(frame, &mut offset)?;
-    Some(ObuLink {
-        stream: var_str8(frame, &mut offset)?,
-        full: block.full != 0,
-        first_id: block.first_id.get(),
-        last_id: block.last_id.get(),
+    let stream = name.strip_prefix(b"ob.")?;
+    let level = stream.iter().rposition(|&byte| byte == b'.')?;
+    Some(Route {
+        instrument: &stream[..level],
+        obu: Some(ObuLink {
+            stream: name,
+            full: block.full != 0,
+            first_id: block.first_id.get(),
+            last_id: block.last_id.get(),
+        }),
     })
+}
+
+/// The chain link of an `obu` frame; `None` for any other frame.
+pub fn obu_link(market: Market, frame: &[u8]) -> Option<ObuLink<'_>> {
+    route(market, frame)?.obu
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn instrument(market: Market, frame: &[u8]) -> Option<&[u8]> {
+        Some(route(market, frame)?.instrument)
+    }
 
     fn var(frame: &mut Vec<u8>, text: &str) {
         frame.push(text.len() as u8);

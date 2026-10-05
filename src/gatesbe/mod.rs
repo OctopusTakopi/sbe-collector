@@ -184,18 +184,19 @@ impl Ingest {
         let Ok((header, _)) = MessageHeader::read_from_prefix(&data) else {
             return Err(ConnectorError::ShortFrame { len: data.len() });
         };
-        let named = gate::instrument(self.market, &data);
-        let symbol = match named.and_then(|name| self.symbols.get(name)) {
+        let route = gate::route(self.market, &data);
+        let symbol = match route.and_then(|route| self.symbols.get(route.instrument)) {
             // Only a subscribed pair's book has one chain to follow.
             Some(symbol) => {
                 let symbol = Symbol::clone(symbol);
-                if let Some(link) = gate::obu_link(self.market, &data) {
+                if let Some(link) = route.and_then(|route| route.obu) {
                     self.check_book(&symbol, link);
                 }
                 symbol
             }
             None => {
-                self.report_unknown(named.unwrap_or_default(), header.template_id.get());
+                let named = route.map_or(&[][..], |route| route.instrument);
+                self.report_unknown(named, header.template_id.get());
                 Symbol::from("unknown")
             }
         };

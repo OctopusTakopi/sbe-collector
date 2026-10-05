@@ -324,9 +324,9 @@ fn print_gate_record(market: Market, nanos: i64, data: &[u8]) {
     };
     let template_id = header.template_id.get();
     let block_len = usize::from(header.block_length.get());
-    let name = gate::instrument(market, data).map_or_else(
+    let name = gate::route(market, data).map_or_else(
         || "unknown".into(),
-        |name| String::from_utf8_lossy(name).into_owned(),
+        |route| String::from_utf8_lossy(route.instrument).into_owned(),
     );
     let groups = size_of::<MessageHeader>() + block_len;
     match (market, template_id) {
