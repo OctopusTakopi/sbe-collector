@@ -6,10 +6,11 @@
 //!
 //! # Key
 //!
-//! The frame minus [`EVENT_TIME`]. Binance stamps `eventTime` when it
-//! serialises for a particular connection: redundant connections receive one
-//! event with stamps 18-37 us apart (measured on live spot data), so a
-//! whole-frame key recognises nothing. The rest still separates distinct
+//! The frame minus the bytes its venue stamps per connection
+//! ([`Exchange::stamp`], hashed by [`event_key`]). Binance stamps `eventTime`
+//! when it serialises for a particular connection: redundant connections
+//! receive one event with stamps 18-37 us apart (measured on live spot data),
+//! so a whole-frame key recognises nothing. The rest still separates distinct
 //! events: depth diffs carry their update id range, depth snapshots and
 //! bestBidAsk an update id, trades a transact time and trade ids. On a
 //! single-connection recording, where every frame is distinct, 11,446 frames
@@ -39,7 +40,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use sbe_collector::sbe_types::EVENT_TIME;
+use sbe_collector::{exchange::Exchange, sbe::event_key};
 use tracing::{info, warn};
 
 /// How far back duplicates are remembered: the delivery skew between
@@ -75,6 +76,8 @@ const CLOCK_CHECK_INTERVAL: u32 = 1_024;
 pub struct Dedup {
     /// Checked before hashing, so a disabled filter costs one branch.
     enabled: bool,
+    /// Whose per-connection stamps the key leaves out.
+    exchange: Exchange,
     current: HashSet<u128>,
     previous: HashSet<u128>,
     window: Duration,
@@ -89,12 +92,12 @@ pub struct Dedup {
 
 impl Dedup {
     /// A no-op filter, for a single connection.
-    pub fn disabled() -> Self {
-        Self::build(false, DEDUP_WINDOW, DEDUP_MAX_ENTRIES)
+    pub fn disabled(exchange: Exchange) -> Self {
+        Self::build(false, exchange, DEDUP_WINDOW, DEDUP_MAX_ENTRIES)
     }
 
-    pub fn new(window: Duration, max_entries: usize) -> Self {
-        Self::build(true, window, max_entries)
+    pub fn new(exchange: Exchange, window: Duration, max_entries: usize) -> Self {
+        Self::build(true, exchange, window, max_entries)
     }
 
     /// Enabled only when more than one connection can deliver the same frame.
@@ -104,18 +107,19 @@ impl Dedup {
     /// unconditionally would silently drop every timer-pushed snapshot that
     /// repeats while the book sits still. A repeat can be discarded when the
     /// recording is read; a frame never written cannot be recovered.
-    pub fn for_connections(connections: usize) -> Self {
+    pub fn for_connections(connections: usize, exchange: Exchange) -> Self {
         if connections > 1 {
-            Self::new(DEDUP_WINDOW, DEDUP_MAX_ENTRIES)
+            Self::new(exchange, DEDUP_WINDOW, DEDUP_MAX_ENTRIES)
         } else {
-            Self::disabled()
+            Self::disabled(exchange)
         }
     }
 
-    fn build(enabled: bool, window: Duration, max_entries: usize) -> Self {
+    fn build(enabled: bool, exchange: Exchange, window: Duration, max_entries: usize) -> Self {
         let now = Instant::now();
         Self {
             enabled,
+            exchange,
             current: HashSet::new(),
             previous: HashSet::new(),
             window,
@@ -129,21 +133,9 @@ impl Dedup {
         }
     }
 
-    /// The frame without its [`EVENT_TIME`] stamp. A frame too short to hold
-    /// one is hashed whole: keeping an unknown frame twice is recoverable,
-    /// dropping a real one is not.
-    fn key(frame: &[u8]) -> u128 {
-        if frame.len() < EVENT_TIME.end {
-            return xxhash_rust::xxh3::xxh3_128(frame);
-        }
-        // The 8 header bytes seed the hash instead of feeding a streaming
-        // hasher: they separate templates exactly as hashing them would.
-        let header = u64::from_le_bytes(
-            frame[..EVENT_TIME.start]
-                .try_into()
-                .expect("EVENT_TIME starts at 8, the width of the message header"),
-        );
-        xxhash_rust::xxh3::xxh3_128_with_seed(&frame[EVENT_TIME.end..], header)
+    /// The frame without its venue's per-connection stamp.
+    fn key(&self, frame: &[u8]) -> u128 {
+        event_key(frame, self.exchange.frame_stamp(frame))
     }
 
     /// True if this frame's event was already seen inside the window. A
@@ -160,11 +152,7 @@ impl Dedup {
             self.maintain();
         }
 
-        // 128 bits: at the ceiling, a collision inside one window has
-        // probability around 2^-85. A 64-bit key would be roughly 2^-21 per
-        // window, a coin flip over a year, and a collision silently discards
-        // a real frame.
-        let key = Self::key(frame);
+        let key = self.key(frame);
         if self.previous.contains(&key) || !self.current.insert(key) {
             self.duplicate += 1;
             true
@@ -229,6 +217,8 @@ impl Dedup {
 mod tests {
     use super::*;
 
+    const BINANCE: Exchange = Exchange::BinanceSbeSpot;
+
     /// An SBE frame with the real field order: 8-byte message header,
     /// `eventTime`, the block's identifying fields, then the symbol. Keeping
     /// `event_time` separate keeps the discriminator out of the field real
@@ -251,7 +241,7 @@ mod tests {
 
     #[test]
     fn copies_differing_only_in_event_time_are_duplicates() {
-        let mut dedup = Dedup::new(DEDUP_WINDOW, DEDUP_MAX_ENTRIES);
+        let mut dedup = Dedup::new(BINANCE, DEDUP_WINDOW, DEDUP_MAX_ENTRIES);
         let first = frame_at(10_003, 1_785_046_950_114_506, 42);
         let second = frame_at(10_003, 1_785_046_950_114_469, 42);
 
@@ -266,7 +256,7 @@ mod tests {
     /// Excluding the event time must not blur distinct events together.
     #[test]
     fn distinct_events_sharing_an_event_time_are_both_kept() {
-        let mut dedup = Dedup::new(DEDUP_WINDOW, DEDUP_MAX_ENTRIES);
+        let mut dedup = Dedup::new(BINANCE, DEDUP_WINDOW, DEDUP_MAX_ENTRIES);
 
         assert!(!dedup.is_duplicate(&frame_at(10_003, 1_000, 1)));
         assert!(!dedup.is_duplicate(&frame_at(10_003, 1_000, 2)));
@@ -275,7 +265,7 @@ mod tests {
 
     #[test]
     fn a_runt_frame_is_handled_whole() {
-        let mut dedup = Dedup::new(DEDUP_WINDOW, DEDUP_MAX_ENTRIES);
+        let mut dedup = Dedup::new(BINANCE, DEDUP_WINDOW, DEDUP_MAX_ENTRIES);
 
         assert!(!dedup.is_duplicate(b"\x00\x01\x02"));
         assert!(dedup.is_duplicate(b"\x00\x01\x02"));
@@ -284,7 +274,7 @@ mod tests {
 
     #[test]
     fn a_repeated_frame_is_reported_once() {
-        let mut dedup = Dedup::new(DEDUP_WINDOW, DEDUP_MAX_ENTRIES);
+        let mut dedup = Dedup::new(BINANCE, DEDUP_WINDOW, DEDUP_MAX_ENTRIES);
         let frame = frame(10_001, 42);
 
         assert!(!dedup.is_duplicate(&frame));
@@ -294,7 +284,7 @@ mod tests {
 
     #[test]
     fn distinct_frames_are_all_kept() {
-        let mut dedup = Dedup::new(DEDUP_WINDOW, DEDUP_MAX_ENTRIES);
+        let mut dedup = Dedup::new(BINANCE, DEDUP_WINDOW, DEDUP_MAX_ENTRIES);
 
         for update_id in 0..1_000 {
             assert!(
@@ -307,7 +297,7 @@ mod tests {
     /// Frames that differ only in template id are different events.
     #[test]
     fn the_whole_frame_is_the_key() {
-        let mut dedup = Dedup::new(DEDUP_WINDOW, DEDUP_MAX_ENTRIES);
+        let mut dedup = Dedup::new(BINANCE, DEDUP_WINDOW, DEDUP_MAX_ENTRIES);
 
         assert!(!dedup.is_duplicate(&frame(10_001, 1)));
         assert!(!dedup.is_duplicate(&frame(10_002, 1)));
@@ -315,7 +305,7 @@ mod tests {
 
     #[test]
     fn a_disabled_filter_never_reports_a_duplicate() {
-        let mut dedup = Dedup::disabled();
+        let mut dedup = Dedup::disabled(BINANCE);
         let frame = frame(10_001, 1);
 
         assert!(!dedup.is_duplicate(&frame));
@@ -325,15 +315,15 @@ mod tests {
 
     #[test]
     fn redundancy_is_only_engaged_for_more_than_one_connection() {
-        assert!(!Dedup::for_connections(1).enabled);
-        assert!(Dedup::for_connections(2).enabled);
+        assert!(!Dedup::for_connections(1, BINANCE).enabled);
+        assert!(Dedup::for_connections(2, BINANCE).enabled);
     }
 
     /// A key stays known across one rotation, so the window is never shorter
     /// than advertised.
     #[test]
     fn a_key_survives_one_rotation() {
-        let mut dedup = Dedup::new(Duration::ZERO, DEDUP_MAX_ENTRIES);
+        let mut dedup = Dedup::new(BINANCE, Duration::ZERO, DEDUP_MAX_ENTRIES);
         let frame = frame(10_001, 1);
 
         assert!(!dedup.is_duplicate(&frame));
@@ -344,7 +334,7 @@ mod tests {
     /// Memory is bounded by the entry ceiling even if the window never elapses.
     #[test]
     fn the_entry_ceiling_forces_a_rotation() {
-        let mut dedup = Dedup::new(Duration::from_secs(3_600), 16);
+        let mut dedup = Dedup::new(BINANCE, Duration::from_secs(3_600), 16);
 
         for update_id in 0..64 {
             assert!(
@@ -359,7 +349,7 @@ mod tests {
 
     #[test]
     fn a_ceiling_forced_rotation_is_reported() {
-        let mut dedup = Dedup::new(Duration::from_secs(3_600), 16);
+        let mut dedup = Dedup::new(BINANCE, Duration::from_secs(3_600), 16);
         assert!(dedup.last_ceiling_warning.is_none());
 
         for update_id in 0..64 {
@@ -375,7 +365,7 @@ mod tests {
     /// A timed rotation is the normal path and must stay quiet.
     #[test]
     fn a_timed_rotation_is_not_reported() {
-        let mut dedup = Dedup::new(Duration::ZERO, DEDUP_MAX_ENTRIES);
+        let mut dedup = Dedup::new(BINANCE, Duration::ZERO, DEDUP_MAX_ENTRIES);
 
         dedup.is_duplicate(&frame(10_001, 1));
         dedup.maintain();
@@ -385,7 +375,7 @@ mod tests {
 
     #[test]
     fn duplicate_and_unique_counts_are_tracked() {
-        let mut dedup = Dedup::new(DEDUP_WINDOW, DEDUP_MAX_ENTRIES);
+        let mut dedup = Dedup::new(BINANCE, DEDUP_WINDOW, DEDUP_MAX_ENTRIES);
 
         dedup.is_duplicate(&frame(10_001, 1));
         dedup.is_duplicate(&frame(10_001, 2));

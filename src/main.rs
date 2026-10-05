@@ -12,8 +12,9 @@ mod ws;
 
 use std::{path::PathBuf, time::Duration};
 
-use anyhow::{anyhow, bail};
-use clap::{Parser, ValueEnum};
+use anyhow::{Context, anyhow, bail};
+use clap::Parser;
+use sbe_collector::exchange::Exchange;
 use tokio::{
     select, signal,
     sync::{mpsc, oneshot, watch},
@@ -32,22 +33,6 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the handover supervisor gets at exit: to deliver the drain
 /// report after a takeover, or to release the socket otherwise.
 const HANDOVER_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-enum Exchange {
-    #[value(name = "binancesbespot")]
-    BinanceSbeSpot,
-}
-
-impl Exchange {
-    /// As spelled on the command line; the handover identity compares it
-    /// verbatim with the incumbent's.
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::BinanceSbeSpot => "binancesbespot",
-        }
-    }
-}
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Binance SBE stream collector")]
@@ -149,6 +134,13 @@ async fn main() -> anyhow::Result<()> {
     }
 
     std::fs::create_dir_all(&args.path)?;
+    args.exchange.claim(&args.path).with_context(|| {
+        format!(
+            "cannot record {} into {}",
+            args.exchange.as_str(),
+            args.path.display()
+        )
+    })?;
     let run_id = format!(
         "{}-{}",
         jiff::Timestamp::now().as_nanosecond(),
@@ -428,13 +420,5 @@ mod tests {
         assert_eq!(Hangup::for_disposition(libc::SIG_DFL), Hangup::Drain);
         let handler = only_an_ignored_sighup_stays_ignored as fn() as libc::sighandler_t;
         assert_eq!(Hangup::for_disposition(handler), Hangup::Drain);
-    }
-
-    /// The handover identity carries the CLI spelling, so it must round-trip.
-    #[test]
-    fn exchange_names_are_the_cli_spelling() {
-        for exchange in Exchange::value_variants() {
-            assert_eq!(Exchange::from_str(exchange.as_str(), false), Ok(*exchange));
-        }
     }
 }

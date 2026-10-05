@@ -1,20 +1,28 @@
 //! Print the records of `.zst` files written by sbe-collector.
 //!
-//! Usage: `reader <file.zst> [<file2.zst> ...]`
+//! Usage: `reader [--exchange <name>] <file.zst> [<file2.zst> ...]`
+//!
+//! A file's exchange is its directory's `_exchange` marker, or Binance spot
+//! for a directory recorded before markers existed; `--exchange` overrides.
 
 use std::{
-    env,
     fs::File,
     io::{self, BufReader, Read},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
+use clap::Parser;
 use sbe_collector::{
+    exchange::Exchange,
     record::{HEADER_LEN, Header, Tag},
-    sbe_types::{
-        BestBidAskBlock, DepthDiffBlock, DepthEntry, DepthSnapshotBlock, GroupSize16Encoding,
-        GroupSizeEncoding, MessageHeader, TEMPLATE_BEST_BID_ASK, TEMPLATE_DEPTH_DIFF,
-        TEMPLATE_DEPTH_SNAPSHOT, TEMPLATE_TRADES, TradeEntry, TradesBlock,
+    sbe::{
+        GroupSize16Encoding, MessageHeader,
+        binance::{
+            BestBidAskBlock, DepthDiffBlock, DepthEntry, DepthSnapshotBlock, GroupSizeEncoding,
+            TEMPLATE_BEST_BID_ASK, TEMPLATE_DEPTH_DIFF, TEMPLATE_DEPTH_SNAPSHOT, TEMPLATE_TRADES,
+            TradeEntry, TradesBlock,
+        },
+        read_group,
     },
 };
 use serde_json::Value;
@@ -24,16 +32,31 @@ use zstd::stream::read::Decoder as ZstdDecoder;
 /// Entries printed per group before `...`.
 const SHOWN: usize = 5;
 
+#[derive(Parser)]
+#[command(
+    version,
+    about = "Print the records of sbe-collector's recording files"
+)]
+struct Args {
+    /// Decode as this exchange instead of the one the file's directory names.
+    #[arg(long)]
+    exchange: Option<Exchange>,
+
+    /// Recording files to print.
+    #[arg(required = true)]
+    files: Vec<PathBuf>,
+}
+
 fn main() {
-    let files: Vec<String> = env::args().skip(1).collect();
-    if files.is_empty() {
-        eprintln!("Usage: reader <file.zst> [<file2.zst> ...]");
-        std::process::exit(1);
-    }
-    for path in &files {
-        println!("=== {path} ===");
-        if let Err(error) = read_file(Path::new(path)) {
-            eprintln!("Error reading {path}: {error}");
+    let args = Args::parse();
+    for path in &args.files {
+        println!("=== {} ===", path.display());
+        let exchange = match args.exchange {
+            Some(exchange) => Ok(exchange),
+            None => Exchange::of_recordings_in(path.parent().unwrap_or(Path::new("."))),
+        };
+        if let Err(error) = exchange.and_then(|exchange| read_file(path, exchange)) {
+            eprintln!("Error reading {}: {error}", path.display());
         }
     }
 }
@@ -45,7 +68,7 @@ struct Counts {
     rest: usize,
 }
 
-fn read_file(path: &Path) -> io::Result<()> {
+fn read_file(path: &Path, exchange: Exchange) -> io::Result<()> {
     let decoder = ZstdDecoder::new(BufReader::new(File::open(path)?))?;
     let mut reader = BufReader::new(decoder);
     let mut header = [0u8; HEADER_LEN];
@@ -64,11 +87,15 @@ fn read_file(path: &Path) -> io::Result<()> {
         match Tag::from_byte(tag) {
             Some(Tag::Rest) => {
                 counts.rest += 1;
-                print_rest_record(recv_ns, &payload);
+                match exchange {
+                    Exchange::BinanceSbeSpot => print_rest_record(recv_ns, &payload),
+                }
             }
             Some(Tag::Sbe) => {
                 counts.sbe += 1;
-                print_sbe_record(recv_ns, &payload);
+                match exchange {
+                    Exchange::BinanceSbeSpot => print_sbe_record(recv_ns, &payload),
+                }
             }
             None => println!("[{recv_ns}] unknown tag: 0x{tag:02x}, payload_len={len}"),
         }
@@ -254,45 +281,6 @@ fn print_depth_levels(
             println!("    ...");
         }
     }
-}
-
-/// A repeating group: `count` entries of `stride` bytes each. The stride is
-/// the wire `blockLength`, not a struct size: a newer schema version appends
-/// fields to entries.
-#[derive(Default)]
-struct Group {
-    count: usize,
-    stride: usize,
-}
-
-/// A group dimension composite.
-trait Dimension: FromBytes {
-    fn group(&self) -> Group;
-}
-
-impl Dimension for GroupSizeEncoding {
-    fn group(&self) -> Group {
-        Group {
-            count: self.num_in_group.get() as usize,
-            stride: usize::from(self.block_length.get()),
-        }
-    }
-}
-
-impl Dimension for GroupSize16Encoding {
-    fn group(&self) -> Group {
-        Group {
-            count: usize::from(self.num_in_group.get()),
-            stride: usize::from(self.block_length.get()),
-        }
-    }
-}
-
-/// The group dimension at `*offset`, stepping past it.
-fn read_group<D: Dimension>(data: &[u8], offset: &mut usize) -> Option<Group> {
-    let (dimension, _) = D::read_from_prefix(data.get(*offset..)?).ok()?;
-    *offset += size_of::<D>();
-    Some(dimension.group())
 }
 
 /// The symbol the stream bridge appends to every frame as a `VarString8`.

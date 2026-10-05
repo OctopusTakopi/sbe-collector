@@ -22,6 +22,10 @@
 //!
 //! Sequence state carries across a series' files, so a break straddling the
 //! rotation is attributed correctly.
+//!
+//! A series is decoded as the exchange its directory's `_exchange` marker
+//! names, or Binance spot for a directory recorded before markers existed;
+//! `--exchange` overrides.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
@@ -40,11 +44,15 @@ use anyhow::{Context as _, Result};
 use clap::Parser;
 use jiff::{Span, Timestamp, civil, tz::TimeZone};
 use sbe_collector::{
+    exchange::Exchange,
     record::{HEADER_LEN, Header, Tag},
-    sbe_types::{
-        BestBidAskBlock, DepthDiffBlock, EVENT_TIME, GroupSizeEncoding, MessageHeader,
-        TEMPLATE_BEST_BID_ASK, TEMPLATE_DEPTH_DIFF, TEMPLATE_DEPTH_SNAPSHOT, TEMPLATE_TRADES,
-        TradesBlock,
+    sbe::{
+        MessageHeader,
+        binance::{
+            BestBidAskBlock, DepthDiffBlock, GroupSizeEncoding, TEMPLATE_BEST_BID_ASK,
+            TEMPLATE_DEPTH_DIFF, TEMPLATE_DEPTH_SNAPSHOT, TEMPLATE_TRADES, TradesBlock,
+        },
+        event_key,
     },
 };
 use zerocopy::FromBytes;
@@ -95,6 +103,11 @@ struct Args {
     /// Exit with status 1 if any gap, sequence break, or decode error is found.
     #[arg(long)]
     fail_on_gaps: bool,
+
+    /// Decode every series as this exchange instead of the one its directory
+    /// names.
+    #[arg(long)]
+    exchange: Option<Exchange>,
 }
 
 /// A recording file, as its name describes it.
@@ -110,11 +123,13 @@ struct DatedFile {
 struct Series {
     key: String,
     files: Vec<DatedFile>,
+    exchange: Exchange,
 }
 
 /// Discover daily files, handover sidecars and legacy segments under the
-/// roots, grouped into per-(directory, symbol) series in recording order.
-fn discover(roots: &[PathBuf]) -> Result<Vec<Series>> {
+/// roots, grouped into per-(directory, symbol) series in recording order,
+/// each with the exchange to decode it as.
+fn discover(roots: &[PathBuf], exchange: Option<Exchange>) -> Result<Vec<Series>> {
     let mut map: BTreeMap<(PathBuf, String), Vec<DatedFile>> = BTreeMap::new();
     let mut stack: Vec<PathBuf> = Vec::new();
     for root in roots {
@@ -156,23 +171,32 @@ fn discover(roots: &[PathBuf]) -> Result<Vec<Series>> {
         );
     }
 
-    let mut series: Vec<Series> = map
-        .into_iter()
-        .map(|((dir, symbol), mut files)| {
-            files.sort_by(|a, b| {
-                (a.date, a.segment_start_ns, &a.run_id, &a.path).cmp(&(
-                    b.date,
-                    b.segment_start_ns,
-                    &b.run_id,
-                    &b.path,
-                ))
-            });
-            Series {
-                key: format!("{}/{symbol}", dir.display()),
-                files,
+    let mut exchanges: HashMap<PathBuf, Exchange> = HashMap::new();
+    let mut series: Vec<Series> = Vec::with_capacity(map.len());
+    for ((dir, symbol), mut files) in map {
+        files.sort_by(|a, b| {
+            (a.date, a.segment_start_ns, &a.run_id, &a.path).cmp(&(
+                b.date,
+                b.segment_start_ns,
+                &b.run_id,
+                &b.path,
+            ))
+        });
+        let exchange = match (exchange, exchanges.get(&dir)) {
+            (Some(exchange), _) | (None, Some(&exchange)) => exchange,
+            (None, None) => {
+                let exchange = Exchange::of_recordings_in(&dir)
+                    .with_context(|| format!("cannot tell the exchange of {}", dir.display()))?;
+                exchanges.insert(dir.clone(), exchange);
+                exchange
             }
-        })
-        .collect();
+        };
+        series.push(Series {
+            key: format!("{}/{symbol}", dir.display()),
+            files,
+            exchange,
+        });
+    }
     series.sort_by(|a, b| a.key.cmp(&b.key));
     Ok(series)
 }
@@ -393,6 +417,7 @@ impl Gap {
 
 #[derive(Default)]
 struct SeriesScan {
+    exchange: Exchange,
     exact: bool,
     rows: u64,
     sbe_records: u64,
@@ -438,13 +463,15 @@ impl SeriesScan {
         match tag {
             Tag::Sbe => {
                 self.sbe_records += 1;
-                self.sbe_payload(recv, payload);
+                match self.exchange {
+                    Exchange::BinanceSbeSpot => self.binance_payload(recv, payload),
+                }
             }
             Tag::Rest => self.rest_records += 1,
         }
     }
 
-    fn sbe_payload(&mut self, recv: i64, payload: &[u8]) {
+    fn binance_payload(&mut self, recv: i64, payload: &[u8]) {
         let Ok((header, body)) = MessageHeader::read_from_prefix(payload) else {
             self.bad_records += 1;
             return;
@@ -688,9 +715,9 @@ impl RecvSpan {
     }
 }
 
-/// The live collector's event identity: Binance stamps SBE `eventTime` per
-/// connection, so the same event from two rolling processes differs only
-/// there and must still collapse to one record.
+/// The live collector's event identity: a venue stamps some bytes of a
+/// stream frame per connection, so the same event from two rolling processes
+/// differs only there and must still collapse to one record.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct OverlapKey {
     tag: Tag,
@@ -698,18 +725,15 @@ struct OverlapKey {
 }
 
 impl OverlapKey {
-    fn of(tag: Tag, payload: &[u8]) -> Self {
-        let hash = if tag != Tag::Sbe || payload.len() < EVENT_TIME.end {
-            xxhash_rust::xxh3::xxh3_128(payload)
-        } else {
-            let header = u64::from_le_bytes(
-                payload[..EVENT_TIME.start]
-                    .try_into()
-                    .expect("the 8-byte SBE header"),
-            );
-            xxhash_rust::xxh3::xxh3_128_with_seed(&payload[EVENT_TIME.end..], header)
+    fn of(exchange: Exchange, tag: Tag, payload: &[u8]) -> Self {
+        let stamp = match tag {
+            Tag::Sbe => exchange.frame_stamp(payload),
+            Tag::Rest => None,
         };
-        Self { tag, hash }
+        Self {
+            tag,
+            hash: event_key(payload, stamp),
+        }
     }
 }
 
@@ -736,7 +760,7 @@ fn process_overlapping(scan: &mut SeriesScan, mut records: Vec<RawRecord>, min_g
     let mut unpaired: HashMap<OverlapKey, VecDeque<Unpaired>> = HashMap::new();
     for record in records {
         let queue = unpaired
-            .entry(OverlapKey::of(record.tag, &record.payload))
+            .entry(OverlapKey::of(scan.exchange, record.tag, &record.payload))
             .or_default();
         while queue.front().is_some_and(|earlier| {
             earlier.recv < record.recv.saturating_sub(OVERLAP_DEDUP_WINDOW_NS)
@@ -769,6 +793,7 @@ fn process_overlapping(scan: &mut SeriesScan, mut records: Vec<RawRecord>, min_g
 
 fn scan_series(series: &Series, min_gap_ns: i64, exact: bool) -> SeriesReport {
     let mut scan = SeriesScan {
+        exchange: series.exchange,
         exact,
         ..SeriesScan::default()
     };
@@ -1152,7 +1177,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let min_gap_ns = (args.min_gap.max(0.0) * 1e9) as i64;
 
-    let mut series = discover(&args.paths)?;
+    let mut series = discover(&args.paths, args.exchange)?;
     if let Some(filter) = &args.filter {
         series.retain(|s| s.key.contains(filter));
     }
@@ -1231,6 +1256,7 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sbe_collector::sbe::binance::EVENT_TIME;
     use std::io::Write;
 
     fn test_dir(tag: &str) -> PathBuf {
@@ -1263,6 +1289,7 @@ mod tests {
 
     fn daily(path: PathBuf, date: civil::Date) -> Series {
         Series {
+            exchange: Exchange::BinanceSbeSpot,
             key: "test/btcusdt".into(),
             files: vec![DatedFile {
                 symbol: "btcusdt".into(),

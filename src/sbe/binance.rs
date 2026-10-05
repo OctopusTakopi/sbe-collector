@@ -2,12 +2,9 @@
 
 use std::ops::Range;
 
-use zerocopy::byteorder::LittleEndian;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
-type U16LE = zerocopy::byteorder::U16<LittleEndian>;
-type U32LE = zerocopy::byteorder::U32<LittleEndian>;
-type I64LE = zerocopy::byteorder::I64<LittleEndian>;
+use super::{Dimension, Group, I64LE, U16LE, U32LE};
 
 pub const TEMPLATE_TRADES: u16 = 10000;
 pub const TEMPLATE_BEST_BID_ASK: u16 = 10001;
@@ -18,17 +15,9 @@ pub const TEMPLATE_DEPTH_DIFF: u16 = 10003;
 /// above, right behind the 8-byte message header.
 pub const EVENT_TIME: Range<usize> = 8..16;
 
-#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned, Debug, Copy, Clone)]
-#[repr(C)]
-pub struct MessageHeader {
-    pub block_length: U16LE,
-    pub template_id: U16LE,
-    pub schema_id: U16LE,
-    pub version: U16LE,
-}
-
 /// `groupSizeEncoding`, the trades group's dimension: a `uint32` count, so
-/// 6 bytes. Mistaking it for [`GroupSize16Encoding`] shifts every later field.
+/// 6 bytes. Mistaking it for [`super::GroupSize16Encoding`], the depth groups'
+/// dimension, shifts every later field.
 #[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned, Debug, Copy, Clone)]
 #[repr(C)]
 pub struct GroupSizeEncoding {
@@ -36,13 +25,13 @@ pub struct GroupSizeEncoding {
     pub num_in_group: U32LE,
 }
 
-/// `groupSize16Encoding`, the depth groups' dimension: a `uint16` count, so
-/// 4 bytes.
-#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned, Debug, Copy, Clone)]
-#[repr(C)]
-pub struct GroupSize16Encoding {
-    pub block_length: U16LE,
-    pub num_in_group: U16LE,
+impl Dimension for GroupSizeEncoding {
+    fn group(&self) -> Group {
+        Group {
+            count: self.num_in_group.get() as usize,
+            stride: usize::from(self.block_length.get()),
+        }
+    }
 }
 
 /// `TradesStreamEvent` fixed block (18 bytes), followed by the trades group
@@ -119,15 +108,13 @@ mod tests {
 
     #[test]
     fn wire_sizes_match_the_schema() {
-        assert_eq!(size_of::<MessageHeader>(), 8);
         assert_eq!(size_of::<GroupSizeEncoding>(), 6);
-        assert_eq!(size_of::<GroupSize16Encoding>(), 4);
         assert_eq!(size_of::<TradesBlock>(), 18);
         assert_eq!(size_of::<TradeEntry>(), 25);
         assert_eq!(size_of::<BestBidAskBlock>(), 50);
         assert_eq!(size_of::<DepthSnapshotBlock>(), 18);
         assert_eq!(size_of::<DepthDiffBlock>(), 26);
         assert_eq!(size_of::<DepthEntry>(), 16);
-        assert_eq!(EVENT_TIME.start, size_of::<MessageHeader>());
+        assert_eq!(EVENT_TIME.start, size_of::<crate::sbe::MessageHeader>());
     }
 }

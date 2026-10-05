@@ -13,8 +13,12 @@ use tracing::{error, warn};
 use zerocopy::FromBytes;
 
 use sbe_collector::{
+    exchange::Exchange,
     record::Tag,
-    sbe_types::{DepthDiffBlock, MessageHeader, TEMPLATE_DEPTH_DIFF},
+    sbe::{
+        MessageHeader,
+        binance::{DepthDiffBlock, TEMPLATE_DEPTH_DIFF},
+    },
 };
 
 use crate::{
@@ -119,7 +123,7 @@ impl Ingest {
             writer_tx,
             symbols: SymbolMatcher::new(symbols),
             last_update_ids: HashMap::new(),
-            dedup: Dedup::for_connections(connections),
+            dedup: Dedup::for_connections(connections, Exchange::BinanceSbeSpot),
             snapshots,
             quality,
             tasks: JoinSet::new(),
@@ -294,7 +298,7 @@ pub async fn run_collection(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sbe_collector::sbe_types::EVENT_TIME;
+    use sbe_collector::sbe::binance::EVENT_TIME;
     use tokio::sync::mpsc::{Receiver, channel};
 
     #[test]
