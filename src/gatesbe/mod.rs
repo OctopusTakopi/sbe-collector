@@ -186,21 +186,27 @@ impl Ingest {
         };
         let named = gate::instrument(self.market, &data);
         let symbol = match named.and_then(|name| self.symbols.get(name)) {
-            Some(symbol) => Symbol::clone(symbol),
+            // Only a subscribed pair's book has one chain to follow.
+            Some(symbol) => {
+                let symbol = Symbol::clone(symbol);
+                if let Some(link) = gate::obu_link(self.market, &data) {
+                    self.check_book(&symbol, link);
+                }
+                symbol
+            }
             None => {
                 self.report_unknown(named.unwrap_or_default(), header.template_id.get());
                 Symbol::from("unknown")
             }
         };
-        if let Some(link) = gate::obu_link(self.market, &data) {
-            self.check_book(&symbol, link);
-        }
         self.write(recv_time, symbol, data).await
     }
 
-    /// Report a hole in `symbol`'s merged book stream: an id no connection
-    /// delivered. Each connection that missed it replaces itself from a fresh
-    /// snapshot; this only records that the hole happened.
+    /// Report a hole in `symbol`'s merged book stream when a delta jumps past
+    /// the ids recorded so far. A lagging connection may still deliver them:
+    /// as with Binance's depth check, this records the moment the hole was
+    /// real, and `gap_detector`'s count of the file says whether it stayed.
+    /// Each connection that missed ids replaces itself from a fresh snapshot.
     ///
     /// A delta ending at or below the mark is covered ground, a straggler
     /// from a lagging connection. A snapshot never lowers the mark: one from
@@ -403,14 +409,21 @@ mod tests {
         assert_eq!(ingest.marks["btc_usdt"], 120);
     }
 
+    /// Unsubscribed streams share the `unknown` file, not a book chain: their
+    /// unrelated ids must not read as holes in one another.
     #[tokio::test]
     async fn an_unsubscribed_pair_goes_to_unknown_and_is_reported_once() {
         let (quality, events) = QualityReporter::test_channel();
         let (mut ingest, mut writer_rx) = ingest(quality);
 
-        for last_id in [9, 10] {
+        for (pair, first_id, last_id) in [
+            ("XRP_USDT", 9, 10),
+            ("XRP_USDT", 11, 12),
+            ("SOL_USDT", 500, 501),
+            ("XRP_USDT", 13, 13),
+        ] {
             ingest
-                .handle(Timestamp::now(), obu("XRP_USDT", true, 0, last_id, 1))
+                .handle(Timestamp::now(), obu(pair, false, first_id, last_id, 1))
                 .await
                 .unwrap();
         }
@@ -420,8 +433,9 @@ mod tests {
                 .iter()
                 .all(|record| &*record.symbol == "unknown")
         );
-        assert!(events.try_recv().is_ok());
-        assert!(events.try_recv().is_err(), "one report per name");
+        let reports: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert_eq!(reports.len(), 2, "one report per name, no book gaps");
+        assert!(ingest.marks.is_empty());
     }
 
     #[test]
