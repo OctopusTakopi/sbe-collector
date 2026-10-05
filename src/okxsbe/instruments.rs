@@ -7,6 +7,8 @@ use anyhow::{Context, bail};
 use serde::Deserialize;
 use tracing::warn;
 
+use crate::file::Symbol;
+
 const INSTRUMENTS_URL: &str = "https://www.okx.com/api/v5/public/instruments";
 
 /// An instrument to record.
@@ -15,6 +17,13 @@ pub(crate) struct Instrument {
     pub(crate) inst_id: String,
     /// What the stream calls it. Changes if the instrument is relisted.
     pub(crate) code: i64,
+}
+
+impl Instrument {
+    /// The name of its files: the instId, lowercase.
+    pub(crate) fn symbol(&self) -> Symbol {
+        Symbol::from(self.inst_id.to_ascii_lowercase())
+    }
 }
 
 /// Look every instId up, failing on the first OKX does not know. One small

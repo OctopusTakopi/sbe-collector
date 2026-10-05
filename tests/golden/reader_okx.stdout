@@ -5,5 +5,17 @@
 [1785542400000000003] S template=1001 code=3 block_len=42 total=50b
 [1785542400000000004] S <too short: 5 bytes>
 [1785542407000000000] S BBO_TBT code=3 bid=85775.700000x0.847441 ask=85775.800000x0.166942 orders=6/19 seq=105 t=1785542407000000
-[1785542407000000001] R 8 bytes
---- total: 7 records (6 SBE stream, 1 REST snapshot) ---
+[1785542407000000001] R SNAPSHOT_DEPTH code=3 seq=105 t=1785542407000500
+  Asks (3):
+    85775.800000 @ 0.100000 (1 orders)
+    85775.900000 @ 0.200000 (2 orders)
+    85776.000000 @ 0.300000 (3 orders)
+  Bids (7):
+    85775.700000 @ 0.100000 (1 orders)
+    85775.600000 @ 0.200000 (2 orders)
+    85775.500000 @ 0.300000 (3 orders)
+    85775.400000 @ 0.400000 (4 orders)
+    85775.300000 @ 0.500000 (5 orders)
+    ...
+[1785542407000000002] R <38 bytes, not a book snapshot>
+--- total: 8 records (6 SBE stream, 2 REST snapshot) ---

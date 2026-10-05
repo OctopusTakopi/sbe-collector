@@ -1,5 +1,6 @@
 mod instruments;
 mod protocol;
+mod snapshot;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -32,6 +33,7 @@ use crate::{
 };
 use instruments::Instrument;
 use protocol::{Credentials, Okx};
+use snapshot::Snapshots;
 
 /// Channels subscribed per instrument.
 ///
@@ -80,7 +82,7 @@ struct Ingest {
     unknown: HashSet<i64>,
     dedup: Dedup,
     quality: QualityReporter,
-    /// Connection supervisors.
+    /// Connection supervisors and the periodic book snapshots.
     tasks: JoinSet<BackgroundResult>,
 }
 
@@ -95,12 +97,7 @@ impl Ingest {
             writer_tx,
             symbols: instruments
                 .iter()
-                .map(|instrument| {
-                    (
-                        instrument.code,
-                        Symbol::from(instrument.inst_id.to_ascii_lowercase()),
-                    )
-                })
+                .map(|instrument| (instrument.code, instrument.symbol()))
                 .collect(),
             unknown: HashSet::new(),
             dedup: Dedup::for_connections(connections, Exchange::OkxSbe),
@@ -187,9 +184,23 @@ pub async fn run_collection(
         &CHANNELS,
         quality.clone(),
     ));
-    let mut ingest = Ingest::new(writer_tx, &instruments, connections, quality.clone());
+    let snapshots = Snapshots::new()?;
+    let mut ingest = Ingest::new(
+        writer_tx.clone(),
+        &instruments,
+        connections,
+        quality.clone(),
+    );
     let ws_rx = session::spawn_slots(&mut ingest.tasks, okx, connections, &quality, &readiness);
     let mut feed = Feed::new(ws_rx, shutdown);
+    let books = instruments
+        .iter()
+        .map(|instrument| (instrument.code, instrument.symbol()))
+        .collect();
+    ingest.tasks.spawn(async move {
+        snapshots.run_periodic(books, writer_tx).await;
+        Err(anyhow::anyhow!("periodic book-snapshot task exited"))
+    });
 
     while let Some((recv_time, data)) = feed.recv(&mut ingest.tasks).await? {
         match ingest.handle(recv_time, data).await {

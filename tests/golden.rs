@@ -17,6 +17,7 @@ const DEPTH_SNAPSHOT: u16 = 10_002;
 const DEPTH_DIFF: u16 = 10_003;
 const OKX_BBO_TBT: u16 = 1_000;
 const OKX_BOOKS_L2_TBT: u16 = 1_001;
+const OKX_SNAPSHOT_DEPTH: u16 = 1_006;
 
 fn record(recv_ns: i64, tag: u8, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(13 + payload.len());
@@ -127,6 +128,25 @@ fn okx_bbo(ts_us: i64, out_time: i64, seq_id: i64) -> Vec<u8> {
     frame.extend_from_slice(&6i32.to_le_bytes());
     frame.extend_from_slice(&[(-1i8) as u8, (-8i8) as u8]);
     frame
+}
+
+/// An OKX REST book snapshot for BTC-USDT (code 3).
+fn okx_snapshot(seq_id: i64, asks: u16, bids: u16) -> Vec<u8> {
+    let mut body = header(26, OKX_SNAPSHOT_DEPTH);
+    for field in [3, 1_785_542_407_000_500, seq_id] {
+        body.extend_from_slice(&i64::to_le_bytes(field));
+    }
+    body.extend_from_slice(&[(-1i8) as u8, (-8i8) as u8]);
+    for (count, best, step) in [(asks, 857_758, 1), (bids, 857_757, -1)] {
+        body.extend_from_slice(&20u16.to_le_bytes());
+        body.extend_from_slice(&count.to_le_bytes());
+        for level in 0..i64::from(count) {
+            body.extend_from_slice(&(best + step * level).to_le_bytes());
+            body.extend_from_slice(&(10_000_000 * (level + 1)).to_le_bytes());
+            body.extend_from_slice(&(level as i32 + 1).to_le_bytes());
+        }
+    }
+    body
 }
 
 fn zstd_file(path: &Path, records: &[Vec<u8>]) {
@@ -501,10 +521,12 @@ fn okx_fixtures(dir: &Path) {
                 T0 + 7 * SECOND,
                 &okx_bbo(us + 7_000_000, us + 7_001_000, 105),
             ),
+            record(T0 + 7 * SECOND + 1, b'R', &okx_snapshot(105, 3, 7)),
+            // OKX's error reply is never recorded, but would read as such.
             record(
-                T0 + 7 * SECOND + 1,
+                T0 + 7 * SECOND + 2,
                 b'R',
-                &[0x1a, 0, 0xee, 0x03, 1, 0, 0, 0],
+                br#"{"code":"51001","msg":"doesn't exist"}"#,
             ),
         ],
     );

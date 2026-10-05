@@ -13,6 +13,10 @@ use super::{I32LE, I64LE};
 /// `BboTbtChannelEvent`, the `bbo-tbt` channel.
 pub const TEMPLATE_BBO_TBT: u16 = 1000;
 
+/// `SnapshotDepthResponseEvent`, the body of `GET /api/v5/market/books-sbe`:
+/// up to 400 levels a side.
+pub const TEMPLATE_SNAPSHOT_DEPTH: u16 = 1006;
+
 /// The templates pushed on the websocket, as opposed to the REST snapshot's.
 pub const STREAM_TEMPLATES: RangeInclusive<u16> = 1000..=1005;
 
@@ -43,6 +47,27 @@ pub struct BboTbtBlock {
     pub sz_exponent: i8,
 }
 
+/// `SnapshotDepthResponseEvent` fixed block (26 bytes), followed by the asks
+/// and bids groups of [`DepthLevel`]s.
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned, Debug, Copy, Clone)]
+#[repr(C)]
+pub struct SnapshotDepthBlock {
+    pub inst_id_code: I64LE,
+    pub ts_us: I64LE,
+    pub seq_id: I64LE,
+    pub px_exponent: i8,
+    pub sz_exponent: i8,
+}
+
+/// One price level of a book snapshot or update (20 bytes).
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned, Debug, Copy, Clone)]
+#[repr(C)]
+pub struct DepthLevel {
+    pub px: I64LE,
+    pub sz: I64LE,
+    pub ord_count: I32LE,
+}
+
 /// The `instIdCode` of a stream frame, if it is long enough to carry one.
 pub fn inst_id_code(frame: &[u8]) -> Option<i64> {
     Some(i64::from_le_bytes(
@@ -57,6 +82,8 @@ mod tests {
     #[test]
     fn wire_sizes_match_the_schema() {
         assert_eq!(size_of::<BboTbtBlock>(), 74);
+        assert_eq!(size_of::<SnapshotDepthBlock>(), 26);
+        assert_eq!(size_of::<DepthLevel>(), 20);
     }
 
     /// The first 82-byte frame of a live `bbo-tbt` capture for BTC-USDT.

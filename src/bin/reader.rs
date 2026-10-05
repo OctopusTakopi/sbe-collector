@@ -22,7 +22,7 @@ use sbe_collector::{
             TEMPLATE_BEST_BID_ASK, TEMPLATE_DEPTH_DIFF, TEMPLATE_DEPTH_SNAPSHOT, TEMPLATE_TRADES,
             TradeEntry, TradesBlock,
         },
-        okx::{self, BboTbtBlock},
+        okx::{self, BboTbtBlock, DepthLevel, SnapshotDepthBlock},
         read_group,
     },
 };
@@ -90,7 +90,7 @@ fn read_file(path: &Path, exchange: Exchange) -> io::Result<()> {
                 counts.rest += 1;
                 match exchange {
                     Exchange::BinanceSbeSpot => print_rest_record(recv_ns, &payload),
-                    Exchange::OkxSbe => println!("[{recv_ns}] R {} bytes", payload.len()),
+                    Exchange::OkxSbe => print_okx_snapshot(recv_ns, &payload),
                 }
             }
             Some(Tag::Sbe) => {
@@ -258,6 +258,50 @@ fn print_okx_record(nanos: i64, data: &[u8]) {
         header.block_length.get(),
         data.len()
     );
+}
+
+/// An OKX REST book snapshot: SBE template 1006, asks then bids.
+fn print_okx_snapshot(nanos: i64, data: &[u8]) {
+    let snapshot = MessageHeader::read_from_prefix(data)
+        .ok()
+        .filter(|(header, _)| header.template_id.get() == okx::TEMPLATE_SNAPSHOT_DEPTH)
+        .and_then(|(header, body)| {
+            Some((header, SnapshotDepthBlock::read_from_prefix(body).ok()?.0))
+        });
+    let Some((header, block)) = snapshot else {
+        println!("[{nanos}] R <{} bytes, not a book snapshot>", data.len());
+        return;
+    };
+    println!(
+        "[{nanos}] R SNAPSHOT_DEPTH code={} seq={} t={}",
+        block.inst_id_code.get(),
+        block.seq_id.get(),
+        block.ts_us.get(),
+    );
+    let mut offset = size_of::<MessageHeader>() + usize::from(header.block_length.get());
+    for label in ["Asks", "Bids"] {
+        let Some(group) = read_group::<GroupSize16Encoding>(data, &mut offset) else {
+            break;
+        };
+        println!("  {label} ({}):", group.count);
+        for index in 0..group.count {
+            let Some(Ok((level, _))) = data.get(offset..).map(DepthLevel::read_from_prefix) else {
+                break;
+            };
+            if index < SHOWN {
+                println!(
+                    "    {:.6} @ {:.6} ({} orders)",
+                    decimal(level.px.get(), block.px_exponent),
+                    decimal(level.sz.get(), block.sz_exponent),
+                    level.ord_count.get(),
+                );
+            }
+            offset += group.stride;
+        }
+        if group.count > SHOWN {
+            println!("    ...");
+        }
+    }
 }
 
 fn print_trades(nanos: i64, symbol: &str, data: &[u8], mut offset: usize, block: &TradesBlock) {
