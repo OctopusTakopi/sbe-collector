@@ -205,6 +205,7 @@ where
 /// A frame handed to the writer task.
 pub enum Outgoing {
     Text(String),
+    Ping(Vec<u8>),
     Pong(Vec<u8>),
     CloseRaw(Vec<u8>),
 }
@@ -221,6 +222,9 @@ impl Outgoing {
     fn into_frame(self) -> Frame<'static> {
         match self {
             Outgoing::Text(text) => Frame::text(Payload::Owned(text.into_bytes())),
+            Outgoing::Ping(payload) => {
+                Frame::new(true, OpCode::Ping, None, Payload::Owned(payload))
+            }
             Outgoing::Pong(payload) => Frame::pong(Payload::Owned(payload)),
             Outgoing::CloseRaw(payload) => Frame::close_raw(Payload::Owned(payload)),
         }
@@ -243,6 +247,13 @@ impl FrameSender {
     /// A request in the venue's text protocol, such as a subscription.
     pub async fn text(&self, text: String) -> Result<()> {
         self.send(Outgoing::Text(text)).await
+    }
+
+    /// A keepalive for venues that never ping first; the pong it earns is a
+    /// frame like any other, so the idle timeout stays meaningful on a quiet
+    /// feed.
+    pub async fn ping(&self, payload: impl Into<Vec<u8>>) -> Result<()> {
+        self.send(Outgoing::Ping(payload.into())).await
     }
 
     pub async fn pong(&self, payload: impl Into<Vec<u8>>) -> Result<()> {
@@ -664,19 +675,24 @@ mod tests {
         assert!(message.contains("clock"), "{message}");
     }
 
-    /// Subscriptions go out as text frames.
+    /// Subscriptions go out as text, keepalives as protocol pings.
     #[tokio::test]
-    async fn text_frames_reach_the_peer() {
+    async fn text_and_ping_frames_reach_the_peer() {
         let (conn, mut server) = duplex_pair();
+        let sender = conn.sender();
 
-        conn.sender()
+        sender
             .text(r#"{"op":"subscribe"}"#.to_owned())
             .await
             .unwrap();
+        sender.ping(b"k1".to_vec()).await.unwrap();
 
         let text = server.read_frame().await.unwrap();
         assert_eq!(text.opcode, OpCode::Text);
         assert_eq!(&text.payload[..], br#"{"op":"subscribe"}"#);
+        let ping = server.read_frame().await.unwrap();
+        assert_eq!(ping.opcode, OpCode::Ping);
+        assert_eq!(&ping.payload[..], b"k1");
     }
 
     #[test]

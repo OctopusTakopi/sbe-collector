@@ -28,7 +28,7 @@ use crate::{
     feed::BackgroundResult,
     quality::QualityReporter,
     readiness::Readiness,
-    ws::{Connection, Delivery, Overflow},
+    ws::{ConnectError, Connection, Delivery, FrameSender, Overflow},
 };
 
 /// A binary frame and when it arrived.
@@ -51,6 +51,17 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// A session that lived this long was healthy: whatever ended it was the
 /// venue's doing, and the backoff starts over.
 const SETTLED: Duration = Duration::from_secs(30);
+
+/// How long a session may wait for the answer to every subscription. Replies
+/// come within milliseconds; one that never comes would otherwise leave the
+/// slot un-ready, and the channel missing, with nothing to say so.
+const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The least spacing between any two connection attempts of the process.
+///
+/// OKX allows 3 a second per IP, and a venue-wide notice relieves every slot
+/// at once, each reconnecting after a settled session's 100 ms backoff.
+const CONNECT_SPACING: Duration = Duration::from_millis(400);
 
 /// RFC 6455 "going away".
 const CLOSE_GOING_AWAY: u16 = 1001;
@@ -91,6 +102,11 @@ pub(crate) trait Protocol: Send + Sync + 'static {
     /// When a session on `connection` arranges its own replacement, if ever.
     fn max_age(&self, connection: usize) -> Option<Duration>;
 
+    /// How often to ping a venue that never pings first.
+    fn keepalive(&self) -> Option<Duration> {
+        None
+    }
+
     /// A fresh session, and the text requests it sends once connected.
     fn open(&self) -> (Self::Session, Vec<String>);
 }
@@ -99,6 +115,18 @@ pub(crate) trait Protocol: Send + Sync + 'static {
 pub(crate) trait Session: Send + 'static {
     /// A text frame from the venue: a subscription reply or a notice.
     fn on_text(&mut self, text: &[u8]) -> Verdict;
+
+    /// A binary frame, before it is queued. Delivered whatever this returns.
+    fn on_binary(&mut self, _frame: &[u8]) -> Verdict {
+        Verdict::Continue
+    }
+
+    /// Whether every subscription has been answered. Until then the session
+    /// cannot prove it carries the whole feed, so it neither retires an older
+    /// session nor counts towards handover readiness.
+    fn settled(&self) -> bool {
+        true
+    }
 }
 
 /// What a session asks of its slot after a frame.
@@ -147,6 +175,8 @@ pub(crate) enum Loss {
     ClosedByServer,
     #[error("a frame that must not be shed could not be queued")]
     Undeliverable,
+    #[error("not every subscription was answered within {SUBSCRIBE_TIMEOUT:?}")]
+    Unanswered,
     #[error("{0:#}")]
     Io(anyhow::Error),
 }
@@ -274,6 +304,7 @@ struct Slot {
     /// before it went live can still report going live.
     events: mpsc::Sender<Event>,
     max_age: Option<Duration>,
+    keepalive: Option<Duration>,
     quality: QualityReporter,
     readiness: Readiness,
 }
@@ -292,12 +323,29 @@ impl Slot {
     }
 }
 
+/// Ping every `every`, for a venue that never pings first, so its pongs keep
+/// [`IDLE_TIMEOUT`] meaningful on a quiet feed. Never completes unless the
+/// writer stopped, so racing it against `read` never cancels a read.
+async fn keep_alive(sender: FrameSender, every: Option<Duration>) -> Loss {
+    let Some(every) = every else {
+        return std::future::pending().await;
+    };
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+    loop {
+        ticker.tick().await;
+        if let Err(error) = sender.ping(Vec::new()).await {
+            return Loss::Io(error);
+        }
+    }
+}
+
 /// Read one session to its end, delivering market data into the slot's queue.
 ///
 /// Deciding to replace a session does not end it: when the session asks, or
 /// at `max_age`, it reports [`Event::Relieve`] and keeps reading, so the
 /// replacement handshakes while this socket still delivers. It stops when
-/// retired, when the venue closes it, or when it falls silent.
+/// retired, when the venue closes it, when it falls silent, or when the
+/// session gives up on it.
 async fn run_session<T, S>(
     slot: Slot,
     mut conn: Connection<S>,
@@ -318,14 +366,16 @@ where
         }
     }
     let mut overflow = Overflow::new(slot.source.clone(), slot.quality.clone());
-    let opened = Instant::now();
+    let opened = tokio::time::Instant::now();
     let mut liveness = None;
     let mut announced_live = false;
     let mut relieved = false;
+    let keepalive = keep_alive(sender.clone(), slot.keepalive);
+    tokio::pin!(keepalive);
 
     loop {
-        // Both arms end the session, which is what makes racing the
-        // non-cancel-safe `read` sound.
+        // Every arm that completes ends the session, which is what makes
+        // racing the non-cancel-safe `read` sound.
         let message = select! {
             biased;
             _ = &mut retire => {
@@ -354,6 +404,7 @@ where
                 );
                 return SessionEnd::Retired;
             }
+            loss = &mut keepalive => return SessionEnd::Lost(loss),
             result = timeout(IDLE_TIMEOUT, conn.read()) => match result {
                 Ok(Ok(message)) => message,
                 Ok(Err(error)) => return SessionEnd::Lost(Loss::Io(error)),
@@ -371,12 +422,19 @@ where
             relieved = true;
             slot.request_replacement(id, Reason::Age);
         }
+        if !session.settled() && opened.elapsed() >= SUBSCRIBE_TIMEOUT {
+            return SessionEnd::Lost(Loss::Unanswered);
+        }
 
         let verdict = match message.opcode {
             OpCode::Binary => {
+                let verdict = session.on_binary(&message.payload);
+                // Data before the last reply proves nothing about the
+                // channels still unanswered.
+                let settled = session.settled();
                 match deliver_frame(&slot.ws_tx, &mut overflow, message.payload).await {
                     Delivery::Sent => {
-                        if liveness.is_none() {
+                        if settled && liveness.is_none() {
                             liveness = Some(slot.readiness.source_live(slot.source.as_str()));
                         }
                     }
@@ -387,11 +445,11 @@ where
                     Delivery::Closed => return SessionEnd::Finished,
                     Delivery::Undeliverable => return SessionEnd::Lost(Loss::Undeliverable),
                 }
-                if !announced_live {
+                if settled && !announced_live {
                     announced_live = true;
                     let _ = slot.events.try_send(Event::Live(id));
                 }
-                Verdict::Continue
+                verdict
             }
             OpCode::Text => session.on_text(&message.payload),
             OpCode::Ping => {
@@ -436,6 +494,39 @@ fn jittered_backoff(error_count: u32) -> Duration {
     Duration::from_millis(base_ms - jitter_range + jitter)
 }
 
+/// Spaces the connection attempts of every slot in the process by
+/// [`CONNECT_SPACING`].
+#[derive(Default)]
+struct Pacer {
+    next: tokio::sync::Mutex<Option<tokio::time::Instant>>,
+}
+
+impl Pacer {
+    /// Wait for this attempt's turn. Holding the lock through the sleep is
+    /// what queues the slots behind one another.
+    async fn wait(&self) {
+        let mut next = self.next.lock().await;
+        if let Some(at) = *next {
+            tokio::time::sleep_until(at).await;
+        }
+        *next = Some(tokio::time::Instant::now() + CONNECT_SPACING);
+    }
+}
+
+/// Open one socket for the slot: its handshake, then the upgrade.
+async fn connect<P: Protocol>(
+    protocol: &P,
+    tls: &Arc<ClientConfig>,
+    connection: usize,
+    first_attempt: &mut bool,
+) -> Result<Connection, ConnectError> {
+    let handshake = protocol.handshake()?;
+    if std::mem::take(first_attempt) {
+        info!(connection, url = %handshake.url, "connecting to {}", P::SOURCE);
+    }
+    crate::ws::connect(handshake.url, handshake.headers, Arc::clone(tls)).await
+}
+
 /// Pace the next connection attempt.
 ///
 /// `lifetime` is how long the session that just ended lasted; a failed
@@ -457,14 +548,18 @@ async fn back_off(error_count: &mut u32, lifetime: Option<Duration>) {
 /// delivering while its replacement handshakes, and is retired only once the
 /// replacement has data flowing. The overlap's duplicates are what
 /// [`crate::dedup`] is for.
+///
+/// Returns once the consumer is gone, or with the refusal that ended a slot
+/// which never went live.
 async fn keep_connection<P: Protocol>(
     protocol: Arc<P>,
     tls: Arc<ClientConfig>,
+    pacer: Arc<Pacer>,
     connection: usize,
     ws_tx: mpsc::Sender<Frame>,
     quality: QualityReporter,
     readiness: Readiness,
-) {
+) -> anyhow::Result<()> {
     // Relieved sessions still delivering. A `JoinSet` so that aborting this
     // supervisor at shutdown also drops their `ws_tx` clones, which would
     // otherwise hold the feed open until the drain timed out.
@@ -480,29 +575,31 @@ async fn keep_connection<P: Protocol>(
         ws_tx,
         events: event_tx,
         max_age: protocol.max_age(connection),
+        keepalive: protocol.keepalive(),
         quality,
         readiness,
     };
     let mut next_session: SessionId = 0;
     let mut first_attempt = true;
+    let mut ever_live = false;
 
     loop {
         while lingering.try_join_next().is_some() {}
 
+        pacer.wait().await;
         let opened = Instant::now();
-        let connected = match protocol.handshake() {
-            Ok(handshake) => {
-                if std::mem::take(&mut first_attempt) {
-                    info!(connection, url = %handshake.url, "connecting to {}", P::SOURCE);
-                }
-                crate::ws::connect(handshake.url, handshake.headers, Arc::clone(&tls))
-                    .await
-                    .map_err(anyhow::Error::from)
-            }
-            Err(error) => Err(error),
-        };
-        let conn = match connected {
+        let conn = match connect(&*protocol, &tls, connection, &mut first_attempt).await {
             Ok(conn) => conn,
+            // Credentials wrong from the start: no retry can cure them. A
+            // slot that was delivering keeps retrying rather than take the
+            // process down mid-recording.
+            Err(ConnectError::Unauthorized) if !ever_live => {
+                return Err(anyhow::anyhow!(
+                    "{}: {}",
+                    P::SOURCE,
+                    ConnectError::Unauthorized
+                ));
+            }
             Err(err) => {
                 error!(
                     connection,
@@ -536,7 +633,10 @@ async fn keep_connection<P: Protocol>(
                     // Proof that a session carries the feed, and the only
                     // thing that retires older ones. It can come from a
                     // relieved session, hence the shared channel and the id.
-                    Some(Event::Live(live)) => handover.on_live(live),
+                    Some(Event::Live(live)) => {
+                        ever_live = true;
+                        handover.on_live(live);
+                    }
                     Some(Event::Relieve(from, reason)) if from == id => {
                         break Step::Relieved(reason);
                     }
@@ -573,7 +673,7 @@ async fn keep_connection<P: Protocol>(
                 back_off(&mut error_count, Some(lifetime)).await;
             }
             // Dropping `lingering` stops the relieved sessions too.
-            Step::Ended(SessionEnd::Finished) => return,
+            Step::Ended(SessionEnd::Finished) => return Ok(()),
             Step::Ended(SessionEnd::Retired) => {
                 // Unreachable: the active session's handle is not in
                 // `Handover` until it is relieved. Reconnect, with backoff so
@@ -616,15 +716,17 @@ pub(crate) fn spawn_slots<P: Protocol>(
 ) -> mpsc::Receiver<Frame> {
     let (ws_tx, ws_rx) = mpsc::channel(WS_QUEUE_CAPACITY.saturating_mul(connections));
     let tls = Arc::new(crate::ws::build_tls_config());
+    let pacer = Arc::new(Pacer::default());
     for connection in 0..connections {
         let protocol = Arc::clone(&protocol);
         let tls = Arc::clone(&tls);
+        let pacer = Arc::clone(&pacer);
         let ws_tx = ws_tx.clone();
         let quality = quality.clone();
         let readiness = readiness.clone();
         tasks.spawn(async move {
             tokio::time::sleep(CONNECT_STAGGER * connection as u32).await;
-            keep_connection(protocol, tls, connection, ws_tx, quality, readiness).await;
+            keep_connection(protocol, tls, pacer, connection, ws_tx, quality, readiness).await?;
             Err(anyhow::anyhow!(
                 "websocket connection supervisor {connection} exited"
             ))
@@ -636,21 +738,33 @@ pub(crate) fn spawn_slots<P: Protocol>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::readiness::ReadinessState;
     use fastwebsockets::{Frame as WsFrame, Payload, WebSocket};
-    use tokio::io::DuplexStream;
+    use tokio::{io::DuplexStream, sync::watch};
 
     const TEST_SESSION: SessionId = 7;
 
-    /// Asks for a replacement on the text `relieve` and ignores any other.
-    struct Script;
+    /// Asks for a replacement on the text `relieve`; each `ack` answers one
+    /// of `pending` subscriptions.
+    #[derive(Default)]
+    struct Script {
+        pending: usize,
+    }
 
     impl Session for Script {
         fn on_text(&mut self, text: &[u8]) -> Verdict {
-            if text == b"relieve" {
-                Verdict::Relieve(Reason::ServerShutdown)
-            } else {
-                Verdict::Continue
+            match text {
+                b"relieve" => Verdict::Relieve(Reason::ServerShutdown),
+                b"ack" => {
+                    self.pending = self.pending.saturating_sub(1);
+                    Verdict::Continue
+                }
+                _ => Verdict::Continue,
             }
+        }
+
+        fn settled(&self) -> bool {
+            self.pending == 0
         }
     }
 
@@ -659,39 +773,60 @@ mod tests {
         server: WebSocket<DuplexStream>,
         events: mpsc::Receiver<Event>,
         data: mpsc::Receiver<Frame>,
+        /// The writer is marked ready, so this follows the session's lease.
+        ready: watch::Receiver<ReadinessState>,
         retire: Option<oneshot::Sender<()>>,
         session: tokio::task::JoinHandle<SessionEnd>,
     }
 
     impl Harness {
         fn start(max_age: Option<Duration>) -> Self {
+            Self::with(Script::default(), Vec::new(), max_age, None)
+        }
+
+        fn with(
+            script: Script,
+            requests: Vec<String>,
+            max_age: Option<Duration>,
+            keepalive: Option<Duration>,
+        ) -> Self {
             let (conn, server) = crate::ws::duplex_pair();
             let (event_tx, events) = mpsc::channel(2);
             let (ws_tx, data) = mpsc::channel(16);
             let (retire_tx, retire_rx) = oneshot::channel();
+            let (readiness, ready) = Readiness::new(1);
+            readiness.mark_writer_ready();
             let slot = Slot {
                 connection: 0,
                 source: "test".to_owned(),
                 ws_tx,
                 events: event_tx,
                 max_age,
+                keepalive,
                 quality: QualityReporter::disabled(),
-                readiness: Readiness::new(1).0,
+                readiness,
             };
             Self {
                 server,
                 events,
                 data,
+                ready,
                 retire: Some(retire_tx),
                 session: tokio::spawn(run_session(
                     slot,
                     conn,
                     TEST_SESSION,
                     retire_rx,
-                    Script,
-                    Vec::new(),
+                    script,
+                    requests,
                 )),
             }
+        }
+
+        async fn expect_text(&mut self, expected: &str) {
+            let frame = self.server.read_frame().await.unwrap();
+            assert_eq!(frame.opcode, OpCode::Text);
+            assert_eq!(&frame.payload[..], expected.as_bytes());
         }
 
         async fn send_text(&mut self, text: &str) {
@@ -896,6 +1031,110 @@ mod tests {
             before,
             "draining must not wait for frames that have not arrived"
         );
+    }
+
+    #[tokio::test]
+    async fn requests_go_out_in_order_once_connected() {
+        let mut harness = Harness::with(
+            Script { pending: 2 },
+            vec!["first".to_owned(), "second".to_owned()],
+            None,
+            None,
+        );
+
+        harness.expect_text("first").await;
+        harness.expect_text("second").await;
+    }
+
+    /// Data that arrives before the last reply is recorded, but proves nothing
+    /// about the channels still unanswered: it must neither retire an older
+    /// session nor make the process ready for a handover.
+    #[tokio::test]
+    async fn a_session_is_not_live_until_every_subscription_is_answered() {
+        let mut harness = Harness::with(Script { pending: 1 }, vec!["sub".to_owned()], None, None);
+        harness.expect_text("sub").await;
+
+        harness.send_market_data().await;
+        assert!(harness.data.recv().await.is_some());
+        assert!(
+            harness.events.try_recv().is_err(),
+            "no Live before the reply"
+        );
+        assert!(!harness.ready.borrow().is_ready());
+
+        harness.send_text("ack").await;
+        harness.send_market_data().await;
+        assert!(matches!(
+            harness.events.recv().await,
+            Some(Event::Live(TEST_SESSION))
+        ));
+        assert!(harness.data.recv().await.is_some());
+        assert!(harness.ready.borrow().is_ready());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_subscription_left_unanswered_ends_the_session() {
+        let mut harness = Harness::with(Script { pending: 1 }, vec!["sub".to_owned()], None, None);
+        harness.expect_text("sub").await;
+
+        tokio::time::sleep(SUBSCRIBE_TIMEOUT).await;
+        harness.send_market_data().await;
+
+        assert!(matches!(
+            harness.session.await.unwrap(),
+            SessionEnd::Lost(Loss::Unanswered)
+        ));
+    }
+
+    /// The keepalive races the read without cancelling it: data on either
+    /// side of a ping arrives intact.
+    #[tokio::test(start_paused = true)]
+    async fn keepalive_pings_go_out_while_data_keeps_flowing() {
+        let every = Duration::from_secs(20);
+        let mut harness = Harness::with(Script::default(), Vec::new(), None, Some(every));
+
+        harness.send_market_data().await;
+        assert!(harness.data.recv().await.is_some());
+
+        let before = tokio::time::Instant::now();
+        let ping = harness.server.read_frame().await.unwrap();
+        assert_eq!(ping.opcode, OpCode::Ping);
+        assert!(tokio::time::Instant::now() - before <= every);
+
+        harness.send_market_data().await;
+        let (_, payload) = harness.data.recv().await.unwrap();
+        assert_eq!(&payload[..], &[0x12, 0x00, 0x10, 0x27]);
+        assert!(!harness.session.is_finished());
+    }
+
+    /// Slots wait their turn: a venue-wide notice relieves every slot at once,
+    /// and their reconnects must not burst past a per-IP attempt limit.
+    #[tokio::test(start_paused = true)]
+    async fn connection_attempts_are_spaced_across_slots() {
+        let pacer = Arc::new(Pacer::default());
+        let start = tokio::time::Instant::now();
+
+        let attempts = three_attempts(Arc::clone(&pacer)).await;
+
+        let mut attempts = attempts.to_vec();
+        attempts.sort();
+        assert_eq!(attempts[0], start);
+        assert_eq!(attempts[1] - attempts[0], CONNECT_SPACING);
+        assert_eq!(attempts[2] - attempts[1], CONNECT_SPACING);
+    }
+
+    /// Three slots asking for their turn at once; when each got it.
+    async fn three_attempts(pacer: Arc<Pacer>) -> [tokio::time::Instant; 3] {
+        let attempt = |pacer: Arc<Pacer>| async move {
+            pacer.wait().await;
+            tokio::time::Instant::now()
+        };
+        let (a, b, c) = tokio::join!(
+            attempt(Arc::clone(&pacer)),
+            attempt(Arc::clone(&pacer)),
+            attempt(pacer)
+        );
+        [a, b, c]
     }
 
     #[test]
