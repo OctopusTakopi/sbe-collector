@@ -15,7 +15,35 @@ CONNECTIONS=2
 # Format: "internal_exchange_name:filesystem_subpath"
 MAPPINGS=(
     "binancesbespot:binance/spot"
+    "okxsbe:okx"
+    "gatesbespot:gate/spot"
+    "gatesbefutures:gate/futures"
 )
+
+# The symbols an exchange is given for $1, a lowercase coin, as that exchange
+# spells them. OKX gets spot and the USDT perpetual in one process: its SBE
+# endpoint carries every instrument type on one connection.
+symbols_for() {
+    local exchange="$1" coin="$2"
+    case "$exchange" in
+        binancesbespot) echo "${coin}usdt" ;;
+        okxsbe) echo "${coin^^}-USDT ${coin^^}-USDT-SWAP" ;;
+        gatesbespot | gatesbefutures) echo "${coin^^}_USDT" ;;
+        *)
+            echo "Error: no symbol convention for $exchange." >&2
+            exit 1
+            ;;
+    esac
+}
+
+# The environment variables an exchange's collector needs; Gate's public
+# market data needs none.
+credentials_for() {
+    case "$1" in
+        binancesbespot) echo "BINANCE_API_KEY" ;;
+        okxsbe) echo "OKX_API_KEY OKX_SECRET_KEY OKX_PASSPHRASE" ;;
+    esac
+}
 
 SESSION_NAME="sbe_collector"
 # Session names this script has created in the past.
@@ -31,21 +59,33 @@ if [ ! -x "$COLLECTOR_EXE" ]; then
     exit 1
 fi
 
-# Check for API Key (required by binancesbespot). Read silently: -p alone echoes
-# the key into the terminal and, from there, into scrollback.
+# Every credential the mapped exchanges need, each once.
+CREDENTIALS=()
+for MAP in "${MAPPINGS[@]}"; do
+    for VAR in $(credentials_for "${MAP%%:*}"); do
+        if [[ ! " ${CREDENTIALS[*]} " =~ " $VAR " ]]; then
+            CREDENTIALS+=("$VAR")
+        fi
+    done
+done
+
+# Ask for whichever is not already in the environment. Read silently: -p alone
+# echoes the secret into the terminal and, from there, into scrollback.
 #
 # `|| true` because `read` reports failure on EOF — which is what happens when
 # this runs without a terminal, exactly the case the message below exists to
 # explain. Under `set -e` that failure would abort here and the operator would
 # see a bare prompt and exit 1 instead of the reason.
-if [ -z "${BINANCE_API_KEY:-}" ]; then
-    read -rsp "Enter BINANCE_API_KEY: " BINANCE_API_KEY || true
-    echo
-    if [ -z "$BINANCE_API_KEY" ]; then
-        echo "Error: BINANCE_API_KEY is required." >&2
-        exit 1
+for VAR in "${CREDENTIALS[@]}"; do
+    if [ -z "${!VAR:-}" ]; then
+        read -rsp "Enter $VAR: " "$VAR" || true
+        echo
+        if [ -z "${!VAR:-}" ]; then
+            echo "Error: $VAR is required." >&2
+            exit 1
+        fi
     fi
-fi
+done
 
 # Kill the current session and any this script created under an older name, so
 # a rename cannot leave two collectors writing the same files.
@@ -55,17 +95,20 @@ done
 
 tmux new-session -d -s "$SESSION_NAME" -n "init"
 
-# The collector reads the key from its environment, so hand it over through the
-# session environment rather than the collector's command line, where it would
-# be typed into the pane — recorded in that shell's history file, and readable
-# in `ps` by every user on the host for as long as the collector runs.
+# The collectors read their credentials from the environment, so hand them over
+# through the session environment rather than the collector's command line,
+# where they would be typed into the pane — recorded in that shell's history
+# file, and readable in `ps` by every user on the host for as long as the
+# collector runs.
 #
-# This narrows that exposure rather than removing it: the key is on *this*
+# This narrows that exposure rather than removing it: each secret is on *this*
 # command's argv while the tmux client runs, and `tmux show-environment -t
 # sbe_collector` prints it afterwards to anyone who can reach the socket. Closing
 # those would mean the collector reading a mode-600 file instead of an
 # environment variable.
-tmux set-environment -t "$SESSION_NAME" BINANCE_API_KEY "$BINANCE_API_KEY"
+for VAR in "${CREDENTIALS[@]}"; do
+    tmux set-environment -t "$SESSION_NAME" "$VAR" "${!VAR}"
+done
 
 for MAP in "${MAPPINGS[@]}"; do
     EXCH="${MAP%%:*}"
@@ -75,11 +118,10 @@ for MAP in "${MAPPINGS[@]}"; do
     # Ensure target directory exists
     mkdir -p "$TARGET_DIR"
 
-    # Build the symbols list for this exchange (assuming <coin>usdt convention)
+    # Build the symbols list for this exchange, in its own spelling
     SYMBOLS_LIST=""
     for COIN in "${COINS[@]}"; do
-        S="${COIN}usdt"
-        SYMBOLS_LIST+="$S "
+        SYMBOLS_LIST+="$(symbols_for "$EXCH" "$COIN") "
     done
 
     # Create a new tmux window for this exchange instance. It inherits the
