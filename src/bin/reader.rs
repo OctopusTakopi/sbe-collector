@@ -22,6 +22,10 @@ use sbe_collector::{
             TEMPLATE_BEST_BID_ASK, TEMPLATE_DEPTH_DIFF, TEMPLATE_DEPTH_SNAPSHOT, TEMPLATE_TRADES,
             TradeEntry, TradesBlock,
         },
+        gate::{
+            self, FuturesBboBlock, FuturesTrade, FuturesTradeBlock, Level, Market, ObuBlock,
+            SpotBboBlock, SpotTradeBlock,
+        },
         okx::{self, BboTbtBlock, DepthLevel, SnapshotDepthBlock},
         read_group,
     },
@@ -91,6 +95,9 @@ fn read_file(path: &Path, exchange: Exchange) -> io::Result<()> {
                 match exchange {
                     Exchange::BinanceSbeSpot => print_rest_record(recv_ns, &payload),
                     Exchange::OkxSbe => print_okx_snapshot(recv_ns, &payload),
+                    Exchange::GateSbeSpot | Exchange::GateSbeFutures => {
+                        println!("[{recv_ns}] R {} bytes", payload.len());
+                    }
                 }
             }
             Some(Tag::Sbe) => {
@@ -98,6 +105,10 @@ fn read_file(path: &Path, exchange: Exchange) -> io::Result<()> {
                 match exchange {
                     Exchange::BinanceSbeSpot => print_sbe_record(recv_ns, &payload),
                     Exchange::OkxSbe => print_okx_record(recv_ns, &payload),
+                    Exchange::GateSbeSpot => print_gate_record(Market::Spot, recv_ns, &payload),
+                    Exchange::GateSbeFutures => {
+                        print_gate_record(Market::Futures, recv_ns, &payload);
+                    }
                 }
             }
             None => println!("[{recv_ns}] unknown tag: 0x{tag:02x}, payload_len={len}"),
@@ -302,6 +313,139 @@ fn print_okx_snapshot(nanos: i64, data: &[u8]) {
             println!("    ...");
         }
     }
+}
+
+/// A Gate stream frame: the same template ids mean different layouts in the
+/// two markets.
+fn print_gate_record(market: Market, nanos: i64, data: &[u8]) {
+    let Ok((header, body)) = MessageHeader::read_from_prefix(data) else {
+        println!("[{nanos}] S <too short: {} bytes>", data.len());
+        return;
+    };
+    let template_id = header.template_id.get();
+    let block_len = usize::from(header.block_length.get());
+    let name = gate::instrument(market, data).map_or_else(
+        || "unknown".into(),
+        |name| String::from_utf8_lossy(name).into_owned(),
+    );
+    let groups = size_of::<MessageHeader>() + block_len;
+    match (market, template_id) {
+        (Market::Spot, gate::TEMPLATE_BBO) => {
+            if let Ok((block, _)) = SpotBboBlock::read_from_prefix(body) {
+                let [px, sz] = [block.px_exponent, block.sz_exponent];
+                println!(
+                    "[{nanos}] S BBO {name} bid={:.6}x{:.6} ask={:.6}x{:.6} u={} t={}",
+                    decimal(block.bid_px.get(), px),
+                    decimal(block.bid_sz.get(), sz),
+                    decimal(block.ask_px.get(), px),
+                    decimal(block.ask_sz.get(), sz),
+                    block.u.get(),
+                    block.t.get(),
+                );
+                return;
+            }
+        }
+        (Market::Futures, gate::TEMPLATE_BBO) => {
+            if let Ok((block, _)) = FuturesBboBlock::read_from_prefix(body) {
+                let [px, sz] = [block.px_exponent, block.sz_exponent];
+                println!(
+                    "[{nanos}] S BBO {name} bid={:.6}x{:.6} ask={:.6}x{:.6} u={} t={}",
+                    decimal(block.bid_px.get(), px),
+                    decimal(block.bid_sz.get(), sz),
+                    decimal(block.ask_px.get(), px),
+                    decimal(block.ask_sz.get(), sz),
+                    block.u.get(),
+                    block.t.get(),
+                );
+                return;
+            }
+        }
+        (Market::Spot, gate::TEMPLATE_PUBLIC_TRADE) => {
+            if let Ok((block, _)) = SpotTradeBlock::read_from_prefix(body) {
+                println!(
+                    "[{nanos}] S TRADE {name} id={} side={} px={:.6} amount={:.6} t={}",
+                    block.id_market.get(),
+                    if block.side == 1 { "buy" } else { "sell" },
+                    decimal(block.price.get(), block.px_exponent),
+                    decimal(block.amount.get(), block.sz_exponent),
+                    block.create_time_us.get(),
+                );
+                return;
+            }
+        }
+        (Market::Futures, gate::TEMPLATE_PUBLIC_TRADE) => {
+            if let Ok((block, _)) = FuturesTradeBlock::read_from_prefix(body) {
+                let mut offset = groups;
+                let group =
+                    read_group::<GroupSize16Encoding>(data, &mut offset).unwrap_or_default();
+                println!(
+                    "[{nanos}] S TRADES {name} trades={} t={}",
+                    group.count,
+                    block.time.get()
+                );
+                for _ in 0..group.count.min(SHOWN) {
+                    let Some(Ok((trade, _))) =
+                        data.get(offset..).map(FuturesTrade::read_from_prefix)
+                    else {
+                        break;
+                    };
+                    println!(
+                        "  trade id={} px={:.6} size={:.6} t={}",
+                        trade.id.get(),
+                        decimal(trade.price.get(), block.px_exponent),
+                        decimal(trade.size.get(), block.sz_exponent),
+                        trade.t.get(),
+                    );
+                    offset += group.stride;
+                }
+                if group.count > SHOWN {
+                    println!("  ...");
+                }
+                return;
+            }
+        }
+        (_, gate::TEMPLATE_OBU) => {
+            if let Ok((block, _)) = ObuBlock::read_from_prefix(body) {
+                println!(
+                    "[{nanos}] S OBU {name} full={} U={} u={} t={}",
+                    block.full,
+                    block.first_id.get(),
+                    block.last_id.get(),
+                    block.t.get(),
+                );
+                let mut offset = groups;
+                for label in ["bids", "asks"] {
+                    let Some(group) = read_group::<GroupSize16Encoding>(data, &mut offset) else {
+                        break;
+                    };
+                    println!("  {label} ({}):", group.count);
+                    for index in 0..group.count {
+                        let Some(Ok((level, _))) = data.get(offset..).map(Level::read_from_prefix)
+                        else {
+                            break;
+                        };
+                        if index < SHOWN {
+                            println!(
+                                "    {:.6} @ {:.6}",
+                                decimal(level.px.get(), block.px_exponent),
+                                decimal(level.sz.get(), block.sz_exponent)
+                            );
+                        }
+                        offset += group.stride;
+                    }
+                    if group.count > SHOWN {
+                        println!("    ...");
+                    }
+                }
+                return;
+            }
+        }
+        _ => {}
+    }
+    println!(
+        "[{nanos}] S template={template_id} {name} block_len={block_len} total={}b",
+        data.len()
+    );
 }
 
 fn print_trades(nanos: i64, symbol: &str, data: &[u8], mut offset: usize, block: &TradesBlock) {

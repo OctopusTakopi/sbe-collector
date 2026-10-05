@@ -1,0 +1,31 @@
+
+./btc_usdt
+  files: ./btc_usdt_20260801.zst, ./btc_usdt_20260801_1785542400000000001-42.zst
+  records: 13 (13 stream, 0 rest snapshots) | recv span: 2026-08-01 00:00:00.000Z .. 2026-08-01 00:00:06.000Z | bad records: 2
+  RECV GAPS > 5.000s: 1 (total silence 6.000s)
+    2026-08-01 00:00:00.000Z .. 2026-08-01 00:00:06.000Z (6.000s)
+  streams:
+    best-bid-ask: 3 msgs
+      1 duplicate/reordered event(s)
+      1 time regression(s)
+    depth-diff: 5 msgs
+      1 forward chain break(s), 2 ids
+      breaks at: 2026-08-01 00:00:00.000Z
+    trades: 3 msgs
+      ids 1,000..1,003: net 1 missing (3 observed)
+      1 forward chain break(s), 1 ids
+      breaks at: 2026-08-01 00:00:00.000Z
+
+SUMMARY
+  series scanned        : 1
+  records decoded       : 13
+  recv gaps > 5s  : 1 across 1 series (total silence 6.000s)
+  forward chain breaks  : 2 event(s), 3 ids
+  net missing ids       : 1 (range accounting)
+  dup/reordered events  : 1
+  time regressions      : 1
+  missing dates         : 0
+  decode errors         : 0
+  bad records           : 2
+  foreign files         : 0 (skipped)
+RESULT: issues found in 1 series

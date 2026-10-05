@@ -3,6 +3,7 @@ mod dedup;
 mod error;
 mod feed;
 mod file;
+mod gatesbe;
 mod handover;
 mod okxsbe;
 mod quality;
@@ -15,7 +16,7 @@ use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, anyhow};
 use clap::Parser;
-use sbe_collector::exchange::Exchange;
+use sbe_collector::{exchange::Exchange, sbe::gate::Market};
 use tokio::{
     select, signal,
     sync::{mpsc, oneshot, watch},
@@ -36,7 +37,10 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 const HANDOVER_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Parser, Debug)]
-#[command(version, about = "SBE market-data collector for Binance spot and OKX")]
+#[command(
+    version,
+    about = "SBE market-data collector for Binance spot, OKX and Gate"
+)]
 struct Args {
     /// Directory where collected data files are written.
     path: PathBuf,
@@ -45,7 +49,8 @@ struct Args {
     exchange: Exchange,
 
     /// Symbols to subscribe to, as the exchange names them: btcusdt for
-    /// Binance, instIds such as BTC-USDT or BTC-USDT-SWAP for OKX.
+    /// Binance, instIds such as BTC-USDT or BTC-USDT-SWAP for OKX, BTC_USDT
+    /// for Gate.
     symbols: Vec<String>,
 
     /// Number of redundant websocket connections to the exchange.
@@ -115,6 +120,7 @@ impl Hangup {
 enum Venue {
     BinanceSbeSpot(binancesbespot::Subscription),
     OkxSbe(okxsbe::Subscription),
+    GateSbe(gatesbe::Subscription),
 }
 
 impl Venue {
@@ -130,6 +136,12 @@ impl Venue {
             Exchange::OkxSbe => {
                 Self::OkxSbe(okxsbe::Subscription::prepare(symbols, connections).await?)
             }
+            Exchange::GateSbeSpot => Self::GateSbe(
+                gatesbe::Subscription::prepare(Market::Spot, symbols, connections).await?,
+            ),
+            Exchange::GateSbeFutures => Self::GateSbe(
+                gatesbe::Subscription::prepare(Market::Futures, symbols, connections).await?,
+            ),
         })
     }
 
@@ -149,6 +161,13 @@ impl Venue {
                 readiness,
             )),
             Self::OkxSbe(subscription) => tokio::spawn(okxsbe::run_collection(
+                subscription,
+                writer_tx,
+                shutdown,
+                quality,
+                readiness,
+            )),
+            Self::GateSbe(subscription) => tokio::spawn(gatesbe::run_collection(
                 subscription,
                 writer_tx,
                 shutdown,

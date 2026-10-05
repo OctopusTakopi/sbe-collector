@@ -1,0 +1,24 @@
+
+./btc_usdt
+  files: ./btc_usdt_20260801.zst
+  records: 6 (6 stream, 0 rest snapshots) | recv span: 2026-08-01 00:00:00.000Z .. 2026-08-01 00:00:00.000Z | bad records: 0
+  recv gaps > 5.000s: none
+  streams:
+    trades: 3 msgs
+      ids 7,000..7,010: net 2 missing (9 observed)
+      1 forward chain break(s), 2 ids
+      breaks at: 2026-08-01 00:00:00.000Z
+
+SUMMARY
+  series scanned        : 1
+  records decoded       : 6
+  recv gaps > 5s  : 0 across 0 series (total silence 0.000s)
+  forward chain breaks  : 1 event(s), 2 ids
+  net missing ids       : 2 (range accounting)
+  dup/reordered events  : 0
+  time regressions      : 0
+  missing dates         : 0
+  decode errors         : 0
+  bad records           : 0
+  foreign files         : 0 (skipped)
+RESULT: issues found in 1 series

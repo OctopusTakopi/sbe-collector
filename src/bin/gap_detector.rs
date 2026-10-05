@@ -11,8 +11,12 @@
 //!   - Binance depth diffs (10003): `firstBookUpdateId` normally follows the
 //!     previous `lastBookUpdateId + 1` (the collector's own rule);
 //!   - Binance trades (10000): trade ids increment by one per trade;
-//!   - best bid/ask, Binance's `bookUpdateId` (10001) and OKX's `bbo-tbt`
-//!     `seqId` (1000): must not go backwards;
+//!   - best bid/ask, Binance's `bookUpdateId` (10001), OKX's `bbo-tbt`
+//!     `seqId` (1000) and Gate's `u` (1): must not go backwards;
+//!   - Gate's `obu` book (3): each delta starts at the previous one's last
+//!     id plus one, and a full snapshot re-anchors the chain;
+//!   - Gate's trades (2): `idMarket` (spot) and trade ids (futures)
+//!     increment by one per trade;
 //! * range accounting for trade ids: ids are unique, so
 //!   `(max - min + 1) - count` nets missing ids against late duplicates
 //!   whatever the order. `--exact` builds id sets to split the two;
@@ -48,13 +52,18 @@ use sbe_collector::{
     exchange::Exchange,
     record::{HEADER_LEN, Header, Tag},
     sbe::{
-        MessageHeader,
+        GroupSize16Encoding, MessageHeader,
         binance::{
             BestBidAskBlock, DepthDiffBlock, GroupSizeEncoding, TEMPLATE_BEST_BID_ASK,
             TEMPLATE_DEPTH_DIFF, TEMPLATE_DEPTH_SNAPSHOT, TEMPLATE_TRADES, TradesBlock,
         },
         event_key,
+        gate::{
+            self, FuturesBboBlock, FuturesTrade, FuturesTradeBlock, Market, ObuBlock, SpotBboBlock,
+            SpotTradeBlock,
+        },
         okx::{self, BboTbtBlock},
+        read_group,
     },
 };
 use zerocopy::FromBytes;
@@ -477,6 +486,8 @@ impl SeriesScan {
                 match self.exchange {
                     Exchange::BinanceSbeSpot => self.binance_payload(recv, payload),
                     Exchange::OkxSbe => self.okx_payload(payload),
+                    Exchange::GateSbeSpot => self.gate_payload(Market::Spot, recv, payload),
+                    Exchange::GateSbeFutures => self.gate_payload(Market::Futures, recv, payload),
                 }
             }
             Tag::Rest => self.rest_records += 1,
@@ -579,6 +590,94 @@ impl SeriesScan {
             okx::TEMPLATE_BBO_TBT => self.okx_bbo(body),
             _ => self.bad_records += 1,
         }
+    }
+
+    fn gate_payload(&mut self, market: Market, recv: i64, payload: &[u8]) {
+        let Ok((header, body)) = MessageHeader::read_from_prefix(payload) else {
+            self.bad_records += 1;
+            return;
+        };
+        let groups = size_of::<MessageHeader>() + usize::from(header.block_length.get());
+        let decoded = match (market, header.template_id.get()) {
+            (Market::Spot, gate::TEMPLATE_BBO) => SpotBboBlock::read_from_prefix(body)
+                .map(|(block, _)| self.gate_bbo(block.u.get(), block.t.get()))
+                .is_ok(),
+            (Market::Futures, gate::TEMPLATE_BBO) => FuturesBboBlock::read_from_prefix(body)
+                .map(|(block, _)| self.gate_bbo(block.u.get(), block.t.get()))
+                .is_ok(),
+            (Market::Spot, gate::TEMPLATE_PUBLIC_TRADE) => SpotTradeBlock::read_from_prefix(body)
+                .map(|(block, _)| {
+                    let state = self.stream(Stream::Trades);
+                    state.stats.messages += 1;
+                    state.check_time(block.create_time_us.get());
+                    let id = block.id_market.get() as i64;
+                    state.chain(id, recv);
+                    state.observe_point_id(id);
+                })
+                .is_ok(),
+            (Market::Futures, gate::TEMPLATE_PUBLIC_TRADE) => {
+                FuturesTradeBlock::read_from_prefix(body).is_ok()
+                    && self.gate_futures_trades(recv, payload, groups)
+            }
+            (_, gate::TEMPLATE_OBU) => ObuBlock::read_from_prefix(body)
+                .map(|(block, _)| self.gate_obu(recv, &block))
+                .is_ok(),
+            _ => false,
+        };
+        if !decoded {
+            self.bad_records += 1;
+        }
+    }
+
+    /// `u` must not go backwards: Gate samples `book_ticker` per connection.
+    fn gate_bbo(&mut self, u: i64, t: i64) {
+        let state = self.stream(Stream::BestBidAsk);
+        state.stats.messages += 1;
+        state.check_time(t);
+        state.non_decreasing(u);
+    }
+
+    /// Futures trades come in a group, each with an id one past the last.
+    fn gate_futures_trades(&mut self, recv: i64, payload: &[u8], mut offset: usize) -> bool {
+        let Some(group) = read_group::<GroupSize16Encoding>(payload, &mut offset) else {
+            return false;
+        };
+        let state = self.stream(Stream::Trades);
+        state.stats.messages += 1;
+        for _ in 0..group.count {
+            let Some(Ok((trade, _))) = payload.get(offset..).map(FuturesTrade::read_from_prefix)
+            else {
+                return false;
+            };
+            state.check_time(trade.t.get());
+            let id = trade.id.get() as i64;
+            state.chain(id, recv);
+            state.observe_point_id(id);
+            offset += group.stride;
+        }
+        true
+    }
+
+    /// A delta starts at the previous `u` plus one; a full snapshot carries
+    /// no `U` to check and re-anchors. Redundant connections interleave, so
+    /// the chain tracks its running maximum and only forward breaks count.
+    fn gate_obu(&mut self, recv: i64, block: &ObuBlock) {
+        let state = self.stream(Stream::DepthDiff);
+        state.stats.messages += 1;
+        state.check_time(block.t.get());
+        let (first, last) = (block.first_id.get(), block.last_id.get());
+        if block.full == 0
+            && let Some(prev) = state.last_id
+        {
+            if last <= prev {
+                state.stats.seq_back_events += 1;
+            } else if first > prev + 1 {
+                state.stats.seq_fwd_events += 1;
+                state.stats.seq_fwd_ids += (first - prev - 1) as u64;
+                state.note_break(recv);
+            }
+        }
+        state.advance(last);
     }
 
     /// `seqId` must not go backwards. Each connection samples `bbo-tbt` its

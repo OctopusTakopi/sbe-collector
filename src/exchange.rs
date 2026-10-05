@@ -14,7 +14,7 @@ use std::{
 
 use clap::ValueEnum;
 
-use crate::sbe::{binance, okx};
+use crate::sbe::{binance, gate, okx};
 
 /// An exchange's SBE feed. The default is the exchange of a directory
 /// recorded before markers existed.
@@ -26,6 +26,11 @@ pub enum Exchange {
     /// OKX's `public-sbe` endpoint, every instrument type on one connection.
     #[value(name = "okxsbe")]
     OkxSbe,
+    #[value(name = "gatesbespot")]
+    GateSbeSpot,
+    /// Gate's USDT-settled perpetual futures.
+    #[value(name = "gatesbefutures")]
+    GateSbeFutures,
 }
 
 /// The file naming a directory's exchange: one line, its command-line
@@ -39,6 +44,8 @@ impl Exchange {
         match self {
             Self::BinanceSbeSpot => "binancesbespot",
             Self::OkxSbe => "okxsbe",
+            Self::GateSbeSpot => "gatesbespot",
+            Self::GateSbeFutures => "gatesbefutures",
         }
     }
 
@@ -49,7 +56,8 @@ impl Exchange {
     /// Binance stamps `eventTime` when it serialises for a particular
     /// connection: redundant connections receive one event with stamps
     /// 18-37 us apart. OKX stamps the gateway's `outTime`, and its REST
-    /// snapshot has none.
+    /// snapshot has none. Every Gate template starts with the server's send
+    /// `time`.
     pub fn stamp(self, template_id: u16) -> Option<Range<usize>> {
         match self {
             Self::BinanceSbeSpot => (binance::TEMPLATE_TRADES..=binance::TEMPLATE_DEPTH_DIFF)
@@ -58,6 +66,7 @@ impl Exchange {
             Self::OkxSbe => okx::STREAM_TEMPLATES
                 .contains(&template_id)
                 .then_some(okx::OUT_TIME),
+            Self::GateSbeSpot | Self::GateSbeFutures => Some(gate::TIME),
         }
     }
 

@@ -566,3 +566,199 @@ fn okx_recordings_are_read_and_checked() {
 
     fs::remove_dir_all(&dir).unwrap();
 }
+
+const GATE_BBO: u16 = 1;
+const GATE_PUBLIC_TRADE: u16 = 2;
+const GATE_OBU: u16 = 3;
+
+/// Gate's schema 1 header (version 1).
+fn gate_header(block_length: u16, template_id: u16) -> Vec<u8> {
+    [block_length, template_id, 1, 1]
+        .iter()
+        .flat_map(|field| field.to_le_bytes())
+        .collect()
+}
+
+/// The channel's and the instrument's names that end every Gate frame.
+fn gate_names(frame: &mut Vec<u8>, channel: &str, name: &str) {
+    for text in [channel, name] {
+        frame.push(text.len() as u8);
+        frame.extend_from_slice(text.as_bytes());
+    }
+}
+
+/// A `bbo` frame; futures put the ask first.
+fn gate_bbo(futures: bool, time: i64, u: i64) -> Vec<u8> {
+    let mut frame = gate_header(59, GATE_BBO);
+    frame.extend_from_slice(&time.to_le_bytes());
+    frame.push(2);
+    frame.extend_from_slice(&(time - 1_000).to_le_bytes());
+    frame.extend_from_slice(&u.to_le_bytes());
+    frame.extend_from_slice(&[(-1i8) as u8, (-6i8) as u8]);
+    let bid = [858_292i64, 3_887_000];
+    let ask = [858_293i64, 91_320_000];
+    let (first, second) = if futures { (ask, bid) } else { (bid, ask) };
+    for field in first.into_iter().chain(second) {
+        frame.extend_from_slice(&field.to_le_bytes());
+    }
+    let channel = if futures {
+        "futures.book_ticker"
+    } else {
+        "spot.book_ticker"
+    };
+    gate_names(&mut frame, channel, "BTC_USDT");
+    frame
+}
+
+/// A spot trade: one per frame.
+fn gate_spot_trade(time: i64, id_market: u64, buy: bool) -> Vec<u8> {
+    let mut frame = gate_header(60, GATE_PUBLIC_TRADE);
+    frame.extend_from_slice(&time.to_le_bytes());
+    frame.extend_from_slice(&[2, (-1i8) as u8, (-6i8) as u8]);
+    frame.extend_from_slice(&id_market.to_le_bytes());
+    frame.extend_from_slice(&id_market.to_le_bytes());
+    frame.extend_from_slice(&(time / 1_000_000 * 1_000_000).to_le_bytes());
+    frame.extend_from_slice(&(time - 500).to_le_bytes());
+    frame.push(u8::from(buy));
+    frame.extend_from_slice(&858_293i64.to_le_bytes());
+    frame.extend_from_slice(&41_100i64.to_le_bytes());
+    gate_names(&mut frame, "spot.trades", "BTC_USDT");
+    let range = format!("{id_market}-{id_market}");
+    frame.push(range.len() as u8);
+    frame.extend_from_slice(range.as_bytes());
+    frame
+}
+
+/// Futures trades: a group of them per frame, sells with negative sizes.
+fn gate_futures_trades(time: i64, ids: &[u64]) -> Vec<u8> {
+    let mut frame = gate_header(11, GATE_PUBLIC_TRADE);
+    frame.extend_from_slice(&time.to_le_bytes());
+    frame.extend_from_slice(&[2, (-1i8) as u8, 0]);
+    frame.extend_from_slice(&32u16.to_le_bytes());
+    frame.extend_from_slice(&(ids.len() as u16).to_le_bytes());
+    for (index, &id) in ids.iter().enumerate() {
+        frame.extend_from_slice(&(time - 900 + index as i64).to_le_bytes());
+        frame.extend_from_slice(&id.to_le_bytes());
+        let size = if id % 2 == 0 { 41_100i64 } else { -17_100 };
+        frame.extend_from_slice(&size.to_le_bytes());
+        frame.extend_from_slice(&858_293i64.to_le_bytes());
+    }
+    gate_names(&mut frame, "futures.trades", "BTC_USDT");
+    frame
+}
+
+/// An `obu` frame of the 50-level stream.
+fn gate_obu(channel: &str, time: i64, full: bool, ids: [i64; 2], levels: [u16; 2]) -> Vec<u8> {
+    let mut frame = gate_header(36, GATE_OBU);
+    frame.extend_from_slice(&time.to_le_bytes());
+    frame.push(2);
+    frame.extend_from_slice(&(time - 2_000).to_le_bytes());
+    frame.push(u8::from(full));
+    frame.extend_from_slice(&ids[0].to_le_bytes());
+    frame.extend_from_slice(&ids[1].to_le_bytes());
+    frame.extend_from_slice(&[(-1i8) as u8, (-6i8) as u8]);
+    for (count, best, step) in [(levels[0], 858_292, -1), (levels[1], 858_293, 1)] {
+        frame.extend_from_slice(&16u16.to_le_bytes());
+        frame.extend_from_slice(&count.to_le_bytes());
+        for level in 0..i64::from(count) {
+            frame.extend_from_slice(&(best + step * level).to_le_bytes());
+            frame.extend_from_slice(&(1_000_000 * (level + 1)).to_le_bytes());
+        }
+    }
+    gate_names(&mut frame, channel, "ob.BTC_USDT.50");
+    frame
+}
+
+/// A `gatesbespot` directory, with a handover's sidecar.
+fn gate_spot_fixtures(dir: &Path) {
+    fs::write(dir.join("_exchange"), "gatesbespot\n").unwrap();
+    let us = T0 / 1_000;
+    let obu = |time, full, ids, levels| gate_obu("spot.obu", time, full, ids, levels);
+    zstd_file(
+        &dir.join("btc_usdt_20260801.zst"),
+        &[
+            sbe(T0, &obu(us, true, [0, 100], [2, 7])),
+            sbe(T0 + 1, &obu(us + 20_000, false, [101, 105], [1, 0])),
+            sbe(T0 + 2, &gate_bbo(false, us + 21_000, 106)),
+            sbe(T0 + 3, &gate_spot_trade(us + 22_000, 1_000, true)),
+            sbe(T0 + 4, &gate_spot_trade(us + 23_000, 1_001, false)),
+            // Ids 106 and 107 never arrive.
+            sbe(T0 + 5, &obu(us + 40_000, false, [108, 110], [0, 1])),
+            // Another connection's sample of an earlier quote.
+            sbe(T0 + 6, &gate_bbo(false, us + 20_500, 104)),
+            // Trade 1,002 never arrives.
+            sbe(T0 + 7, &gate_spot_trade(us + 41_000, 1_003, true)),
+            // 6 s of silence, then a fresh connection's snapshot re-anchors.
+            sbe(
+                T0 + 6 * SECOND,
+                &obu(us + 6_000_000, true, [0, 115], [1, 1]),
+            ),
+            sbe(
+                T0 + 6 * SECOND + 1,
+                &obu(us + 6_020_000, false, [116, 117], [1, 1]),
+            ),
+            sbe(T0 + 6 * SECOND + 2, &{
+                let mut frame = gate_header(77, 7);
+                frame.extend_from_slice(&[0; 77]);
+                gate_names(&mut frame, "spot.tickers", "BTC_USDT");
+                frame
+            }),
+            sbe(T0 + 6 * SECOND + 3, &[1, 0, 1]),
+        ],
+    );
+    // The challenger's copies of the same events differ only in `time`.
+    zstd_file(
+        &dir.join("btc_usdt_20260801_1785542400000000001-42.zst"),
+        &[
+            sbe(T0 + 9, &gate_spot_trade(us + 41_000, 1_003, true)),
+            sbe(T0 + 6 * SECOND + 4, &gate_bbo(false, us + 6_030_000, 120)),
+        ],
+    );
+}
+
+/// A `gatesbefutures` directory.
+fn gate_futures_fixtures(dir: &Path) {
+    fs::write(dir.join("_exchange"), "gatesbefutures\n").unwrap();
+    let us = T0 / 1_000;
+    let obu = |time, full, ids, levels| gate_obu("futures.obu", time, full, ids, levels);
+    zstd_file(
+        &dir.join("btc_usdt_20260801.zst"),
+        &[
+            sbe(T0, &obu(us, true, [0, 500], [3, 3])),
+            sbe(T0 + 1, &gate_bbo(true, us + 1_000, 501)),
+            sbe(T0 + 2, &gate_futures_trades(us + 2_000, &[7_000, 7_001])),
+            sbe(T0 + 3, &obu(us + 20_000, false, [501, 503], [1, 1])),
+            sbe(
+                T0 + 4,
+                &gate_futures_trades(us + 21_000, &[7_002, 7_003, 7_004, 7_005, 7_006, 7_007]),
+            ),
+            // Trades 7,008 and 7,009 never arrive.
+            sbe(T0 + 5, &gate_futures_trades(us + 22_000, &[7_010])),
+        ],
+    );
+}
+
+#[test]
+fn gate_recordings_are_read_and_checked() {
+    for (name, fixtures) in [
+        ("gate_spot", gate_spot_fixtures as fn(&Path)),
+        ("gate_futures", gate_futures_fixtures),
+    ] {
+        let dir = fixture_dir(name);
+        fixtures(&dir);
+
+        let reader = run(
+            env!("CARGO_BIN_EXE_reader"),
+            &dir,
+            &["btc_usdt_20260801.zst"],
+        );
+        assert!(reader.status.success());
+        assert_golden(&format!("reader_{name}.stdout"), &reader.stdout);
+
+        let gaps = run(env!("CARGO_BIN_EXE_gap_detector"), &dir, &["."]);
+        assert!(gaps.status.success());
+        assert_golden(&format!("gap_detector_{name}.stdout"), &gaps.stdout);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+}

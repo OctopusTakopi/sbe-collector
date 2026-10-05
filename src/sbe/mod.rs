@@ -1,6 +1,7 @@
 //! SBE framing every venue's schema shares, and each venue's fixed layouts.
 
 pub mod binance;
+pub mod gate;
 pub mod okx;
 
 use std::ops::Range;
@@ -11,6 +12,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 pub(crate) type U16LE = zerocopy::byteorder::U16<LittleEndian>;
 pub(crate) type U32LE = zerocopy::byteorder::U32<LittleEndian>;
 pub(crate) type I32LE = zerocopy::byteorder::I32<LittleEndian>;
+pub(crate) type U64LE = zerocopy::byteorder::U64<LittleEndian>;
 pub(crate) type I64LE = zerocopy::byteorder::I64<LittleEndian>;
 
 #[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned, Debug, Copy, Clone)]
@@ -59,6 +61,15 @@ pub fn read_group<D: Dimension>(data: &[u8], offset: &mut usize) -> Option<Group
     let (dimension, _) = D::read_from_prefix(data.get(*offset..)?).ok()?;
     *offset += size_of::<D>();
     Some(dimension.group())
+}
+
+/// The `varString8` at `*offset` (a length byte, then that many bytes),
+/// stepping past it.
+pub fn var_str8<'a>(data: &'a [u8], offset: &mut usize) -> Option<&'a [u8]> {
+    let len = usize::from(*data.get(*offset)?);
+    let text = data.get(*offset + 1..*offset + 1 + len)?;
+    *offset += 1 + len;
+    Some(text)
 }
 
 /// An event's identity across connections: the frame hashed without the
@@ -127,6 +138,17 @@ mod tests {
             event_key(&runt, Some(8..16)),
             xxhash_rust::xxh3::xxh3_128(&runt)
         );
+    }
+
+    #[test]
+    fn a_var_string_is_read_and_stepped_past() {
+        let data = b"\x03abc\x00\x05xy";
+        let mut offset = 0;
+        assert_eq!(var_str8(data, &mut offset), Some(&b"abc"[..]));
+        assert_eq!(var_str8(data, &mut offset), Some(&b""[..]));
+        assert_eq!(offset, 5);
+        assert_eq!(var_str8(data, &mut offset), None, "cut short");
+        assert_eq!(offset, 5);
     }
 
     #[test]

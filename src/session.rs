@@ -147,6 +147,9 @@ pub(crate) enum Reason {
     /// The venue reported an error on a session already carrying the feed;
     /// a fresh one resubscribes everything.
     VenueError,
+    /// This socket's own book stream skipped an update; a fresh subscription
+    /// starts from a full snapshot.
+    Gap,
 }
 
 impl Reason {
@@ -155,6 +158,7 @@ impl Reason {
             Reason::ServerShutdown => "server shutdown announced",
             Reason::Age => "connection age limit",
             Reason::VenueError => "the venue reported an error",
+            Reason::Gap => "gap in this connection's book stream",
         }
     }
 }
