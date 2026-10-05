@@ -7,16 +7,16 @@ it.
 Start the replacement with the same arguments without stopping the incumbent:
 
 ```sh
-new/sbe-collector -c 2 /data/binance-sbe binancesbespot btcusdt ethusdt
+new/sbe-collector -c 2 /data/sbe/okx okxsbe BTC-USDT BTC-USDT-SWAP
 ```
 
 The replacement must match the incumbent's exchange, ordered symbol list,
 connection count, and canonical output path. While warming up it may write a
 run-local sidecar (`<symbol>_<UTC-date>_<run-id>.zst`) if today's canonical
 daily file is already locked by the incumbent. Only after every configured
-connection is currently delivering frames, the writer has accepted its first
-record, and that state has remained continuously healthy for two seconds does
-it request takeover. A disconnect or dropped delivery restarts the overlap
+connection has every subscription answered and is currently delivering
+frames, the writer has accepted its first record, and that state has remained
+continuously healthy for two seconds does it request takeover. A disconnect or dropped delivery restarts the overlap
 grace; the incumbent then drains, fsyncs, and exits only after a healthy
 request.
 

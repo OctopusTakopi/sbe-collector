@@ -7,7 +7,8 @@ pub const HEADER_LEN: usize = 13;
 pub enum Tag {
     /// Raw SBE stream frame.
     Sbe = b'S',
-    /// REST depth snapshot (JSON).
+    /// REST book snapshot as the venue returned it: JSON from Binance, SBE
+    /// template 1006 from OKX.
     Rest = b'R',
 }
 
