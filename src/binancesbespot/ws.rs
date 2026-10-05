@@ -5,6 +5,7 @@ use std::{
 
 use bytes::Bytes;
 use fastwebsockets::OpCode;
+use hyper::header::{HeaderMap, HeaderValue};
 use jiff::Timestamp;
 use rustls::ClientConfig;
 use tokio::{
@@ -238,13 +239,21 @@ where
 /// Where every connection slot connects.
 pub(crate) struct Endpoint {
     url: String,
-    api_key: String,
+    /// `X-MBX-APIKEY`, validated once.
+    api_key: HeaderValue,
     tls: Arc<ClientConfig>,
 }
 
 impl Endpoint {
     /// The combined-stream URL for every `$symbol` stream of every symbol.
-    pub(crate) fn new(streams: &[impl AsRef<str>], symbols: &[String], api_key: String) -> Self {
+    pub(crate) fn new(
+        streams: &[impl AsRef<str>],
+        symbols: &[String],
+        api_key: &str,
+    ) -> anyhow::Result<Self> {
+        let mut api_key = HeaderValue::from_str(api_key)
+            .map_err(|_| anyhow::anyhow!("BINANCE_API_KEY is not a valid header value"))?;
+        api_key.set_sensitive(true);
         let streams = symbols
             .iter()
             .flat_map(|symbol| {
@@ -255,11 +264,17 @@ impl Endpoint {
             })
             .collect::<Vec<_>>()
             .join("/");
-        Self {
+        Ok(Self {
             url: format!("wss://{WSS_HOST}:{WSS_PORT}/stream?streams={streams}"),
             api_key,
             tls: Arc::new(crate::ws::build_tls_config()),
-        }
+        })
+    }
+
+    fn headers(&self) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-mbx-apikey", self.api_key.clone());
+        headers
     }
 }
 
@@ -401,7 +416,8 @@ where
                 }
             }
             OpCode::Close => {
-                warn!(connection, lifetime = ?opened.elapsed(), "WS closed by server");
+                let (code, reason) = crate::ws::close_reason(&message.payload);
+                warn!(connection, lifetime = ?opened.elapsed(), ?code, %reason, "WS closed by server");
                 conn.flush_close().await;
                 return SessionEnd::Lost(Loss::ClosedByServer);
             }
@@ -479,26 +495,23 @@ pub(crate) async fn keep_connection(
         while lingering.try_join_next().is_some() {}
 
         let opened = Instant::now();
-        let conn = match crate::ws::connect(
-            &endpoint.url,
-            Some(&endpoint.api_key),
-            Arc::clone(&endpoint.tls),
-        )
-        .await
-        {
-            Ok(conn) => conn,
-            Err(err) => {
-                error!(
-                    connection,
-                    ?err,
-                    attempt = error_count + 1,
-                    still_delivering = handover.waiting(),
-                    "WS handshake failed"
-                );
-                back_off(&mut error_count, None).await;
-                continue;
-            }
-        };
+        let conn =
+            match crate::ws::connect(&endpoint.url, endpoint.headers(), Arc::clone(&endpoint.tls))
+                .await
+            {
+                Ok(conn) => conn,
+                Err(err) => {
+                    error!(
+                        connection,
+                        ?err,
+                        attempt = error_count + 1,
+                        still_delivering = handover.waiting(),
+                        "WS handshake failed"
+                    );
+                    back_off(&mut error_count, None).await;
+                    continue;
+                }
+            };
 
         let id = next_session;
         next_session += 1;
@@ -905,8 +918,9 @@ mod tests {
         let endpoint = Endpoint::new(
             &["$symbol@trade", "$symbol@depth"],
             &["BTCUSDT".to_owned(), "ethusdt".to_owned()],
-            "key".to_owned(),
-        );
+            "key",
+        )
+        .unwrap();
         assert_eq!(
             endpoint.url,
             "wss://stream-sbe.binance.com:9443/stream?streams=\

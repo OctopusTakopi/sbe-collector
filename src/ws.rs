@@ -1,10 +1,12 @@
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use fastwebsockets::{
-    FragmentCollectorRead, Frame, OpCode, Payload, WebSocket, WebSocketWrite, handshake,
+    FragmentCollectorRead, Frame, OpCode, Payload, WebSocket, WebSocketError, WebSocketWrite,
+    handshake,
 };
 use http_body_util::Empty;
 use hyper::Request;
+use hyper::header::HeaderMap;
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
 use rustls::ClientConfig;
@@ -229,11 +231,15 @@ impl Outgoing {
 pub struct FrameSender(mpsc::Sender<Outgoing>);
 
 impl FrameSender {
-    pub async fn pong(&self, payload: impl Into<Vec<u8>>) -> Result<()> {
+    async fn send(&self, outgoing: Outgoing) -> Result<()> {
         self.0
-            .send(Outgoing::Pong(payload.into()))
+            .send(outgoing)
             .await
             .map_err(|_| anyhow!("websocket writer stopped"))
+    }
+
+    pub async fn pong(&self, payload: impl Into<Vec<u8>>) -> Result<()> {
+        self.send(Outgoing::Pong(payload.into())).await
     }
 
     /// Start a close handshake from this side; pair with
@@ -247,10 +253,20 @@ impl FrameSender {
         let reason = &reason.as_bytes()[..reason.len().min(room)];
         let mut payload = code.to_be_bytes().to_vec();
         payload.extend_from_slice(reason);
-        self.0
-            .send(Outgoing::CloseRaw(payload))
-            .await
-            .map_err(|_| anyhow!("websocket writer stopped"))
+        self.send(Outgoing::CloseRaw(payload)).await
+    }
+}
+
+/// The status code and reason of a close frame's payload, for the log: a
+/// venue's own codes (OKX 4004 "no data received in 30s", 4005 "buffer is
+/// full") are what tell one disconnect from another.
+pub fn close_reason(payload: &[u8]) -> (Option<u16>, std::borrow::Cow<'_, str>) {
+    match payload {
+        [high, low, reason @ ..] => (
+            Some(u16::from_be_bytes([*high, *low])),
+            String::from_utf8_lossy(reason),
+        ),
+        _ => (None, std::borrow::Cow::Borrowed("")),
     }
 }
 
@@ -370,23 +386,54 @@ where
     }
 }
 
-/// Open a TLS WebSocket to `url`, optionally sending `X-MBX-APIKEY`, within
-/// [`CONNECT_TIMEOUT`]: none of the three handshakes has a deadline of its own.
+/// Why a connection attempt failed.
+#[derive(Debug, thiserror::Error)]
+pub enum ConnectError {
+    /// The venue rejected the upgrade's credentials. OKX also answers 401 to
+    /// a signature whose timestamp is more than 30 s off, so the clock is a
+    /// suspect too.
+    #[error(
+        "the venue refused the credentials (HTTP 401): check the API key, secret, passphrase and the system clock"
+    )]
+    Unauthorized,
+    #[error("{0:#}")]
+    Failed(#[from] anyhow::Error),
+}
+
+/// Open a TLS WebSocket to `url` with `headers` added to the upgrade request,
+/// within [`CONNECT_TIMEOUT`]: none of the three handshakes has a deadline of
+/// its own.
 pub async fn connect(
     url: &str,
-    api_key: Option<&str>,
+    headers: HeaderMap,
     tls: Arc<ClientConfig>,
-) -> Result<Connection> {
-    timeout(CONNECT_TIMEOUT, handshake_all(url, api_key, tls))
+) -> Result<Connection, ConnectError> {
+    timeout(CONNECT_TIMEOUT, handshake_all(url, headers, tls))
         .await
         .map_err(|_| anyhow!("connection attempt timed out after {CONNECT_TIMEOUT:?}"))?
 }
 
+/// The websocket upgrade request for `url`, carrying `headers` as well.
+fn upgrade_request(url: &Url, headers: HeaderMap) -> Result<Request<Empty<Bytes>>> {
+    let host = url.host_str().ok_or_else(|| anyhow!("No host in url"))?;
+    let mut request = Request::builder()
+        .uri(url.as_str())
+        .header("Host", host)
+        .header("Upgrade", "websocket")
+        .header("Connection", "Upgrade")
+        .header("Sec-WebSocket-Key", handshake::generate_key())
+        .header("Sec-WebSocket-Version", "13")
+        .body(Empty::<Bytes>::new())
+        .context("Failed to build request")?;
+    request.headers_mut().extend(headers);
+    Ok(request)
+}
+
 async fn handshake_all(
     url: &str,
-    api_key: Option<&str>,
+    headers: HeaderMap,
     tls: Arc<ClientConfig>,
-) -> Result<Connection> {
+) -> Result<Connection, ConnectError> {
     let url = Url::parse(url).context("Invalid URL")?;
     let host = url.host_str().ok_or_else(|| anyhow!("No host in url"))?;
     let port = url
@@ -407,25 +454,13 @@ async fn handshake_all(
         .await
         .context("Failed to perform TLS handshake")?;
 
-    let mut req_builder = Request::builder()
-        .uri(url.as_str())
-        .header("Host", host)
-        .header("Upgrade", "websocket")
-        .header("Connection", "Upgrade")
-        .header("Sec-WebSocket-Key", handshake::generate_key())
-        .header("Sec-WebSocket-Version", "13");
-
-    if let Some(key) = api_key {
-        req_builder = req_builder.header("X-MBX-APIKEY", key);
-    }
-
-    let req = req_builder
-        .body(Empty::<Bytes>::new())
-        .context("Failed to build request")?;
-
-    let (mut ws, _) = handshake::client(&SpawnExecutor, req, tls_stream)
+    let request = upgrade_request(&url, headers)?;
+    let (mut ws, _) = handshake::client(&SpawnExecutor, request, tls_stream)
         .await
-        .map_err(|e| anyhow!("WebSocket handshake failed: {:?}", e))?;
+        .map_err(|error| match error {
+            WebSocketError::InvalidStatusCode(401) => ConnectError::Unauthorized,
+            error => anyhow!("WebSocket handshake failed: {error:?}").into(),
+        })?;
     // Pings reach the caller, which answers them through the writer task.
     ws.set_auto_pong(false);
 
@@ -596,6 +631,41 @@ mod tests {
         let reply = server.read_frame().await.unwrap();
         assert_eq!(reply.opcode, OpCode::Close);
         assert_eq!(&reply.payload[2..], b"going away");
+    }
+
+    #[test]
+    fn the_upgrade_request_carries_the_venues_headers() {
+        let url = Url::parse("wss://ws.okx.com:8443/ws/v5/public-sbe").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("ok-access-key", "key".parse().unwrap());
+        headers.insert("ok-access-passphrase", "phrase".parse().unwrap());
+
+        let request = upgrade_request(&url, headers).unwrap();
+
+        let headers = request.headers();
+        assert_eq!(headers["host"], "ws.okx.com");
+        assert_eq!(headers["upgrade"], "websocket");
+        assert_eq!(headers["ok-access-key"], "key");
+        assert_eq!(headers["ok-access-passphrase"], "phrase");
+        assert_eq!(request.uri(), "wss://ws.okx.com:8443/ws/v5/public-sbe");
+    }
+
+    #[test]
+    fn an_unauthorized_upgrade_names_the_credentials() {
+        let message = ConnectError::Unauthorized.to_string();
+        assert!(message.contains("401"), "{message}");
+        assert!(message.contains("clock"), "{message}");
+    }
+
+    #[test]
+    fn a_close_payload_yields_its_code_and_reason() {
+        let mut payload = 4004u16.to_be_bytes().to_vec();
+        payload.extend_from_slice(b"No data received in 30s");
+        assert_eq!(
+            close_reason(&payload),
+            (Some(4004), "No data received in 30s".into())
+        );
+        assert_eq!(close_reason(&[]), (None, "".into()));
     }
 
     /// SBE market data arrives as binary frames.

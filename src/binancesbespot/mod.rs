@@ -259,7 +259,7 @@ pub async fn run_collection(
     let (ws_tx, ws_rx) =
         channel::<(Timestamp, Bytes)>(crate::WS_QUEUE_CAPACITY.saturating_mul(connections));
     let mut feed = Feed::new(ws_rx, shutdown);
-    let endpoint = Arc::new(Endpoint::new(&STREAMS, &symbols, api_key));
+    let endpoint = Arc::new(Endpoint::new(&STREAMS, &symbols, &api_key)?);
     let symbols: Vec<Symbol> = symbols
         .iter()
         .map(|symbol| Symbol::from(symbol.to_ascii_lowercase()))
