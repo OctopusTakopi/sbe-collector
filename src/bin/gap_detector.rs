@@ -637,23 +637,31 @@ impl SeriesScan {
         state.non_decreasing(u);
     }
 
-    /// Futures trades come in a group, each with an id one past the last.
+    /// Futures trades come in a group, each with an id one past the last. A
+    /// frame whose group does not fit is bad as a whole: none of it counts.
     fn gate_futures_trades(&mut self, recv: i64, payload: &[u8], mut offset: usize) -> bool {
         let Some(group) = read_group::<GroupSize16Encoding>(payload, &mut offset) else {
             return false;
         };
+        let end = group
+            .count
+            .checked_mul(group.stride)
+            .and_then(|len| offset.checked_add(len));
+        let Some(entries) = end.and_then(|end| payload.get(offset..end)) else {
+            return false;
+        };
+        if group.stride < size_of::<FuturesTrade>() {
+            return false;
+        }
         let state = self.stream(Stream::Trades);
         state.stats.messages += 1;
-        for _ in 0..group.count {
-            let Some(Ok((trade, _))) = payload.get(offset..).map(FuturesTrade::read_from_prefix)
-            else {
-                return false;
-            };
+        for entry in entries.chunks_exact(group.stride) {
+            let (trade, _) =
+                FuturesTrade::read_from_prefix(entry).expect("stride >= a trade's size");
             state.check_time(trade.t.get());
             let id = trade.id.get() as i64;
             state.chain(id, recv);
             state.observe_point_id(id);
-            offset += group.stride;
         }
         true
     }
@@ -1543,6 +1551,45 @@ mod tests {
         let s = stats(&scan, Stream::BestBidAsk);
         assert_eq!(s.seq_fwd_events, 0);
         assert_eq!(s.seq_back_events, 1);
+    }
+
+    /// A Gate futures trade frame whose group claims `claimed` trades and
+    /// holds one per id.
+    fn gate_futures_trades(ids: &[i64], claimed: u16) -> Vec<u8> {
+        let mut payload = Vec::new();
+        for field in [11u16, gate::TEMPLATE_PUBLIC_TRADE, 1, 1] {
+            payload.extend_from_slice(&field.to_le_bytes());
+        }
+        payload.extend_from_slice(&[0; 11]);
+        payload.extend_from_slice(&32u16.to_le_bytes());
+        payload.extend_from_slice(&claimed.to_le_bytes());
+        for &id in ids {
+            payload.extend_from_slice(&1i64.to_le_bytes());
+            payload.extend_from_slice(&id.to_le_bytes());
+            payload.extend_from_slice(&[0; 16]);
+        }
+        payload
+    }
+
+    #[test]
+    fn a_truncated_futures_trade_frame_counts_only_as_bad() {
+        let mut scan = SeriesScan {
+            exchange: Exchange::GateSbeFutures,
+            ..SeriesScan::default()
+        };
+        scan_record(
+            &mut scan,
+            1,
+            Tag::Sbe,
+            &gate_futures_trades(&[1, 2, 3, 4], 6),
+        );
+        assert_eq!(scan.bad_records, 1);
+        assert!(scan.streams[Stream::Trades as usize].is_none());
+
+        scan_record(&mut scan, 2, Tag::Sbe, &gate_futures_trades(&[1, 2, 4], 3));
+        let trades = stats(&scan, Stream::Trades);
+        assert_eq!((trades.messages, trades.id_count), (1, 3));
+        assert_eq!(trades.seq_fwd_ids, 1);
     }
 
     #[test]
