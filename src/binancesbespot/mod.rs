@@ -6,10 +6,7 @@ use std::{collections::HashMap, sync::Arc};
 use bytes::Bytes;
 use jiff::Timestamp;
 use tokio::{
-    sync::{
-        mpsc::{Sender, channel},
-        watch,
-    },
+    sync::{mpsc::Sender, watch},
     task::JoinSet,
 };
 use tracing::{error, warn};
@@ -27,10 +24,11 @@ use crate::{
     file::{Symbol, WriteRecord},
     quality::{QualityEvent, QualityReporter},
     readiness::Readiness,
+    session::{self, Protocol},
     throttler::{SNAPSHOT_WEIGHT_BUDGET, Throttler},
 };
 use snapshot::Snapshots;
-use ws::{Endpoint, keep_connection};
+use ws::Endpoint;
 
 /// Streams subscribed per symbol; `$symbol` becomes the lowercase symbol.
 const STREAMS: [&str; 4] = [
@@ -146,7 +144,7 @@ impl Ingest {
             );
             self.quality.report(QualityEvent::FeedDegraded {
                 at_ns: QualityEvent::now_ns(),
-                source: "binance-sbe-spot".to_owned(),
+                source: Endpoint::SOURCE.to_owned(),
                 detail: format!(
                     "could not identify symbol in SBE frame (template_id={template_id}, len={})",
                     data.len()
@@ -204,7 +202,7 @@ impl Ingest {
         );
         self.quality.report(QualityEvent::FeedDegraded {
             at_ns: QualityEvent::now_ns(),
-            source: format!("binance-sbe-spot/{symbol}"),
+            source: format!("{}/{symbol}", Endpoint::SOURCE),
             detail: format!(
                 "depth gap: expected first_u={expected} but got {first_id} (prev_u={prev})"
             ),
@@ -256,9 +254,6 @@ pub async fn run_collection(
         api_key,
         connections,
     } = subscription;
-    let (ws_tx, ws_rx) =
-        channel::<(Timestamp, Bytes)>(crate::WS_QUEUE_CAPACITY.saturating_mul(connections));
-    let mut feed = Feed::new(ws_rx, shutdown);
     let endpoint = Arc::new(Endpoint::new(&STREAMS, &symbols, &api_key)?);
     let symbols: Vec<Symbol> = symbols
         .iter()
@@ -273,21 +268,14 @@ pub async fn run_collection(
         quality.clone(),
     );
 
-    for connection in 0..connections {
-        let endpoint = Arc::clone(&endpoint);
-        let ws_tx = ws_tx.clone();
-        let quality = quality.clone();
-        let readiness = readiness.clone();
-        ingest.tasks.spawn(async move {
-            tokio::time::sleep(crate::CONNECT_STAGGER * connection as u32).await;
-            keep_connection(endpoint, connection, ws_tx, quality, readiness).await;
-            Err(anyhow::anyhow!(
-                "websocket connection supervisor {connection} exited"
-            ))
-        });
-    }
-    // Only the connection tasks may keep the feed open.
-    drop(ws_tx);
+    let ws_rx = session::spawn_slots(
+        &mut ingest.tasks,
+        endpoint,
+        connections,
+        &quality,
+        &readiness,
+    );
+    let mut feed = Feed::new(ws_rx, shutdown);
     ingest.tasks.spawn(async move {
         snapshots.run_periodic(symbols, writer_tx).await;
         Err(anyhow::anyhow!("periodic depth-snapshot task exited"))

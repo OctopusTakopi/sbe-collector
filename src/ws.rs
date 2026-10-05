@@ -204,6 +204,7 @@ where
 
 /// A frame handed to the writer task.
 pub enum Outgoing {
+    Text(String),
     Pong(Vec<u8>),
     CloseRaw(Vec<u8>),
 }
@@ -219,6 +220,7 @@ impl Outgoing {
 
     fn into_frame(self) -> Frame<'static> {
         match self {
+            Outgoing::Text(text) => Frame::text(Payload::Owned(text.into_bytes())),
             Outgoing::Pong(payload) => Frame::pong(Payload::Owned(payload)),
             Outgoing::CloseRaw(payload) => Frame::close_raw(Payload::Owned(payload)),
         }
@@ -236,6 +238,11 @@ impl FrameSender {
             .send(outgoing)
             .await
             .map_err(|_| anyhow!("websocket writer stopped"))
+    }
+
+    /// A request in the venue's text protocol, such as a subscription.
+    pub async fn text(&self, text: String) -> Result<()> {
+        self.send(Outgoing::Text(text)).await
     }
 
     pub async fn pong(&self, payload: impl Into<Vec<u8>>) -> Result<()> {
@@ -655,6 +662,21 @@ mod tests {
         let message = ConnectError::Unauthorized.to_string();
         assert!(message.contains("401"), "{message}");
         assert!(message.contains("clock"), "{message}");
+    }
+
+    /// Subscriptions go out as text frames.
+    #[tokio::test]
+    async fn text_frames_reach_the_peer() {
+        let (conn, mut server) = duplex_pair();
+
+        conn.sender()
+            .text(r#"{"op":"subscribe"}"#.to_owned())
+            .await
+            .unwrap();
+
+        let text = server.read_frame().await.unwrap();
+        assert_eq!(text.opcode, OpCode::Text);
+        assert_eq!(&text.payload[..], br#"{"op":"subscribe"}"#);
     }
 
     #[test]

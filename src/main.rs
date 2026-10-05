@@ -6,6 +6,7 @@ mod file;
 mod handover;
 mod quality;
 mod readiness;
+mod session;
 mod throttler;
 mod ws;
 
@@ -25,19 +26,12 @@ use quality::{HandoverState, QualityEvent, QualityLog};
 use readiness::Readiness;
 
 const WRITER_QUEUE_CAPACITY: usize = 65_536;
-/// Per connection: all of them share the queue, so redundancy does not shrink
-/// the burst each one can absorb.
-const WS_QUEUE_CAPACITY: usize = 16_384;
 /// How long the collection task may spend handing what it already received
 /// to the writer before it is aborted.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the handover supervisor gets at exit: to deliver the drain
 /// report after a takeover, or to release the socket otherwise.
 const HANDOVER_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
-/// Redundant connections are opened this far apart. Simultaneous handshakes
-/// are what a venue's connection rate limit notices, and connections opened
-/// together are the ones recycled together.
-const CONNECT_STAGGER: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum Exchange {
