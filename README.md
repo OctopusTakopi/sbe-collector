@@ -45,8 +45,16 @@ export OKX_API_KEY=... OKX_SECRET_KEY=... OKX_PASSPHRASE=...
 ./target/release/sbe-collector -c 2 /data/sbe/gate/futures gatesbefutures BTC_USDT ETH_USDT
 ```
 
-Missing credentials, an unknown symbol, or credentials the venue refuses (401
-before any connection went live) end the process instead of retrying.
+Missing credentials or an unknown symbol end the process at startup. So does
+a venue refusing the websocket upgrade before any connection has delivered,
+as Binance does with 400 `Invalid X-MBX-APIKEY header` for a key used from an
+IP it is not whitelisted for, or OKX with 401 for a wrong passphrase. Any 4xx
+answer is a refusal except the ones that lapse, which are retried with
+backoff: a timeout (408), a rate limit (429), and Binance's WAF limit (403)
+and IP ban (418). The process stops with the venue's own reason, after
+sealing its files. A refusal once data has flowed, say a key revoked mid-run,
+is logged and reported to the quality log instead, while the connections
+still delivering carry on.
 
 ## vs hftbacktest / the JSON collector
 

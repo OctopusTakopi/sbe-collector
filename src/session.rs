@@ -6,7 +6,10 @@
 //! are the venue's protocol and stay with the [`Session`] that owns them.
 
 use std::{
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -26,7 +29,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     feed::BackgroundResult,
-    quality::QualityReporter,
+    quality::{QualityEvent, QualityReporter},
     readiness::Readiness,
     ws::{ConnectError, Connection, Delivery, FrameSender, Overflow},
 };
@@ -538,12 +541,20 @@ impl Pacer {
     }
 }
 
-/// A refusal no retry can cure ends the slot, and with it the collection, but
-/// only while the slot has never carried the feed: credentials or symbols
-/// wrong from the start. A slot that was delivering keeps retrying rather than
-/// take the process down mid-recording.
-fn give_up(ever_live: bool, refusal: impl std::fmt::Display) -> Option<anyhow::Error> {
-    (!ever_live).then(|| anyhow::anyhow!("{refusal}"))
+/// What every slot of the process shares.
+struct Shared {
+    tls: Arc<ClientConfig>,
+    pacer: Pacer,
+    /// Set once any slot's session has gone live.
+    delivered: AtomicBool,
+}
+
+/// A refusal no retry can cure ends the collection, but only while no slot
+/// has carried the feed: credentials or symbols wrong from the start. Once
+/// data has flowed, a refused slot keeps retrying while the others deliver,
+/// rather than take the process down mid-recording.
+fn give_up(delivered: bool, refusal: impl std::fmt::Display) -> Option<anyhow::Error> {
+    (!delivered).then(|| anyhow::anyhow!("{refusal}"))
 }
 
 /// Open one socket for the slot: its handshake, then the upgrade.
@@ -582,12 +593,11 @@ async fn back_off(error_count: &mut u32, lifetime: Option<Duration>) {
 /// replacement has data flowing. The overlap's duplicates are what
 /// [`crate::dedup`] is for.
 ///
-/// Returns once the consumer is gone, or with the refusal that ended a slot
-/// which never went live.
+/// Returns once the consumer is gone, or with a refusal met before any slot
+/// delivered.
 async fn keep_connection<P: Protocol>(
     protocol: Arc<P>,
-    tls: Arc<ClientConfig>,
-    pacer: Arc<Pacer>,
+    shared: Arc<Shared>,
     connection: usize,
     ws_tx: mpsc::Sender<Frame>,
     quality: QualityReporter,
@@ -614,22 +624,44 @@ async fn keep_connection<P: Protocol>(
     };
     let mut next_session: SessionId = 0;
     let mut first_attempt = true;
-    let mut ever_live = false;
+    // A refusal once the feed flowed (a key revoked mid-run) is reported
+    // once until a handshake succeeds again: the quality log syncs every
+    // event, and the refusal repeats each attempt.
+    let mut refusal_reported = false;
 
     loop {
         while lingering.try_join_next().is_some() {}
 
-        pacer.wait().await;
+        shared.pacer.wait().await;
         let opened = Instant::now();
-        let conn = match connect(&*protocol, &tls, connection, &mut first_attempt).await {
-            Ok(conn) => conn,
-            Err(ConnectError::Unauthorized)
-                if let Some(error) = give_up(
-                    ever_live,
-                    format!("{}: {}", P::SOURCE, ConnectError::Unauthorized),
-                ) =>
-            {
-                return Err(error);
+        let conn = match connect(&*protocol, &shared.tls, connection, &mut first_attempt).await {
+            Ok(conn) => {
+                refusal_reported = false;
+                conn
+            }
+            Err(refused @ ConnectError::Refused { .. }) => {
+                let delivered = shared.delivered.load(Ordering::Relaxed);
+                if let Some(error) = give_up(delivered, format!("{}: {refused}", P::SOURCE)) {
+                    return Err(error);
+                }
+                // Other slots may still be delivering, so this one keeps
+                // trying rather than end the recording.
+                error!(
+                    connection,
+                    %refused,
+                    attempt = error_count + 1,
+                    still_delivering = handover.waiting(),
+                    "WS handshake refused"
+                );
+                if !std::mem::replace(&mut refusal_reported, true) {
+                    slot.quality.report(QualityEvent::FeedDegraded {
+                        at_ns: QualityEvent::now_ns(),
+                        source: slot.source.clone(),
+                        detail: refused.to_string(),
+                    });
+                }
+                back_off(&mut error_count, None).await;
+                continue;
             }
             Err(err) => {
                 error!(
@@ -665,7 +697,7 @@ async fn keep_connection<P: Protocol>(
                     // thing that retires older ones. It can come from a
                     // relieved session, hence the shared channel and the id.
                     Some(Event::Live(live)) => {
-                        ever_live = true;
+                        shared.delivered.store(true, Ordering::Relaxed);
                         handover.on_live(live);
                     }
                     Some(Event::Relieve(from, reason)) if from == id => {
@@ -718,7 +750,10 @@ async fn keep_connection<P: Protocol>(
             }
             Step::Ended(SessionEnd::Lost(loss)) => {
                 if let Loss::Refused(_) = &loss
-                    && let Some(error) = give_up(ever_live, format!("{}: {loss}", P::SOURCE))
+                    && let Some(error) = give_up(
+                        shared.delivered.load(Ordering::Relaxed),
+                        format!("{}: {loss}", P::SOURCE),
+                    )
                 {
                     return Err(error);
                 }
@@ -751,18 +786,20 @@ pub(crate) fn spawn_slots<P: Protocol>(
     readiness: &Readiness,
 ) -> mpsc::Receiver<Frame> {
     let (ws_tx, ws_rx) = mpsc::channel(WS_QUEUE_CAPACITY.saturating_mul(connections));
-    let tls = Arc::new(crate::ws::build_tls_config());
-    let pacer = Arc::new(Pacer::default());
+    let shared = Arc::new(Shared {
+        tls: Arc::new(crate::ws::build_tls_config()),
+        pacer: Pacer::default(),
+        delivered: AtomicBool::new(false),
+    });
     for connection in 0..connections {
         let protocol = Arc::clone(&protocol);
-        let tls = Arc::clone(&tls);
-        let pacer = Arc::clone(&pacer);
+        let shared = Arc::clone(&shared);
         let ws_tx = ws_tx.clone();
         let quality = quality.clone();
         let readiness = readiness.clone();
         tasks.spawn(async move {
             tokio::time::sleep(CONNECT_STAGGER * connection as u32).await;
-            keep_connection(protocol, tls, pacer, connection, ws_tx, quality, readiness).await?;
+            keep_connection(protocol, shared, connection, ws_tx, quality, readiness).await?;
             Err(anyhow::anyhow!(
                 "websocket connection supervisor {connection} exited"
             ))
@@ -1122,7 +1159,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_slot_that_never_carried_the_feed_gives_up() {
+    fn only_a_process_that_never_carried_the_feed_gives_up() {
         let error = give_up(false, "okx-sbe: every subscription was refused").unwrap();
         assert_eq!(error.to_string(), "okx-sbe: every subscription was refused");
         assert!(give_up(true, "refused").is_none());

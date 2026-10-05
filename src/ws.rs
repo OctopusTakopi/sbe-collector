@@ -1,16 +1,15 @@
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use fastwebsockets::{
-    FragmentCollectorRead, Frame, OpCode, Payload, WebSocket, WebSocketError, WebSocketWrite,
-    handshake,
+    FragmentCollectorRead, Frame, OpCode, Payload, Role, WebSocket, WebSocketWrite, handshake,
 };
-use http_body_util::Empty;
-use hyper::Request;
-use hyper::header::HeaderMap;
+use http_body_util::{BodyExt, Empty};
+use hyper::body::Incoming;
+use hyper::header::{CONNECTION, HeaderMap, UPGRADE};
 use hyper::upgrade::Upgraded;
+use hyper::{Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use rustls::ClientConfig;
-use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadHalf};
@@ -19,7 +18,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use url::Url;
 
 use crate::quality::{QualityEvent, QualityReporter};
@@ -50,16 +49,14 @@ const CLOSE_FLUSH_GRACE: Duration = Duration::from_secs(1);
 
 const OVERFLOW_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 
-struct SpawnExecutor;
+/// How much of a refused upgrade's body is kept: the venue's reason, which
+/// is a line of text or JSON.
+const REFUSAL_LIMIT: usize = 4 * 1024;
 
-impl<F> hyper::rt::Executor<F> for SpawnExecutor
-where
-    F: Future<Output = ()> + Send + 'static,
-{
-    fn execute(&self, fut: F) {
-        tokio::spawn(fut);
-    }
-}
+/// How long a refused upgrade's reason may take once its status is in. The
+/// status decides; a body without a length ends only when the venue closes
+/// the socket.
+const REFUSAL_GRACE: Duration = Duration::from_secs(2);
 
 /// A TLS client config over the Mozilla root bundle. Build it once and share
 /// the `Arc`: each build clones ~140 root certificates.
@@ -407,15 +404,47 @@ where
 /// Why a connection attempt failed.
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectError {
-    /// The venue rejected the upgrade's credentials. OKX also answers 401 to
-    /// a signature whose timestamp is more than 30 s off, so the clock is a
-    /// suspect too.
+    /// The venue answered the upgrade with a client error that no wait
+    /// cures: it refuses the request itself, its API key above all. Binance
+    /// says "Invalid X-MBX-APIKEY header" under 400; OKX answers 401 to a
+    /// wrong key or passphrase, and to a signature more than 30 s old.
     #[error(
-        "the venue refused the credentials (HTTP 401): check the API key, secret, passphrase and the system clock"
+        "the venue refused the connection with HTTP {status} ({reason}): check the API key and \
+         its IP whitelist, the secret and passphrase, the symbols, and the system clock"
     )]
-    Unauthorized,
+    Refused { status: u16, reason: String },
     #[error("{0:#}")]
     Failed(#[from] anyhow::Error),
+}
+
+impl ConnectError {
+    /// A non-101 answer to the upgrade. A client error is the request's own
+    /// fault, except the ones that lapse: a timeout, a rate limit, and
+    /// Binance's WAF limit (403) and its IP ban for ignoring rate limits
+    /// (418), which lasts minutes to days.
+    fn answered(status: StatusCode, body: &[u8]) -> Self {
+        let reason = String::from_utf8_lossy(body).trim().to_owned();
+        let reason = if reason.is_empty() {
+            "no reason given".to_owned()
+        } else {
+            reason
+        };
+        let lapses = matches!(
+            status,
+            StatusCode::FORBIDDEN
+                | StatusCode::REQUEST_TIMEOUT
+                | StatusCode::IM_A_TEAPOT
+                | StatusCode::TOO_MANY_REQUESTS
+        );
+        if status.is_client_error() && !lapses {
+            Self::Refused {
+                status: status.as_u16(),
+                reason,
+            }
+        } else {
+            Self::Failed(anyhow!("WebSocket upgrade answered {status}: {reason}"))
+        }
+    }
 }
 
 /// Open a TLS WebSocket to `url` with `headers` added to the upgrade request,
@@ -473,16 +502,85 @@ async fn handshake_all(
         .context("Failed to perform TLS handshake")?;
 
     let request = upgrade_request(&url, headers)?;
-    let (mut ws, _) = handshake::client(&SpawnExecutor, request, tls_stream)
-        .await
-        .map_err(|error| match error {
-            WebSocketError::InvalidStatusCode(401) => ConnectError::Unauthorized,
-            error => anyhow!("WebSocket handshake failed: {error:?}").into(),
-        })?;
+    let mut ws = upgrade(request, tls_stream).await?;
     // Pings reach the caller, which answers them through the writer task.
     ws.set_auto_pong(false);
 
     Ok(Connection::from_websocket(ws))
+}
+
+/// Send the upgrade `request` over `socket` and take the websocket it
+/// opens, as `fastwebsockets::handshake::client` does, but keeping the
+/// venue's reason when it refuses: the body says which credential is wrong.
+async fn upgrade<S>(
+    request: Request<Empty<Bytes>>,
+    socket: S,
+) -> Result<WebSocket<TokioIo<Upgraded>>, ConnectError>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(socket))
+        .await
+        .context("HTTP handshake failed")?;
+    // Drives the connection until the upgrade hands the socket over. A
+    // failure here is the attempt's, which the caller reports.
+    tokio::spawn(async move {
+        if let Err(error) = conn.with_upgrades().await {
+            debug!(%error, "upgrade connection ended");
+        }
+    });
+    let mut response = sender
+        .send_request(request)
+        .await
+        .context("upgrade request failed")?;
+    let status = response.status();
+    if status != StatusCode::SWITCHING_PROTOCOLS {
+        let reason = refusal_reason(response.into_body()).await;
+        return Err(ConnectError::answered(status, &reason));
+    }
+    // RFC 6455 4.1: `Upgrade` is `websocket`, and `Connection` a list of
+    // tokens that includes `Upgrade`.
+    let headers = response.headers();
+    let upgrade = headers
+        .get(UPGRADE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"));
+    let connection = headers
+        .get_all(CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|token| token.trim().eq_ignore_ascii_case("upgrade"));
+    if !(upgrade && connection) {
+        return Err(anyhow!("a 101 answer that does not upgrade to a websocket").into());
+    }
+    let upgraded = hyper::upgrade::on(&mut response)
+        .await
+        .context("upgrade failed")?;
+    Ok(WebSocket::after_handshake(
+        TokioIo::new(upgraded),
+        Role::Client,
+    ))
+}
+
+/// The start of a refused upgrade's body, the venue's reason: up to
+/// [`REFUSAL_LIMIT`] bytes, whatever arrived within [`REFUSAL_GRACE`].
+async fn refusal_reason(mut body: Incoming) -> Vec<u8> {
+    let mut reason = Vec::new();
+    let read = async {
+        while reason.len() < REFUSAL_LIMIT {
+            let Some(Ok(frame)) = body.frame().await else {
+                break;
+            };
+            if let Ok(data) = frame.into_data() {
+                let room = REFUSAL_LIMIT - reason.len();
+                reason.extend_from_slice(&data[..data.len().min(room)]);
+            }
+        }
+    };
+    // Out of time, the reason is what came.
+    let _ = timeout(REFUSAL_GRACE, read).await;
+    reason
 }
 
 /// Both ends of an in-memory websocket, with no handshake and no network.
@@ -668,11 +766,137 @@ mod tests {
         assert_eq!(request.uri(), "wss://ws.okx.com:8443/ws/v5/public-sbe");
     }
 
+    /// A stand-in venue: reads the upgrade request, sends `response`, and
+    /// keeps the socket open.
+    fn venue(response: impl Into<Vec<u8>>) -> tokio::io::DuplexStream {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let response = response.into();
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                if server.read_exact(&mut byte).await.is_err() {
+                    return;
+                }
+                request.push(byte[0]);
+            }
+            server.write_all(&response).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        client
+    }
+
+    fn request() -> Request<Empty<Bytes>> {
+        let url =
+            Url::parse("wss://stream-sbe.binance.com:9443/stream?streams=btcusdt@trade").unwrap();
+        upgrade_request(&url, HeaderMap::new()).unwrap()
+    }
+
+    /// What Binance answered a key whitelisted for another IP.
+    #[tokio::test]
+    async fn a_refused_upgrade_keeps_the_venues_reason() {
+        let socket = venue(
+            "HTTP/1.1 400 Bad Request\r\ncontent-length: 27\r\n\r\nInvalid X-MBX-APIKEY header",
+        );
+
+        let Err(error) = upgrade(request(), socket).await else {
+            panic!("a 400 must not open a websocket");
+        };
+
+        assert!(
+            matches!(&error, ConnectError::Refused { status: 400, reason } if reason == "Invalid X-MBX-APIKEY header"),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("HTTP 400 (Invalid X-MBX-APIKEY header)"),
+            "{message}"
+        );
+        assert!(message.contains("API key"), "{message}");
+    }
+
+    /// An error page longer than the limit still names the reason.
+    #[tokio::test]
+    async fn a_long_reason_keeps_its_start() {
+        let page = format!("Forbidden{}", "x".repeat(2 * REFUSAL_LIMIT));
+        let socket = venue(format!(
+            "HTTP/1.1 400 Bad Request\r\ncontent-length: {}\r\n\r\n{page}",
+            page.len()
+        ));
+
+        let Err(ConnectError::Refused { reason, .. }) = upgrade(request(), socket).await else {
+            panic!("a 400 is a refusal");
+        };
+
+        assert_eq!(reason.len(), REFUSAL_LIMIT);
+        assert!(reason.starts_with("Forbiddenxxx"), "{reason}");
+    }
+
+    /// A body without a length ends with the socket; the venue holding it
+    /// open must not turn the refusal into a connect timeout.
+    #[tokio::test(start_paused = true)]
+    async fn a_reason_that_never_ends_is_cut_off() {
+        let socket = venue("HTTP/1.1 401 Unauthorized\r\n\r\n{\"code\":\"60024\"}");
+
+        let started = tokio::time::Instant::now();
+        let Err(ConnectError::Refused { status, reason }) = upgrade(request(), socket).await else {
+            panic!("a 401 is a refusal");
+        };
+
+        assert_eq!((status, reason.as_str()), (401, r#"{"code":"60024"}"#));
+        assert_eq!(started.elapsed(), REFUSAL_GRACE);
+    }
+
+    #[tokio::test]
+    async fn a_websocket_opens_on_101() {
+        for connection in ["Upgrade", "keep-alive, Upgrade"] {
+            let socket = venue(format!(
+                "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\n\
+                 connection: {connection}\r\n\r\n"
+            ));
+            assert!(upgrade(request(), socket).await.is_ok(), "{connection}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_101_that_keeps_the_connection_is_not_a_websocket() {
+        let socket = venue(
+            "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: keep-alive\r\n\r\n",
+        );
+        assert!(matches!(
+            upgrade(request(), socket).await,
+            Err(ConnectError::Failed(_))
+        ));
+    }
+
+    /// Rate limits, bans, timeouts and server errors pass; any other client
+    /// error is the request's own fault.
     #[test]
-    fn an_unauthorized_upgrade_names_the_credentials() {
-        let message = ConnectError::Unauthorized.to_string();
-        assert!(message.contains("401"), "{message}");
-        assert!(message.contains("clock"), "{message}");
+    fn only_lasting_client_errors_are_refusals() {
+        for status in [400, 401, 404, 414, 451] {
+            let status = StatusCode::from_u16(status).unwrap();
+            assert!(
+                matches!(
+                    ConnectError::answered(status, b""),
+                    ConnectError::Refused { .. }
+                ),
+                "{status}"
+            );
+        }
+        for status in [403, 408, 418, 429, 500, 502, 503] {
+            let status = StatusCode::from_u16(status).unwrap();
+            assert!(
+                matches!(ConnectError::answered(status, b""), ConnectError::Failed(_)),
+                "{status}"
+            );
+        }
+        let ConnectError::Refused { reason, .. } =
+            ConnectError::answered(StatusCode::UNAUTHORIZED, b"  ")
+        else {
+            unreachable!()
+        };
+        assert_eq!(reason, "no reason given");
     }
 
     /// Subscriptions go out as text, keepalives as protocol pings.
