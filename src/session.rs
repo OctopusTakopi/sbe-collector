@@ -388,6 +388,8 @@ where
     let mut relieved = false;
     let keepalive = keep_alive(sender.clone(), slot.keepalive);
     tokio::pin!(keepalive);
+    let unanswered = tokio::time::sleep_until(opened + SUBSCRIBE_TIMEOUT);
+    tokio::pin!(unanswered);
 
     loop {
         // Every arm that completes ends the session, which is what makes
@@ -426,6 +428,11 @@ where
                 Ok(Err(error)) => return SessionEnd::Lost(Loss::Io(error)),
                 Err(_) => return SessionEnd::Lost(Loss::Idle),
             },
+            // After `read`, so a reply already waiting is still taken; this
+            // arm is for a socket that sends nothing at all.
+            () = &mut unanswered, if !session.settled() => {
+                return SessionEnd::Lost(Loss::Unanswered);
+            }
         };
 
         // Checked between reads, not raced in the `select!`, which would
@@ -437,9 +444,6 @@ where
         {
             relieved = true;
             slot.request_replacement(id, Reason::Age);
-        }
-        if !session.settled() && opened.elapsed() >= SUBSCRIBE_TIMEOUT {
-            return SessionEnd::Lost(Loss::Unanswered);
         }
 
         let verdict = match message.opcode {
@@ -492,6 +496,10 @@ where
                 }
             }
             Verdict::End(loss) => return SessionEnd::Lost(loss),
+        }
+        // After the frame, so a reply arriving on the deadline still counts.
+        if !session.settled() && opened.elapsed() >= SUBSCRIBE_TIMEOUT {
+            return SessionEnd::Lost(Loss::Unanswered);
         }
     }
 }
@@ -1132,6 +1140,37 @@ mod tests {
             harness.session.await.unwrap(),
             SessionEnd::Lost(Loss::Unanswered)
         ));
+    }
+
+    /// A socket that sends nothing at all is given up at the deadline, not
+    /// at the idle timeout.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_unanswered_session_ends_at_the_deadline() {
+        let mut harness = Harness::with(Script { pending: 1 }, vec!["sub".to_owned()], None, None);
+        harness.expect_text("sub").await;
+        let start = tokio::time::Instant::now();
+
+        assert!(matches!(
+            harness.session.await.unwrap(),
+            SessionEnd::Lost(Loss::Unanswered)
+        ));
+        assert!(tokio::time::Instant::now() - start <= SUBSCRIBE_TIMEOUT);
+    }
+
+    /// Once every reply is in, the deadline no longer applies.
+    #[tokio::test(start_paused = true)]
+    async fn an_answered_session_outlives_the_deadline() {
+        let mut harness = Harness::with(Script { pending: 1 }, vec!["sub".to_owned()], None, None);
+        harness.expect_text("sub").await;
+        harness.send_text("ack").await;
+        tokio::time::advance(SUBSCRIBE_TIMEOUT).await;
+
+        harness.send_market_data().await;
+        assert!(matches!(
+            harness.events.recv().await,
+            Some(Event::Live(TEST_SESSION))
+        ));
+        assert!(!harness.session.is_finished());
     }
 
     /// The keepalive races the read without cancelling it: data on either
