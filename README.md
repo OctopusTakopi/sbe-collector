@@ -71,7 +71,8 @@ quality logs, and the handover protocol match. Only the wire format and the
 exchanges differ.
 
 `scripts/run_sbe.sh` starts one collector per exchange in a tmux session and
-will kill an existing one. Use it for a cold start, not for an upgrade. `tmux
+will kill an existing one. Use it for a cold start, not for an upgrade; for an
+upgrade, `scripts/rolling_update_sbe.sh` (see ROLLING_UPDATE.md). `tmux
 kill-session` delivers SIGHUP, which drains and exits like SIGTERM, unless
 SIGHUP was already ignored when the collector started (`nohup`): then it stays
 ignored.
