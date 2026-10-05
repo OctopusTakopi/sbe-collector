@@ -80,6 +80,12 @@ sample of the best bid/offer, as on OKX and Gate spot, it is lower (about 39%
 on OKX, 45-50% on Gate spot), and the samples' merge shows as reordered ids in
 `gap_detector`.
 
+With one connection the filter is off for Binance and OKX: their timer-pushed
+snapshots repeat unchanged while the book sits still, and dropping those would
+be silent, while a session handover's overlap records a few frames twice.
+Gate filters a single connection too: replacing its session every hour
+overlaps two sockets each time, and none of its frames repeat unchanged.
+
 ## File format
 
 One zstd stream (sometimes several concatenated frames after a handover) of

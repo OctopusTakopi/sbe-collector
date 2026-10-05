@@ -28,7 +28,7 @@ use sbe_collector::{
 use zerocopy::FromBytes;
 
 use crate::{
-    dedup::Dedup,
+    dedup::{DEDUP_MAX_ENTRIES, DEDUP_WINDOW, Dedup},
     error::ConnectorError,
     feed::{BackgroundResult, Feed},
     file::{Symbol, WriteRecord},
@@ -152,7 +152,6 @@ impl Ingest {
         exchange: Exchange,
         writer_tx: Sender<WriteRecord>,
         pairs: &[String],
-        connections: usize,
         quality: QualityReporter,
     ) -> Self {
         Self {
@@ -169,7 +168,10 @@ impl Ingest {
                 .collect(),
             unknown: HashSet::new(),
             marks: HashMap::new(),
-            dedup: Dedup::for_connections(connections, exchange),
+            // Even one connection overlaps two sockets every hour, when its
+            // session is replaced, and Gate repeats no frame unchanged, so
+            // filtering a single connection loses nothing.
+            dedup: Dedup::new(exchange, DEDUP_WINDOW, DEDUP_MAX_ENTRIES),
             quality,
             tasks: JoinSet::new(),
         }
@@ -278,14 +280,7 @@ pub async fn run_collection(
         Market::Futures => Exchange::GateSbeFutures,
     };
     let gate = Arc::new(Gate::new(market, &pairs, quality.clone()));
-    let mut ingest = Ingest::new(
-        market,
-        exchange,
-        writer_tx,
-        &pairs,
-        connections,
-        quality.clone(),
-    );
+    let mut ingest = Ingest::new(market, exchange, writer_tx, &pairs, quality.clone());
     let ws_rx = session::spawn_slots(&mut ingest.tasks, gate, connections, &quality, &readiness);
     let mut feed = Feed::new(ws_rx, shutdown);
 
@@ -333,7 +328,7 @@ mod tests {
         Bytes::from(frame)
     }
 
-    fn ingest(connections: usize, quality: QualityReporter) -> (Ingest, Receiver<WriteRecord>) {
+    fn ingest(quality: QualityReporter) -> (Ingest, Receiver<WriteRecord>) {
         let (writer_tx, writer_rx) = channel(32);
         (
             Ingest::new(
@@ -341,7 +336,6 @@ mod tests {
                 Exchange::GateSbeSpot,
                 writer_tx,
                 &["BTC_USDT".to_owned()],
-                connections,
                 quality,
             ),
             writer_rx,
@@ -352,10 +346,12 @@ mod tests {
         std::iter::from_fn(|| writer_rx.try_recv().ok()).collect()
     }
 
-    /// Spot copies from two connections differ in the send `time` alone.
+    /// Spot copies of one event differ in the send `time` alone, whether
+    /// they come from two connections or from one connection's hourly
+    /// handover.
     #[tokio::test]
-    async fn a_second_connections_copy_is_written_once() {
-        let (mut ingest, mut writer_rx) = ingest(2, QualityReporter::disabled());
+    async fn a_second_sockets_copy_is_written_once() {
+        let (mut ingest, mut writer_rx) = ingest(QualityReporter::disabled());
 
         for time in [100, 117] {
             ingest
@@ -372,7 +368,7 @@ mod tests {
     #[tokio::test]
     async fn the_merged_book_chain_reports_only_real_holes() {
         let (quality, events) = QualityReporter::test_channel();
-        let (mut ingest, _writer_rx) = ingest(1, quality);
+        let (mut ingest, _writer_rx) = ingest(quality);
         let feed = [
             obu("BTC_USDT", true, 0, 100, 1),
             obu("BTC_USDT", false, 101, 105, 2),
@@ -410,7 +406,7 @@ mod tests {
     #[tokio::test]
     async fn an_unsubscribed_pair_goes_to_unknown_and_is_reported_once() {
         let (quality, events) = QualityReporter::test_channel();
-        let (mut ingest, mut writer_rx) = ingest(1, quality);
+        let (mut ingest, mut writer_rx) = ingest(quality);
 
         for last_id in [9, 10] {
             ingest
