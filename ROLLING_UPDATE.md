@@ -16,23 +16,25 @@ run-local sidecar (`<symbol>_<UTC-date>_<run-id>.zst`) if today's canonical
 daily file is already locked by the incumbent. Only after every configured
 connection has every subscription answered and is currently delivering
 frames, the writer has accepted its first record, and that state has remained
-continuously healthy for two seconds does it request takeover. A disconnect or dropped delivery restarts the overlap
-grace; the incumbent then drains, fsyncs, and exits only after a healthy
-request.
+continuously healthy for two seconds does it request takeover. A disconnect
+or dropped delivery restarts the overlap grace; the incumbent then drains,
+fsyncs, and exits only after a healthy request.
 
 Steady-state recordings use one file per symbol per UTC day:
 `<symbol>_<UTC-date>.zst`. During handover overlap the challenger writes a
 run-local sidecar. After the incumbent releases the daily file lock (the
 switch), that sidecar's finished zstd frame is appended into
-`<symbol>_<UTC-date>.zst` and the sidecar is deleted. If the challenger exits
-before the switch, the sidecar stays on disk. Overlap intentionally favors no
-gaps over no duplicates.
+`<symbol>_<UTC-date>.zst`, followed by a fresh clean-close trailer (a 24-byte
+skippable frame that zstd readers skip), and the sidecar is deleted. If the
+challenger exits before the switch, the sidecar stays on disk. Overlap
+intentionally favors no gaps over no duplicates.
 
 An incumbent stopped by a signal releases the socket at once, before it has
 finished draining, so a replacement started right away (as
 `scripts/run_sbe.sh` does) becomes the incumbent. A challenger whose incumbent
 disappears before reporting its drain chooses its role again rather than
-exiting.
+exiting. Processes started at the same moment choose their roles one at a
+time, under `<socket>.lock`, so they agree on one incumbent.
 
 The first upgrade from a binary without UDS support is necessarily a normal
 stop/start.

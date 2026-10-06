@@ -45,16 +45,26 @@ export OKX_API_KEY=... OKX_SECRET_KEY=... OKX_PASSPHRASE=...
 ./target/release/sbe-collector -c 2 /data/sbe/gate/futures gatesbefutures BTC_USDT ETH_USDT
 ```
 
-Missing credentials or an unknown symbol end the process at startup. So does
-a venue refusing the websocket upgrade before any connection has delivered,
-as Binance does with 400 `Invalid X-MBX-APIKEY header` for a key used from an
-IP it is not whitelisted for, or OKX with 401 for a wrong passphrase. Any 4xx
-answer is a refusal except the ones that lapse, which are retried with
-backoff: a timeout (408), a rate limit (429), and Binance's WAF limit (403)
-and IP ban (418). The process stops with the venue's own reason, after
-sealing its files. A refusal once data has flowed, say a key revoked mid-run,
-is logged and reported to the quality log instead, while the connections
-still delivering carry on.
+Missing credentials end the process at startup, and so does a symbol the
+venue says it does not list: every symbol is looked up first (Binance
+`exchangeInfo`, OKX's instruments, Gate's pairs and contracts), and the error
+names each one refused with the venue's answer. A venue that cannot answer,
+unreachable or rate-limited, is asked again for up to two minutes.
+
+A venue refusing the websocket upgrade before any connection has delivered
+ends the process too, where the upgrade carries credentials: Binance answers
+400 `Invalid X-MBX-APIKEY header` for a key used from an IP it is not
+whitelisted for, OKX 401 for a wrong passphrase. Any 4xx answer is a refusal
+except the ones that lapse, which are retried with backoff: a timeout (408),
+a rate limit (429), and Binance's WAF limit (403) and IP ban (418). The
+process stops with the venue's own reason, after sealing its files. Gate's
+upgrade carries none, so its refusals, say through a maintenance window, are
+retried. A refusal once data has flowed, say a key revoked mid-run, is
+logged and reported to the quality log instead, while the connections still
+delivering carry on.
+
+A `_quality_<run-id>.jsonl` is created next to the data at start: frames shed
+under backpressure, feeds degraded, storage faults, and the handover's steps.
 
 ## vs hftbacktest / the JSON collector
 
@@ -66,9 +76,9 @@ still delivering carry on.
 | sockets | one | `-c N`, duplicates dropped |
 | replace | stop then start | Unix socket handover, see [ROLLING_UPDATE.md](ROLLING_UPDATE.md) |
 
-The JSON `collector` crate is the closer sibling. Layout, `flock`, sidecars,
-quality logs, and the handover protocol match. Only the wire format and the
-exchanges differ.
+The JSON `collector` crate is the closer sibling. The connection layer,
+layout, `flock`, sidecars, quality logs, startup checks and the handover
+protocol match. Only the wire format and the exchanges differ.
 
 `scripts/run_sbe.sh` starts one collector per exchange in a tmux session and
 will kill an existing one. Use it for a cold start, not for an upgrade; for an
@@ -78,6 +88,15 @@ SIGHUP was already ignored when the collector started (`nohup`): then it stays
 ignored.
 
 ## Redundant connections
+
+Each of the `-c N` slots keeps one socket open, and replaces its session
+make-before-break: the new one connects while the old one keeps delivering,
+and the old one is retired only once the new one has every subscription
+answered and data flowing. That happens when the venue announces a shutdown
+or upgrade, at Binance's 23-hour connection age, hourly on Gate, and when a
+Gate connection's own book stream skips an id. A lost socket is reconnected
+with backoff from 100 ms to 30 s, attempts across slots at least 400 ms
+apart.
 
 With `-c N` every connection subscribes to the same channels and a frame is
 kept once. Two connections' copies of one event differ only in a send time the
@@ -116,7 +135,9 @@ A record does not say which exchange it is from, and Gate's two markets send
 identical headers over different layouts, so each output directory names its
 exchange in an `_exchange` file. The collector writes it on first start and
 refuses a directory marked for another exchange. A directory without one was
-recorded before markers existed, by `binancesbespot`.
+recorded before markers existed, by `binancesbespot`. The JSON collector
+writes the same file under its own names: its directories are refused here,
+and `reader` and `gap_detector` skip them.
 
 A cleanly sealed file ends with a clean-close trailer: a 24-byte zstd
 skippable frame holding `COLLECTR` and the offset it starts at, so the next

@@ -4,8 +4,10 @@ set -euo pipefail
 # Configuration
 # Path to the compiled sbe-collector binary
 COLLECTOR_EXE="/home/ec2-user/sbe-collector"
-# Base directory for data storage
-BASE_DATA_DIR="./data/sbe"
+# Base directory for data storage. Absolute: the directories are made from
+# wherever this script runs, while each collector runs from the home
+# directory.
+BASE_DATA_DIR="/home/ec2-user/data/sbe"
 # Coins to collect
 COINS=("btc" "eth" "bnb" "xrp" "sol" "trx" "doge")
 # Redundant websocket connections per collector
