@@ -38,10 +38,7 @@ use std::{
     io::Read,
     ops::AddAssign,
     path::{Path, PathBuf},
-    sync::{
-        Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::atomic::{AtomicUsize, Ordering},
     time::{Duration, SystemTime},
 };
 
@@ -1351,32 +1348,38 @@ fn main() -> Result<()> {
 
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
-    let results: Mutex<Vec<SeriesReport>> = Mutex::new(Vec::with_capacity(series.len()));
     let total = series.len();
-    std::thread::scope(|scope| {
-        for _ in 0..jobs.min(total) {
-            scope.spawn(|| {
-                loop {
-                    let idx = next.fetch_add(1, Ordering::Relaxed);
-                    if idx >= total {
-                        break;
+    // Each worker keeps its own reports, handed back when it joins.
+    let mut reports: Vec<SeriesReport> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..jobs.min(total))
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut reports = Vec::new();
+                    loop {
+                        let idx = next.fetch_add(1, Ordering::Relaxed);
+                        if idx >= total {
+                            break;
+                        }
+                        let started = std::time::Instant::now();
+                        let report = scan_series(&series[idx], min_gap_ns, args.exact);
+                        let finished = done.fetch_add(1, Ordering::Relaxed) + 1;
+                        eprintln!(
+                            "[{finished}/{total}] {} ({} records, {:.1}s)",
+                            report.key,
+                            grouped(report.rows),
+                            started.elapsed().as_secs_f64()
+                        );
+                        reports.push(report);
                     }
-                    let started = std::time::Instant::now();
-                    let report = scan_series(&series[idx], min_gap_ns, args.exact);
-                    let finished = done.fetch_add(1, Ordering::Relaxed) + 1;
-                    eprintln!(
-                        "[{finished}/{total}] {} ({} records, {:.1}s)",
-                        report.key,
-                        grouped(report.rows),
-                        started.elapsed().as_secs_f64()
-                    );
-                    results.lock().expect("results mutex").push(report);
-                }
-            });
-        }
+                    reports
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| worker.join().expect("a scan worker panicked"))
+            .collect()
     });
-
-    let mut reports = results.into_inner().expect("results mutex");
     reports.sort_by(|a, b| a.key.cmp(&b.key));
 
     println!();
