@@ -11,6 +11,7 @@ mod okxsbe;
 mod quality;
 mod readiness;
 mod session;
+mod shutdown;
 mod snapshot;
 mod subscriptions;
 mod throttler;
@@ -22,9 +23,9 @@ use anyhow::{Context as _, anyhow};
 use clap::Parser;
 use sbe_collector::{exchange::Exchange, sbe::gate::Market};
 use tokio::{
-    select, signal,
+    select,
     sync::{mpsc, oneshot, watch},
-    task::{JoinError, JoinHandle},
+    task::JoinHandle,
 };
 use tracing::{error, info};
 
@@ -32,11 +33,9 @@ use collection::Context;
 use file::{WriteRecord, Writer};
 use quality::{HandoverState, QualityEvent, QualityLog};
 use readiness::Readiness;
+use shutdown::{Hangup, drain, finish_or_abort, first_error, joined};
 
 const WRITER_QUEUE_CAPACITY: usize = 65_536;
-/// How long the collection task may spend handing what it already received
-/// to the writer before it is aborted.
-const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the handover supervisor gets at exit: to deliver the drain
 /// report after a takeover, or to release the socket otherwise.
 const HANDOVER_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -76,43 +75,6 @@ struct Args {
     /// Defaults to `<path>/.collector.sock`.
     #[arg(long)]
     handover_socket: Option<PathBuf>,
-}
-
-/// What a hangup does.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Hangup {
-    /// Drain and exit, as for SIGTERM: `tmux kill-session` delivers SIGHUP,
-    /// and unhandled it kills the process before buffered records are
-    /// written.
-    Drain,
-    /// SIGHUP was ignored at startup (`nohup`). Installing a handler would
-    /// replace that inherited ignore.
-    Ignore,
-}
-
-impl Hangup {
-    fn for_disposition(handler: libc::sighandler_t) -> Self {
-        if handler == libc::SIG_IGN {
-            Self::Ignore
-        } else {
-            Self::Drain
-        }
-    }
-
-    /// From SIGHUP's disposition before any handler is installed.
-    fn inherited() -> std::io::Result<Self> {
-        // SAFETY: with a null new action `sigaction` only writes the current
-        // one into `old`, a live local for which all-zero bytes are valid.
-        let (status, old) = unsafe {
-            let mut old: libc::sigaction = std::mem::zeroed();
-            let status = libc::sigaction(libc::SIGHUP, std::ptr::null(), &mut old);
-            (status, old)
-        };
-        if status != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(Self::for_disposition(old.sa_sigaction))
-    }
 }
 
 /// A venue's collection, prepared before anything starts, so missing
@@ -165,7 +127,7 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
     let args = Args::parse();
     let hangup = Hangup::inherited()?;
-    if hangup == Hangup::Ignore {
+    if hangup == Hangup::Ignored {
         info!("SIGHUP is ignored (inherited, e.g. from nohup); a hangup will not stop collection");
     }
     let connections = usize::from(args.connections);
@@ -256,7 +218,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let shutdown = select! {
-        result = shutdown_signal(hangup) => {
+        result = shutdown::signal(hangup) => {
             let signal = result?;
             info!(signal, "shutdown signal received");
             Shutdown::Signal
@@ -280,7 +242,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(Err(error)) => error,
             Err(error) => anyhow!("UDS handover task failed: {error}"),
         }),
-        result = &mut collection => Shutdown::Collection(joined("collection task", result)),
+        result = &mut collection => Shutdown::Collection(joined(result)),
     };
 
     if !matches!(shutdown, Shutdown::Takeover(_)) {
@@ -292,16 +254,13 @@ async fn main() -> anyhow::Result<()> {
     let mut handover_result = Ok(());
     let (collection_result, takeover) = match shutdown {
         Shutdown::Collection(result) => (result, None),
-        Shutdown::Takeover(request) => (
-            stop_collection(&shutdown_tx, &mut collection).await,
-            Some(request),
-        ),
+        Shutdown::Takeover(request) => (drain(&shutdown_tx, &mut collection).await, Some(request)),
         Shutdown::HandoverFailed(error) => {
             handover_result = Err(error);
-            (stop_collection(&shutdown_tx, &mut collection).await, None)
+            (drain(&shutdown_tx, &mut collection).await, None)
         }
         Shutdown::Signal | Shutdown::Writer | Shutdown::Quality => {
-            (stop_collection(&shutdown_tx, &mut collection).await, None)
+            (drain(&shutdown_tx, &mut collection).await, None)
         }
     };
 
@@ -349,10 +308,15 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| Err(std::io::Error::other("quality writer thread panicked")))
         .map_err(anyhow::Error::from);
 
-    // A failed handover is what stopped the collection, so it comes first.
-    let result = root_cause(handover_result, collection_result, "the collection");
-    let result = root_cause(result, writer_result, "the writer");
-    root_cause(result, quality_result, "the quality log")
+    // A failed handover is what stopped the collection; the collection error
+    // is the root cause of what follows, and a writer close failure is
+    // usually a symptom of the same problem, so neither may mask it.
+    first_error([
+        ("handover", handover_result),
+        ("collection", collection_result),
+        ("writer", writer_result),
+        ("quality log", quality_result),
+    ])
 }
 
 /// Logs go to the tmux pane, so once tmux is gone every write fails with EIO.
@@ -376,95 +340,4 @@ fn init_tracing() {
         .finish()
         .with(targets)
         .init();
-}
-
-fn joined(task: &str, result: Result<anyhow::Result<()>, JoinError>) -> anyhow::Result<()> {
-    result.unwrap_or_else(|error| Err(anyhow!("{task} failed: {error}")))
-}
-
-/// Ask the collection task to stop reading and flush what it already has to
-/// the writer, rather than aborting it with a full queue.
-async fn stop_collection(
-    shutdown: &watch::Sender<bool>,
-    collection: &mut JoinHandle<anyhow::Result<()>>,
-) -> anyhow::Result<()> {
-    shutdown.send_replace(true);
-    match tokio::time::timeout(DRAIN_TIMEOUT, &mut *collection).await {
-        Ok(result) => joined("collection task", result),
-        Err(_) => {
-            collection.abort();
-            let _ = collection.await;
-            // Exiting 0 here would make an incomplete dump look clean.
-            Err(anyhow!(
-                "collection task did not finish draining within {DRAIN_TIMEOUT:?}; \
-                 queued records were discarded"
-            ))
-        }
-    }
-}
-
-/// Give `task` `grace` to finish, then abort it. A task whose output was
-/// already taken is left alone: polling it again would panic.
-async fn finish_or_abort<T>(task: &mut JoinHandle<T>, grace: Duration) {
-    if task.is_finished() {
-        return;
-    }
-    if tokio::time::timeout(grace, &mut *task).await.is_err() {
-        task.abort();
-        let _ = task.await;
-    }
-}
-
-/// The first failure is the root cause; a later one is usually its symptom,
-/// so it is logged rather than allowed to mask it.
-fn root_cause(
-    first: anyhow::Result<()>,
-    second: anyhow::Result<()>,
-    second_name: &str,
-) -> anyhow::Result<()> {
-    match (first, second) {
-        (Err(first), Err(second)) => {
-            error!(error = %second, "{second_name} also failed while shutting down");
-            Err(first)
-        }
-        (first, second) => first.and(second),
-    }
-}
-
-async fn shutdown_signal(hangup: Hangup) -> std::io::Result<&'static str> {
-    use signal::unix::{SignalKind, signal as unix_signal};
-    let mut sigterm = unix_signal(SignalKind::terminate())?;
-    let mut sighup = match hangup {
-        Hangup::Drain => Some(unix_signal(SignalKind::hangup())?),
-        Hangup::Ignore => None,
-    };
-    let sighup = async {
-        match &mut sighup {
-            Some(sighup) => {
-                sighup.recv().await;
-            }
-            None => std::future::pending().await,
-        }
-    };
-    select! {
-        result = signal::ctrl_c() => {
-            result?;
-            Ok("SIGINT")
-        }
-        _ = sigterm.recv() => Ok("SIGTERM"),
-        () = sighup => Ok("SIGHUP"),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn only_an_ignored_sighup_stays_ignored() {
-        assert_eq!(Hangup::for_disposition(libc::SIG_IGN), Hangup::Ignore);
-        assert_eq!(Hangup::for_disposition(libc::SIG_DFL), Hangup::Drain);
-        let handler = only_an_ignored_sighup_stays_ignored as fn() as libc::sighandler_t;
-        assert_eq!(Hangup::for_disposition(handler), Hangup::Drain);
-    }
 }
