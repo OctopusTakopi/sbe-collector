@@ -1,5 +1,5 @@
 
-./ethusdt
+./ethusdt (binancesbespot)
   files: ./ethusdt_20260801.zst, ./ethusdt_20260801_1785542400000000001-42.zst
   records: 6 (6 stream, 0 rest snapshots) | recv span: 2026-08-01 00:00:00.000Z .. 2026-08-01 00:00:03.000Z | bad records: 0
   recv gaps > 5.000s: none

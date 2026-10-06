@@ -1,5 +1,5 @@
 
-./adausdt
+./adausdt (binancesbespot)
   files: ./adausdt_20260801_1785542400000000000_run-1.zst, ./adausdt_20260801_1785549600000000000_run-1.zst
   records: 2 (2 stream, 0 rest snapshots) | recv span: 2026-08-01 00:00:00.000Z .. 2026-08-01 02:00:00.000Z | bad records: 0
   RECV GAPS > 1.500s: 1 (total silence 2h00m00s)
@@ -8,7 +8,7 @@
     trades: 2 msgs
       ids 1..5: exact 0 missing, 0 duplicates (5 observed)
 
-./btcusdt
+./btcusdt (binancesbespot)
   files: ./btcusdt_20260801.zst, ./btcusdt_20260803.zst
   records: 16 (15 stream, 1 rest snapshots) | recv span: 2026-08-01 00:00:00.000Z .. 2026-08-03 00:00:50.000Z | bad records: 1
   MISSING DATES: 2026-08-02
@@ -30,12 +30,12 @@
       breaks at: 2026-08-01 00:00:09.000Z
       2 duplicate/reordered event(s)
 
-./empty/dogeusdt
+./empty/dogeusdt (binancesbespot)
   files: ./empty/dogeusdt_20260801.zst
   (no records decoded)
   recv gaps > 1.500s: none
 
-./ethusdt
+./ethusdt (binancesbespot)
   files: ./ethusdt_20260801.zst, ./ethusdt_20260801_1785542400000000001-42.zst
   records: 6 (6 stream, 0 rest snapshots) | recv span: 2026-08-01 00:00:00.000Z .. 2026-08-01 00:00:03.000Z | bad records: 0
   recv gaps > 1.500s: none
@@ -47,12 +47,12 @@
       2 duplicate/reordered event(s)
       1 time regression(s)
 
-./solusdt
+./solusdt (binancesbespot)
   files: ./solusdt_20260801.zst
     ./solusdt_20260801.zst: foreign format (not sbe-collector records), skipped
   recv gaps > 1.500s: none
 
-./xrpusdt
+./xrpusdt (binancesbespot)
   files: ./xrpusdt_20260801.zst, ./xrpusdt_20260802.zst
     ./xrpusdt_20260801.zst: decode error after 2 records: incomplete frame
     ./xrpusdt_20260802.zst: unterminated zstd stream after 2 records (file modified recently — still being written?): incomplete frame

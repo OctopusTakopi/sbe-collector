@@ -1,5 +1,5 @@
 
-./btc-usdt
+./btc-usdt (okxsbe)
   files: ./btc-usdt_20260801.zst, ./btc-usdt_20260801_1785542400000000001-42.zst
   records: 10 (8 stream, 2 rest snapshots) | recv span: 2026-08-01 00:00:00.000Z .. 2026-08-01 00:00:08.000Z | bad records: 2
   RECV GAPS > 5.000s: 1 (total silence 7.000s)

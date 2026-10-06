@@ -1,5 +1,5 @@
 
-./btc_usdt
+./btc_usdt (gatesbefutures)
   files: ./btc_usdt_20260801.zst
   records: 6 (6 stream, 0 rest snapshots) | recv span: 2026-08-01 00:00:00.000Z .. 2026-08-01 00:00:00.000Z | bad records: 0
   recv gaps > 5.000s: none

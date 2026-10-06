@@ -34,6 +34,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    fmt,
     fs::{self, File},
     io::Read,
     ops::AddAssign,
@@ -723,6 +724,8 @@ struct StreamReport {
 
 struct SeriesReport {
     key: String,
+    /// What the series was decoded as.
+    exchange: Exchange,
     files: Vec<FileReport>,
     missing_dates: Vec<civil::Date>,
     rows: u64,
@@ -1007,6 +1010,7 @@ fn scan_series(series: &Series, min_gap_ns: i64, exact: bool) -> SeriesReport {
 
     SeriesReport {
         key: series.key.clone(),
+        exchange: series.exchange,
         files,
         missing_dates,
         rows: scan.rows,
@@ -1120,53 +1124,63 @@ fn stream_issues(s: &StreamStats, break_times: &[i64], exact: bool) -> Vec<Strin
     parts
 }
 
-fn print_report(report: &SeriesReport, min_gap_ns: i64, max_reported: usize, exact: bool) {
-    println!("{}", report.key);
+fn write_report(
+    out: &mut impl fmt::Write,
+    report: &SeriesReport,
+    min_gap_ns: i64,
+    max_reported: usize,
+    exact: bool,
+) -> fmt::Result {
+    writeln!(out, "{} ({})", report.key, report.exchange.as_str())?;
     let files: Vec<String> = report
         .files
         .iter()
         .map(|file| file.path.display().to_string())
         .collect();
-    println!("  files: {}", files.join(", "));
+    writeln!(out, "  files: {}", files.join(", "))?;
     for file in &report.files {
         if file.foreign {
-            println!(
+            writeln!(
+                out,
                 "    {}: foreign format (not sbe-collector records), skipped",
                 file.path.display()
-            );
+            )?;
         }
         if let Some(error) = &file.decode_error {
             if file.live {
-                println!(
+                writeln!(
+                    out,
                     "    {}: unterminated zstd stream after {} records (file modified recently — still being written?): {error}",
                     file.path.display(),
                     grouped(file.rows)
-                );
+                )?;
             } else {
-                println!(
+                writeln!(
+                    out,
                     "    {}: decode error after {} records: {error}",
                     file.path.display(),
                     grouped(file.rows)
-                );
+                )?;
             }
         }
     }
     if report.rows == 0 && report.files.iter().all(|f| !f.foreign) {
-        println!("  (no records decoded)");
+        writeln!(out, "  (no records decoded)")?;
     }
     if report.rows > 0 {
         let span = match (report.first_recv, report.last_recv) {
             (Some(a), Some(b)) => format!("{} .. {}", fmt_ts(a), fmt_ts(b)),
             _ => String::from("?"),
         };
-        println!(
+        writeln!(
+            out,
             "  records: {} ({} stream, {} rest snapshots) | recv span: {} | bad records: {}",
             grouped(report.rows),
             grouped(report.sbe_records),
             grouped(report.rest_records),
             span,
             grouped(report.bad_records)
-        );
+        )?;
     }
     if !report.missing_dates.is_empty() {
         let dates: Vec<String> = report
@@ -1174,37 +1188,40 @@ fn print_report(report: &SeriesReport, min_gap_ns: i64, max_reported: usize, exa
             .iter()
             .map(ToString::to_string)
             .collect();
-        println!("  MISSING DATES: {}", dates.join(", "));
+        writeln!(out, "  MISSING DATES: {}", dates.join(", "))?;
     }
     if report.recv_regressions > 0 {
-        println!(
+        writeln!(
+            out,
             "  receive time regressions: {} (arrival-vs-dequeue ordering)",
             grouped(report.recv_regressions)
-        );
+        )?;
     }
 
     let threshold = fmt_dur(min_gap_ns);
     if report.gaps.is_empty() {
-        println!("  recv gaps > {threshold}: none");
+        writeln!(out, "  recv gaps > {threshold}: none")?;
     } else {
         let total: i64 = report.gaps.iter().map(|gap| gap.silence_ns()).sum();
-        println!(
+        writeln!(
+            out,
             "  RECV GAPS > {threshold}: {} (total silence {})",
             report.gaps.len(),
             fmt_dur(total)
-        );
+        )?;
         let mut largest: Vec<&Gap> = report.gaps.iter().collect();
         largest.sort_by_key(|gap| std::cmp::Reverse(gap.silence_ns()));
         for gap in largest.iter().take(max_reported) {
-            println!(
+            writeln!(
+                out,
                 "    {} .. {} ({})",
                 fmt_ts(gap.start),
                 fmt_ts(gap.end),
                 fmt_dur(gap.silence_ns())
-            );
+            )?;
         }
         if report.gaps.len() > max_reported {
-            println!("    ... {} more", report.gaps.len() - max_reported);
+            writeln!(out, "    ... {} more", report.gaps.len() - max_reported)?;
         }
     }
 
@@ -1214,19 +1231,20 @@ fn print_report(report: &SeriesReport, min_gap_ns: i64, max_reported: usize, exa
         .filter(|s| s.stats.is_notable())
         .peekable();
     if notable.peek().is_some() {
-        println!("  streams:");
+        writeln!(out, "  streams:")?;
         for stream in notable {
-            println!(
+            writeln!(
+                out,
                 "    {}: {} msgs",
                 stream.stream.name(),
                 grouped(stream.stats.messages)
-            );
+            )?;
             for part in stream_issues(&stream.stats, &stream.break_times, exact) {
-                println!("      {part}");
+                writeln!(out, "      {part}")?;
             }
         }
     }
-    println!();
+    writeln!(out)
 }
 
 /// What the SUMMARY adds up over every series.
@@ -1275,51 +1293,64 @@ impl AddAssign<&SeriesReport> for Totals {
     }
 }
 
-fn print_summary(totals: &Totals, args: &Args) {
-    println!("SUMMARY");
-    println!("  series scanned        : {}", totals.series);
-    println!("  records decoded       : {}", grouped(totals.rows));
-    println!(
+fn write_summary(out: &mut impl fmt::Write, totals: &Totals, args: &Args) -> fmt::Result {
+    writeln!(out, "SUMMARY")?;
+    writeln!(out, "  series scanned        : {}", totals.series)?;
+    writeln!(out, "  records decoded       : {}", grouped(totals.rows))?;
+    writeln!(
+        out,
         "  recv gaps > {}s  : {} across {} series (total silence {})",
         args.min_gap,
         totals.recv_gaps,
         totals.gap_series,
         fmt_dur(totals.silence_ns)
-    );
-    println!(
+    )?;
+    writeln!(
+        out,
         "  forward chain breaks  : {} event(s), {} ids",
         grouped(totals.fwd_events),
         grouped(totals.fwd_ids)
-    );
+    )?;
     if args.exact {
-        println!(
+        writeln!(
+            out,
             "  exact missing ids     : {}",
             grouped(totals.exact_missing_ids)
-        );
+        )?;
     } else {
-        println!(
+        writeln!(
+            out,
             "  net missing ids       : {} (range accounting)",
             grouped(totals.net_missing_ids as u64)
-        );
+        )?;
     }
-    println!("  dup/reordered events  : {}", grouped(totals.back_events));
-    println!(
+    writeln!(
+        out,
+        "  dup/reordered events  : {}",
+        grouped(totals.back_events)
+    )?;
+    writeln!(
+        out,
         "  time regressions      : {}",
         grouped(totals.time_regressions)
-    );
-    println!("  missing dates         : {}", totals.missing_dates);
-    println!("  decode errors         : {}", totals.decode_errors);
-    println!("  bad records           : {}", grouped(totals.bad_records));
-    println!(
+    )?;
+    writeln!(out, "  missing dates         : {}", totals.missing_dates)?;
+    writeln!(out, "  decode errors         : {}", totals.decode_errors)?;
+    writeln!(
+        out,
+        "  bad records           : {}",
+        grouped(totals.bad_records)
+    )?;
+    writeln!(
+        out,
         "  foreign files         : {} (skipped)",
         totals.foreign_files
-    );
-    println!("RESULT: issues found in {} series", totals.with_issues);
+    )?;
+    writeln!(out, "RESULT: issues found in {} series", totals.with_issues)
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let min_gap_ns = (args.min_gap.max(0.0) * 1e9) as i64;
 
     let mut series = discover(&args.paths, args.exchange)?;
     if let Some(filter) = &args.filter {
@@ -1354,6 +1385,24 @@ fn main() -> Result<()> {
         if args.exact { ", exact id sets" } else { "" }
     );
 
+    let reports = scan_all(&series, &args, jobs);
+    let mut out = String::new();
+    let with_issues =
+        write_output(&mut out, &reports, &args).expect("formatting into a String cannot fail");
+    print!("{out}");
+    if args.fail_on_gaps && with_issues > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn min_gap_ns(args: &Args) -> i64 {
+    (args.min_gap.max(0.0) * 1e9) as i64
+}
+
+/// Scan every series on `jobs` threads; reports come back sorted by key.
+fn scan_all(series: &[Series], args: &Args, jobs: usize) -> Vec<SeriesReport> {
+    let min_gap_ns = min_gap_ns(args);
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
     let total = series.len();
@@ -1389,18 +1438,24 @@ fn main() -> Result<()> {
             .collect()
     });
     reports.sort_by(|a, b| a.key.cmp(&b.key));
+    reports
+}
 
-    println!();
+/// Every report, then the summary; how many series have issues.
+fn write_output(
+    out: &mut impl fmt::Write,
+    reports: &[SeriesReport],
+    args: &Args,
+) -> Result<usize, fmt::Error> {
+    let min_gap_ns = min_gap_ns(args);
     let mut totals = Totals::default();
-    for report in &reports {
-        print_report(report, min_gap_ns, args.max_reported, args.exact);
+    writeln!(out)?;
+    for report in reports {
+        write_report(out, report, min_gap_ns, args.max_reported, args.exact)?;
         totals += report;
     }
-    print_summary(&totals, &args);
-    if args.fail_on_gaps && totals.with_issues > 0 {
-        std::process::exit(1);
-    }
-    Ok(())
+    write_summary(out, &totals, args)?;
+    Ok(totals.with_issues)
 }
 
 #[cfg(test)]
