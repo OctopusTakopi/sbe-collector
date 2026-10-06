@@ -3,6 +3,8 @@ mod ws;
 
 use std::{collections::HashMap, sync::Arc};
 
+use anyhow::bail;
+use serde::Deserialize;
 use tokio::task::JoinSet;
 use tracing::warn;
 use zerocopy::FromBytes;
@@ -20,6 +22,7 @@ use crate::{
     dedup::Dedup,
     error::ConnectorError,
     file::Symbol,
+    listing::{self, Unlisted},
     quality::{QualityEvent, QualityReporter},
     session::{Frame, Protocol},
     snapshot::Snapshots,
@@ -34,6 +37,8 @@ const STREAMS: [&str; 4] = [
     "$symbol@depth",
     "$symbol@depth20",
 ];
+
+const EXCHANGE_INFO: &str = "https://api.binance.com/api/v3/exchangeInfo?symbol=";
 
 /// How far a book update id may fall below the last one seen before the
 /// stream is treated as restarted rather than reordered.
@@ -216,22 +221,68 @@ impl Ingest {
 }
 
 /// What to collect, from the command line. Built before anything starts, so
-/// a missing or malformed key stops the process cleanly.
+/// a missing or malformed key, or a symbol Binance does not list, stops the
+/// process cleanly.
 pub struct Subscription {
     endpoint: Endpoint,
     symbols: Vec<String>,
 }
 
 impl Subscription {
-    pub fn from_env(symbols: &[String]) -> anyhow::Result<Self> {
+    pub async fn prepare(symbols: &[String]) -> anyhow::Result<Self> {
         let api_key = std::env::var("BINANCE_API_KEY").unwrap_or_default();
         if api_key.is_empty() {
-            anyhow::bail!("BINANCE_API_KEY env var must be set for the SBE stream endpoint");
+            bail!("BINANCE_API_KEY env var must be set for the SBE stream endpoint");
+        }
+        let endpoint = Endpoint::new(&STREAMS, symbols, &api_key)?;
+        let client = listing::client()?;
+        let unlisted = listing::patiently(listing::PATIENCE, || unlisted(&client, symbols)).await?;
+        if !unlisted.is_empty() {
+            return Err(Unlisted(unlisted).into());
         }
         Ok(Self {
-            endpoint: Endpoint::new(&STREAMS, symbols, &api_key)?,
+            endpoint,
             symbols: symbols.to_vec(),
         })
+    }
+}
+
+/// Why Binance does not list each of `symbols` it does not.
+async fn unlisted(client: &reqwest::Client, symbols: &[String]) -> anyhow::Result<Vec<String>> {
+    let mut unlisted = Vec::new();
+    for symbol in symbols {
+        let symbol = symbol.to_ascii_uppercase();
+        let response = client
+            .get(format!("{EXCHANGE_INFO}{symbol}"))
+            .send()
+            .await?;
+        let status = response.status().as_u16();
+        let body = response.bytes().await?;
+        if let Some(reason) = exchange_info(status, &body)? {
+            unlisted.push(format!("{symbol} ({reason})"));
+        }
+    }
+    Ok(unlisted)
+}
+
+/// Why `exchangeInfo?symbol=` says Binance does not list a symbol, if it
+/// does not. A 400 refuses the request itself, which asking again cannot
+/// change: `-1121 Invalid symbol.`, or `-1100` for one with characters no
+/// symbol has. Anything else, a rate limit or an outage, is no answer.
+fn exchange_info(status: u16, body: &[u8]) -> anyhow::Result<Option<String>> {
+    #[derive(Deserialize)]
+    struct Refusal {
+        code: i64,
+        msg: String,
+    }
+    let preview = || String::from_utf8_lossy(&body[..body.len().min(256)]).into_owned();
+    match status {
+        200..=299 => Ok(None),
+        400 => Ok(Some(match serde_json::from_slice::<Refusal>(body) {
+            Ok(refusal) => format!("{} {}", refusal.code, refusal.msg),
+            Err(_) => preview(),
+        })),
+        _ => bail!("exchangeInfo answered {status}: {}", preview()),
     }
 }
 
@@ -497,6 +548,25 @@ mod tests {
             truncated.await.unwrap_err().to_string(),
             "28-byte depth diff is shorter than its fixed block"
         );
+    }
+
+    #[test]
+    fn exchange_info_names_an_invalid_symbol_and_retries_anything_else() {
+        assert_eq!(exchange_info(200, br#"{"symbols":[]}"#).unwrap(), None);
+        assert_eq!(
+            exchange_info(400, br#"{"code":-1121,"msg":"Invalid symbol."}"#)
+                .unwrap()
+                .as_deref(),
+            Some("-1121 Invalid symbol.")
+        );
+        assert_eq!(
+            exchange_info(400, br#"{"code":-1100,"msg":"Illegal characters found."}"#)
+                .unwrap()
+                .as_deref(),
+            Some("-1100 Illegal characters found.")
+        );
+        assert!(exchange_info(418, br#"{"code":-1003}"#).is_err());
+        assert!(exchange_info(502, b"<html>").is_err());
     }
 
     #[tokio::test]

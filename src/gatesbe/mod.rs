@@ -1,9 +1,6 @@
 mod protocol;
 
-use std::{
-    collections::{HashMap, HashSet},
-    time::Duration,
-};
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context as _, bail};
 use reqwest::StatusCode;
@@ -25,6 +22,7 @@ use crate::{
     dedup::{DEDUP_MAX_ENTRIES, DEDUP_WINDOW, Dedup},
     error::ConnectorError,
     file::Symbol,
+    listing::{self, Unlisted},
     quality::{QualityEvent, QualityReporter},
     session::{Frame, Protocol},
 };
@@ -46,26 +44,48 @@ impl Subscription {
             .iter()
             .map(|symbol| symbol.to_ascii_uppercase())
             .collect();
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            .build()?;
-        for pair in &pairs {
-            let url = match market {
-                Market::Spot => format!("{REST_URL}/spot/currency_pairs/{pair}"),
-                Market::Futures => format!("{REST_URL}/futures/usdt/contracts/{pair}"),
-            };
-            let response = client
-                .get(&url)
-                .send()
-                .await
-                .with_context(|| format!("cannot look up {pair} at {url}"))?;
-            let status = response.status();
-            let body = response.bytes().await?;
-            check_listing(market, pair, status, &body)?;
+        let client = listing::client()?;
+        let unlisted =
+            listing::patiently(listing::PATIENCE, || unlisted(&client, market, &pairs)).await?;
+        if !unlisted.is_empty() {
+            return Err(Unlisted(unlisted).into());
         }
         Ok(Self { market, pairs })
     }
+}
+
+/// Why Gate does not list each of `pairs` it does not.
+async fn unlisted(
+    client: &reqwest::Client,
+    market: Market,
+    pairs: &[String],
+) -> anyhow::Result<Vec<String>> {
+    let mut unlisted = Vec::new();
+    for pair in pairs {
+        let url = match market {
+            Market::Spot => format!("{REST_URL}/spot/currency_pairs/{pair}"),
+            Market::Futures => format!("{REST_URL}/futures/usdt/contracts/{pair}"),
+        };
+        let response = client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("cannot look up {pair} at {url}"))?;
+        let status = response.status();
+        let body = response.bytes().await?;
+        if let Some(reason) = check_listing(market, pair, status, &body)? {
+            unlisted.push(format!("{pair} ({reason})"));
+        }
+    }
+    Ok(unlisted)
+}
+
+/// How Gate refuses a pair it does not list: `{"label":"INVALID_CURRENCY",
+/// "message":"Invalid currency FOOX"}`, `{"label":"CONTRACT_NOT_FOUND"}`.
+#[derive(Deserialize)]
+struct Refusal {
+    label: String,
+    message: Option<String>,
 }
 
 /// A spot pair's or a futures contract's listing; the fields this reads.
@@ -79,17 +99,30 @@ struct Listing {
     in_delisting: Option<bool>,
 }
 
-/// Whether Gate lists `pair` in `market`; a pair it lists but does not trade
-/// is recorded anyway, with a warning, since it streams nothing until it does.
+/// Why Gate does not list `pair` in `market`, if it does not: it answers an
+/// unknown pair 400, with an error label. A 400 refuses the request itself,
+/// which asking again cannot change; anything else, a rate limit or an
+/// outage, is no answer. A pair it lists but does not trade is recorded
+/// anyway, with a warning, since it streams nothing until it does.
 fn check_listing(
     market: Market,
     pair: &str,
     status: StatusCode,
     body: &[u8],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<String>> {
     let preview = || String::from_utf8_lossy(&body[..body.len().min(512)]).into_owned();
+    if status == StatusCode::BAD_REQUEST {
+        return Ok(Some(match serde_json::from_slice::<Refusal>(body) {
+            Ok(Refusal {
+                label,
+                message: Some(message),
+            }) => format!("{label}: {message}"),
+            Ok(Refusal { label, .. }) => label,
+            Err(_) => preview(),
+        }));
+    }
     if !status.is_success() {
-        bail!("Gate does not list {pair}: {status} {}", preview());
+        bail!("Gate answered {status} for {pair}: {}", preview());
     }
     let listing: Listing = serde_json::from_slice(body)
         .with_context(|| format!("unreadable listing of {pair}: {}", preview()))?;
@@ -98,7 +131,7 @@ fn check_listing(
         Market::Futures => listing.name,
     };
     if listed.as_deref() != Some(pair) {
-        bail!("Gate answered {listed:?} for {pair}");
+        return Ok(Some(format!("Gate answered {listed:?}")));
     }
     if listing
         .trade_status
@@ -108,7 +141,7 @@ fn check_listing(
     {
         warn!(pair, "Gate lists the pair as not trading");
     }
-    Ok(())
+    Ok(None)
 }
 
 /// The single consumer of every connection's frames: duplicate suppression,
@@ -391,21 +424,47 @@ mod tests {
     #[test]
     fn a_listing_must_name_the_pair() {
         let spot = br#"{"id":"BTC_USDT","base":"BTC","quote":"USDT","trade_status":"tradable"}"#;
-        check_listing(Market::Spot, "BTC_USDT", StatusCode::OK, spot).unwrap();
+        assert_eq!(
+            check_listing(Market::Spot, "BTC_USDT", StatusCode::OK, spot).unwrap(),
+            None
+        );
         let futures = br#"{"name":"BTC_USDT","status":"trading","in_delisting":false}"#;
-        check_listing(Market::Futures, "BTC_USDT", StatusCode::OK, futures).unwrap();
+        assert_eq!(
+            check_listing(Market::Futures, "BTC_USDT", StatusCode::OK, futures).unwrap(),
+            None
+        );
 
-        assert!(check_listing(Market::Spot, "ETH_USDT", StatusCode::OK, spot).is_err());
-        assert!(check_listing(Market::Spot, "BTC_USDT", StatusCode::OK, futures).is_err());
+        let listed = |pair, body| check_listing(Market::Spot, pair, StatusCode::OK, body).unwrap();
+        assert!(listed("ETH_USDT", spot).is_some());
+        assert!(listed("BTC_USDT", futures).is_some());
+    }
+
+    /// What Gate really answers for pairs it does not list.
+    #[test]
+    fn an_unknown_pair_is_unlisted_by_gates_label() {
         let unknown = br#"{"label":"CONTRACT_NOT_FOUND"}"#;
-        let error = check_listing(
+        let reason = check_listing(
             Market::Futures,
             "NOPE_USDT",
             StatusCode::BAD_REQUEST,
             unknown,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(error.contains("CONTRACT_NOT_FOUND"), "{error}");
+        );
+        assert_eq!(reason.unwrap().as_deref(), Some("CONTRACT_NOT_FOUND"));
+        let unknown = br#"{"label":"INVALID_CURRENCY","message":"Invalid currency FOOX"}"#;
+        let reason = check_listing(Market::Spot, "FOOX_USDT", StatusCode::BAD_REQUEST, unknown);
+        assert_eq!(
+            reason.unwrap().as_deref(),
+            Some("INVALID_CURRENCY: Invalid currency FOOX")
+        );
+    }
+
+    /// A rate limit or an outage is no answer: asked again.
+    #[test]
+    fn a_rate_limit_or_an_outage_is_no_answer() {
+        let rate_limited =
+            br#"{"label":"TOO_MANY_REQUESTS","message":"Request Rate limit Exceeded"}"#;
+        for status in [StatusCode::TOO_MANY_REQUESTS, StatusCode::BAD_GATEWAY] {
+            assert!(check_listing(Market::Spot, "BTC_USDT", status, rate_limited).is_err());
+        }
     }
 }

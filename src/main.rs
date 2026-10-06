@@ -6,6 +6,7 @@ mod feed;
 mod file;
 mod gatesbe;
 mod handover;
+mod listing;
 mod okxsbe;
 mod quality;
 mod readiness;
@@ -127,7 +128,7 @@ impl Venue {
     async fn prepare(exchange: Exchange, symbols: &[String]) -> anyhow::Result<Self> {
         Ok(match exchange {
             Exchange::BinanceSbeSpot => {
-                Self::BinanceSbeSpot(binancesbespot::Subscription::from_env(symbols)?)
+                Self::BinanceSbeSpot(binancesbespot::Subscription::prepare(symbols).await?)
             }
             Exchange::OkxSbe => Self::OkxSbe(okxsbe::Subscription::prepare(symbols).await?),
             Exchange::GateSbeSpot => {
@@ -168,7 +169,9 @@ async fn main() -> anyhow::Result<()> {
         info!("SIGHUP is ignored (inherited, e.g. from nohup); a hangup will not stop collection");
     }
     let connections = usize::from(args.connections);
-    let venue = Venue::prepare(args.exchange, &args.symbols).await?;
+    let venue = Venue::prepare(args.exchange, &args.symbols)
+        .await
+        .with_context(|| format!("cannot collect {}", args.exchange.as_str()))?;
     if connections > 1 {
         info!(
             connections,

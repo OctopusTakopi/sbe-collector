@@ -1,15 +1,19 @@
 //! Resolving the command line's instIds to the `instIdCode`s OKX's SBE
 //! stream carries instead.
 
-use std::time::Duration;
-
 use anyhow::{Context, bail};
 use serde::Deserialize;
 use tracing::warn;
 
-use crate::file::Symbol;
+use crate::{
+    file::Symbol,
+    listing::{self, Unlisted},
+};
 
 const INSTRUMENTS_URL: &str = "https://www.okx.com/api/v5/public/instruments";
+
+/// OKX's answer for an instId it does not list.
+const UNKNOWN_INSTRUMENT: &str = "51001";
 
 /// An instrument to record.
 pub(crate) struct Instrument {
@@ -26,18 +30,37 @@ impl Instrument {
     }
 }
 
-/// Look every instId up, failing on the first OKX does not know. One small
-/// filtered request each: a whole SPOT listing is over a megabyte.
+/// Look every instId up, asking again while OKX cannot answer, and failing
+/// with every instId it does not list. One small filtered request each: a
+/// whole SPOT listing is over a megabyte.
 pub(crate) async fn resolve(inst_ids: &[String]) -> anyhow::Result<Vec<Instrument>> {
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
-        .build()?;
-    let mut instruments = Vec::with_capacity(inst_ids.len());
-    for inst_id in inst_ids {
-        // OKX rejects a lowercase instId outright.
-        let inst_id = inst_id.to_ascii_uppercase();
-        let url = format!("{INSTRUMENTS_URL}?{}", query(&inst_id)?);
+    let queries = inst_ids
+        .iter()
+        .map(|inst_id| {
+            // OKX rejects a lowercase instId outright.
+            let inst_id = inst_id.to_ascii_uppercase();
+            let query = query(&inst_id)?;
+            anyhow::Ok((inst_id, query))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let client = listing::client()?;
+    let codes = listing::patiently(listing::PATIENCE, || look_up(&client, &queries)).await??;
+    Ok(queries
+        .into_iter()
+        .zip(codes)
+        .map(|((inst_id, _), code)| Instrument { inst_id, code })
+        .collect())
+}
+
+/// Each instId's code, or why OKX does not list the ones it does not.
+async fn look_up(
+    client: &reqwest::Client,
+    queries: &[(String, String)],
+) -> anyhow::Result<Result<Vec<i64>, Unlisted>> {
+    let mut codes = Vec::with_capacity(queries.len());
+    let mut unlisted = Vec::new();
+    for (inst_id, query) in queries {
+        let url = format!("{INSTRUMENTS_URL}?{query}");
         let body = client
             .get(&url)
             .send()
@@ -46,10 +69,16 @@ pub(crate) async fn resolve(inst_ids: &[String]) -> anyhow::Result<Vec<Instrumen
             .with_context(|| format!("cannot look up {inst_id} at {url}"))?
             .bytes()
             .await?;
-        let code = parse(&inst_id, &body)?;
-        instruments.push(Instrument { inst_id, code });
+        match parse(inst_id, &body)? {
+            Ok(code) => codes.push(code),
+            Err(reason) => unlisted.push(format!("{inst_id} ({reason})")),
+        }
     }
-    Ok(instruments)
+    Ok(if unlisted.is_empty() {
+        Ok(codes)
+    } else {
+        Err(Unlisted(unlisted))
+    })
 }
 
 /// The instruments query for `inst_id`, its type read off its shape. Options
@@ -87,37 +116,36 @@ struct Row {
     state: String,
 }
 
-/// The `instIdCode` in an instruments reply for exactly `inst_id`.
-fn parse(inst_id: &str, body: &[u8]) -> anyhow::Result<i64> {
+/// The `instIdCode` in an instruments reply for exactly `inst_id`, or why
+/// OKX does not list it. An unreadable reply, or any error but
+/// [`UNKNOWN_INSTRUMENT`] (a rate limit, say), is no answer.
+fn parse(inst_id: &str, body: &[u8]) -> anyhow::Result<Result<i64, String>> {
     let response: Response = serde_json::from_slice(body).with_context(|| {
         format!(
             "unreadable instruments reply for {inst_id}: {}",
             String::from_utf8_lossy(&body[..body.len().min(512)])
         )
     })?;
-    if response.code != "0" {
-        bail!(
-            "OKX does not know {inst_id}: {} (code {})",
-            response.msg,
-            response.code
-        );
+    match response.code.as_str() {
+        "0" => {}
+        UNKNOWN_INSTRUMENT => {
+            return Ok(Err(format!("{} (code {})", response.msg, response.code)));
+        }
+        code => bail!("OKX answered {code} for {inst_id}: {}", response.msg),
     }
     let [row] = response.data.as_slice() else {
-        bail!(
-            "OKX listed {} instruments for {inst_id}",
-            response.data.len()
-        );
+        return Ok(Err(format!("{} instruments listed", response.data.len())));
     };
     if row.inst_id != inst_id {
-        bail!("OKX answered {} for {inst_id}", row.inst_id);
+        return Ok(Err(format!("OKX answered {}", row.inst_id)));
     }
     let Some(code) = row.code else {
-        bail!("OKX gave {inst_id} no instIdCode");
+        return Ok(Err("no instIdCode".to_owned()));
     };
     if row.state != "live" {
         warn!(inst_id, state = %row.state, "the instrument is not live; it streams nothing until it is");
     }
-    Ok(code)
+    Ok(Ok(code))
 }
 
 #[cfg(test)]
@@ -146,23 +174,30 @@ mod tests {
     #[test]
     fn a_listed_instrument_yields_its_code() {
         let body = br#"{"code":"0","data":[{"alias":"","baseCcy":"BTC","instId":"BTC-USDT","instIdCode":3,"instType":"SPOT","state":"live","tickSz":"0.1"}],"msg":""}"#;
-        assert_eq!(parse("BTC-USDT", body).unwrap(), 3);
+        assert_eq!(parse("BTC-USDT", body).unwrap(), Ok(3));
     }
 
+    /// What OKX really answers for an instId it does not list.
     #[test]
-    fn an_unknown_instrument_fails_by_name() {
+    fn an_unknown_instrument_is_unlisted() {
         let body = br#"{"code":"51001","data":[],"msg":"Instrument ID, Instrument ID code, or Spread ID doesn't exist."}"#;
-        let error = parse("NOPE-USDT", body).unwrap_err().to_string();
-        assert!(error.contains("NOPE-USDT"), "{error}");
-        assert!(error.contains("51001"), "{error}");
+        let reason = parse("NOPE-USDT", body).unwrap().unwrap_err();
+        assert!(reason.contains("51001"), "{reason}");
     }
 
     #[test]
-    fn a_reply_without_a_code_or_for_another_instrument_fails() {
+    fn a_reply_without_a_code_or_for_another_instrument_is_unlisted() {
         let no_code = br#"{"code":"0","data":[{"instId":"BTC-USDT","state":"live"}],"msg":""}"#;
-        assert!(parse("BTC-USDT", no_code).is_err());
+        assert!(parse("BTC-USDT", no_code).unwrap().is_err());
         let other = br#"{"code":"0","data":[{"instId":"ETH-USDT","instIdCode":4,"state":"live"}],"msg":""}"#;
-        assert!(parse("BTC-USDT", other).is_err());
+        assert!(parse("BTC-USDT", other).unwrap().is_err());
+    }
+
+    /// A rate limit or an unreadable page is no answer: asked again.
+    #[test]
+    fn a_rate_limit_or_an_unreadable_reply_is_no_answer() {
+        let rate_limited = br#"{"code":"50011","data":[],"msg":"Too Many Requests"}"#;
+        assert!(parse("BTC-USDT", rate_limited).is_err());
         assert!(parse("BTC-USDT", b"<html>").is_err());
     }
 }
