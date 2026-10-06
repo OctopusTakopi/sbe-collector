@@ -2,6 +2,11 @@
 
 pub const HEADER_LEN: usize = 13;
 
+/// Sanity ceiling for one payload, far above any frame or snapshot the
+/// collectors write; a header claiming more is corrupt, or the file is not a
+/// recording.
+pub const MAX_PAYLOAD_LEN: u32 = 64 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum Tag {

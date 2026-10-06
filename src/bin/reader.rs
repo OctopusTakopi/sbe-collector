@@ -14,7 +14,7 @@ use std::{
 use clap::Parser;
 use sbe_collector::{
     exchange::Exchange,
-    record::{HEADER_LEN, Header, Tag},
+    record::{HEADER_LEN, Header, MAX_PAYLOAD_LEN, Tag},
     sbe::{
         GroupSize16Encoding, MessageHeader,
         binance::{
@@ -56,11 +56,18 @@ fn main() {
     let args = Args::parse();
     for path in &args.files {
         println!("=== {} ===", path.display());
-        let exchange = match args.exchange {
-            Some(exchange) => Ok(exchange),
-            None => Exchange::of_recordings_in(path.parent().unwrap_or(Path::new("."))),
-        };
-        if let Err(error) = exchange.and_then(|exchange| read_file(path, exchange)) {
+        let dir = path.parent().unwrap_or(Path::new("."));
+        let result = Exchange::of_recordings_in(dir).and_then(|marked| match marked {
+            Some(marked) => read_file(path, args.exchange.unwrap_or(marked)),
+            None => {
+                eprintln!(
+                    "Skipped {}: its directory holds another collector's recordings",
+                    path.display()
+                );
+                Ok(())
+            }
+        });
+        if let Err(error) = result {
             eprintln!("Error reading {}: {error}", path.display());
         }
     }
@@ -86,6 +93,14 @@ fn read_file(path: &Path, exchange: Exchange) -> io::Result<()> {
             Err(error) => return Err(error),
         }
         let Header { recv_ns, tag, len } = Header::parse(&header);
+        if len > MAX_PAYLOAD_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "implausible record (tag {tag:#04x}, len {len}): the file is corrupt or not a recording"
+                ),
+            ));
+        }
         payload.resize(len as usize, 0);
         reader.read_exact(&mut payload)?;
         counts.records += 1;
@@ -527,4 +542,36 @@ fn extract_symbol(data: &[u8]) -> &str {
         }
     }
     "unknown"
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::*;
+
+    /// A length no recording holds is corruption: the file is refused
+    /// rather than the length allocated.
+    #[test]
+    fn an_implausible_payload_length_is_refused() {
+        let path = std::env::temp_dir().join(format!(
+            "sbe-reader-implausible-{}-{}.zst",
+            std::process::id(),
+            jiff::Timestamp::now().as_nanosecond()
+        ));
+        let header = Header {
+            recv_ns: 1,
+            tag: Tag::Sbe as u8,
+            len: MAX_PAYLOAD_LEN + 1,
+        };
+        let mut encoder =
+            zstd::stream::write::Encoder::new(File::create(&path).unwrap(), 1).unwrap();
+        encoder.write_all(&header.encode()).unwrap();
+        encoder.finish().unwrap();
+
+        let error = read_file(&path, Exchange::BinanceSbeSpot).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("implausible record"), "{error}");
+        std::fs::remove_file(path).unwrap();
+    }
 }

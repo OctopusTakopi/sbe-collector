@@ -47,7 +47,7 @@ use clap::Parser;
 use jiff::{Span, Timestamp, civil, tz::TimeZone};
 use sbe_collector::{
     exchange::Exchange,
-    record::{HEADER_LEN, Header, Tag},
+    record::{HEADER_LEN, Header, MAX_PAYLOAD_LEN, Tag},
     sbe::{
         GroupSize16Encoding, MessageHeader,
         binance::{
@@ -71,10 +71,6 @@ const LIVE_FILE_WINDOW: Duration = Duration::from_secs(15 * 60);
 
 /// Break timestamps kept per stream.
 const MAX_BREAK_TIMES: usize = 16;
-
-/// Sanity ceiling for one payload; beyond it the stream is corrupt or
-/// foreign.
-const MAX_PAYLOAD_LEN: u32 = 64 * 1024 * 1024;
 
 /// How far apart two rolling processes' copies of one event may be received
 /// to be paired. Pairing is also confined to the runs' observed overlap.
@@ -179,9 +175,30 @@ fn discover(roots: &[PathBuf], exchange: Option<Exchange>) -> Result<Vec<Series>
         );
     }
 
-    let mut exchanges: HashMap<PathBuf, Exchange> = HashMap::new();
+    // Per directory: the exchange it is decoded as, or `None` for one another
+    // collector recorded, whatever `--exchange` says.
+    let mut exchanges: HashMap<PathBuf, Option<Exchange>> = HashMap::new();
     let mut series: Vec<Series> = Vec::with_capacity(map.len());
     for ((dir, symbol), mut files) in map {
+        let decoded = match exchanges.get(&dir) {
+            Some(&decoded) => decoded,
+            None => {
+                let marked = Exchange::of_recordings_in(&dir)
+                    .with_context(|| format!("cannot tell the exchange of {}", dir.display()))?;
+                if marked.is_none() {
+                    eprintln!(
+                        "note: skipped {}: it holds another collector's recordings",
+                        dir.display()
+                    );
+                }
+                let decoded = marked.map(|marked| exchange.unwrap_or(marked));
+                exchanges.insert(dir.clone(), decoded);
+                decoded
+            }
+        };
+        let Some(exchange) = decoded else {
+            continue;
+        };
         files.sort_by(|a, b| {
             (a.date, a.segment_start_ns, &a.run_id, &a.path).cmp(&(
                 b.date,
@@ -190,15 +207,6 @@ fn discover(roots: &[PathBuf], exchange: Option<Exchange>) -> Result<Vec<Series>
                 &b.path,
             ))
         });
-        let exchange = match (exchange, exchanges.get(&dir)) {
-            (Some(exchange), _) | (None, Some(&exchange)) => exchange,
-            (None, None) => {
-                let exchange = Exchange::of_recordings_in(&dir)
-                    .with_context(|| format!("cannot tell the exchange of {}", dir.display()))?;
-                exchanges.insert(dir.clone(), exchange);
-                exchange
-            }
-        };
         series.push(Series {
             key: format!("{}/{symbol}", dir.display()),
             files,
@@ -1427,6 +1435,33 @@ mod tests {
             encoder.write_all(record).unwrap();
         }
         encoder.finish().unwrap();
+    }
+
+    /// A directory collector recorded is left out of the scan, even with
+    /// `--exchange`: its records are not SBE.
+    #[test]
+    fn foreign_directories_are_not_scanned() {
+        let root = test_dir("foreign");
+        for dir in ["sbe", "json"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+            write_zst(&root.join(dir).join("btcusdt_20261007.zst"), &[]);
+        }
+        fs::write(
+            root.join("json").join(sbe_collector::exchange::MARKER),
+            "binancespot\n",
+        )
+        .unwrap();
+
+        for exchange in [None, Some(Exchange::BinanceSbeSpot)] {
+            let series = discover(std::slice::from_ref(&root), exchange).unwrap();
+            let keys: Vec<&str> = series.iter().map(|s| s.key.as_str()).collect();
+            assert_eq!(
+                keys,
+                [format!("{}/sbe/btcusdt", root.display())],
+                "{exchange:?}"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn daily(path: PathBuf, date: civil::Date) -> Series {

@@ -77,32 +77,14 @@ impl Exchange {
     }
 
     /// The exchange `dir`'s recordings were made from: its marker's, or
-    /// Binance spot for a directory recorded before markers existed.
-    pub fn of_recordings_in(dir: &Path) -> io::Result<Self> {
-        Ok(Self::marked_in(dir)?.unwrap_or_default())
-    }
-
-    /// The exchange `dir`'s marker names, if it has one. An empty marker is
-    /// a claim still being written, or one a crash cut short.
-    pub fn marked_in(dir: &Path) -> io::Result<Option<Self>> {
-        let mut name = String::new();
-        match File::open(dir.join(MARKER)) {
-            Ok(mut file) => file.read_to_string(&mut name)?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        if name.trim().is_empty() {
-            return Ok(None);
-        }
-        Self::from_str(name.trim(), false).map(Some).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "{} names an unknown exchange: {:?}",
-                    dir.join(MARKER).display(),
-                    name.trim()
-                ),
-            )
+    /// Binance spot for a directory recorded before markers existed. `None`
+    /// for a directory another collector recorded, which these tools cannot
+    /// decode.
+    pub fn of_recordings_in(dir: &Path) -> io::Result<Option<Self>> {
+        Ok(match Marked::read(dir)? {
+            Marked::Unmarked => Some(Self::default()),
+            Marked::Exchange(exchange) => Some(exchange),
+            Marked::Foreign(_) => None,
         })
     }
 
@@ -112,35 +94,66 @@ impl Exchange {
     /// one symbol's file would interleave payloads no decoder can tell apart.
     pub fn claim(self, dir: &Path) -> io::Result<()> {
         let path = dir.join(MARKER);
-        let file = match File::options().write(true).create_new(true).open(&path) {
+        let mut file = match File::options().write(true).create_new(true).open(&path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                match Self::marked_in(dir)? {
-                    Some(marked) if marked == self => return Ok(()),
-                    Some(marked) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::AlreadyExists,
-                            format!(
-                                "{} holds {} recordings, not {}",
-                                dir.display(),
-                                marked.as_str(),
-                                self.as_str()
-                            ),
-                        ));
-                    }
+                match Marked::read(dir)? {
+                    Marked::Exchange(marked) if marked == self => return Ok(()),
+                    Marked::Exchange(marked) => return Err(refused(dir, marked.as_str(), self)),
+                    Marked::Foreign(name) => return Err(refused(dir, &name, self)),
                     // Empty: finish the claim. A concurrent one, a handover's
                     // other process, writes the same line.
-                    None => File::options().write(true).truncate(true).open(&path)?,
+                    Marked::Unmarked => File::options().write(true).truncate(true).open(&path)?,
                 }
             }
             Err(error) => return Err(error),
         };
-        let mut file = file;
         writeln!(file, "{}", self.as_str())?;
         file.sync_all()?;
         // Persist the directory entry too.
         File::open(dir)?.sync_all()
     }
+}
+
+/// What a directory's marker says.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Marked {
+    /// No marker, or an empty one: a claim still being written, or one a
+    /// crash cut short.
+    Unmarked,
+    Exchange(Exchange),
+    /// An exchange this collector does not record, such as collector's
+    /// `binancespot`.
+    Foreign(String),
+}
+
+impl Marked {
+    pub fn read(dir: &Path) -> io::Result<Self> {
+        let mut name = String::new();
+        match File::open(dir.join(MARKER)) {
+            Ok(mut file) => file.read_to_string(&mut name)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::Unmarked),
+            Err(error) => return Err(error),
+        };
+        let name = name.trim();
+        Ok(if name.is_empty() {
+            Self::Unmarked
+        } else {
+            Exchange::from_str(name, false)
+                .map_or_else(|_| Self::Foreign(name.to_owned()), Self::Exchange)
+        })
+    }
+}
+
+fn refused(dir: &Path, marked: &str, exchange: Exchange) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "{} holds {marked} recordings, not {}",
+            dir.display(),
+            exchange.as_str()
+        ),
+    )
 }
 
 #[cfg(test)]
@@ -203,17 +216,20 @@ mod tests {
                 dir.display()
             )
         );
-        assert_eq!(Exchange::of_recordings_in(&dir).unwrap(), Exchange::OkxSbe);
+        assert_eq!(
+            Exchange::of_recordings_in(&dir).unwrap(),
+            Some(Exchange::OkxSbe)
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn a_claim_marks_the_directory_and_is_confirmed_again() {
         let dir = test_dir("claim");
-        assert_eq!(Exchange::marked_in(&dir).unwrap(), None);
+        assert_eq!(Marked::read(&dir).unwrap(), Marked::Unmarked);
         assert_eq!(
             Exchange::of_recordings_in(&dir).unwrap(),
-            Exchange::BinanceSbeSpot,
+            Some(Exchange::BinanceSbeSpot),
             "an unmarked directory is a legacy Binance one"
         );
 
@@ -225,20 +241,32 @@ mod tests {
             "binancesbespot\n"
         );
         assert_eq!(
-            Exchange::marked_in(&dir).unwrap(),
-            Some(Exchange::BinanceSbeSpot)
+            Marked::read(&dir).unwrap(),
+            Marked::Exchange(Exchange::BinanceSbeSpot)
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// collector writes the same marker: its directories are foreign here,
+    /// refused to the collector and skipped by the tools.
     #[test]
-    fn a_directory_marked_for_an_unknown_exchange_is_refused() {
-        let dir = test_dir("unknown");
-        std::fs::write(dir.join(MARKER), "bitmexsbe\n").unwrap();
+    fn a_collector_directory_is_foreign() {
+        let dir = test_dir("foreign");
+        std::fs::write(dir.join(MARKER), "binancespot\n").unwrap();
 
+        assert_eq!(
+            Marked::read(&dir).unwrap(),
+            Marked::Foreign("binancespot".to_owned())
+        );
         let error = Exchange::BinanceSbeSpot.claim(&dir).unwrap_err();
-        assert!(error.to_string().contains("bitmexsbe"), "{error}");
-        assert!(Exchange::of_recordings_in(&dir).is_err());
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "{} holds binancespot recordings, not binancesbespot",
+                dir.display()
+            )
+        );
+        assert_eq!(Exchange::of_recordings_in(&dir).unwrap(), None);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -247,13 +275,13 @@ mod tests {
     fn an_empty_marker_is_completed() {
         let dir = test_dir("empty");
         std::fs::write(dir.join(MARKER), "").unwrap();
-        assert_eq!(Exchange::marked_in(&dir).unwrap(), None);
+        assert_eq!(Marked::read(&dir).unwrap(), Marked::Unmarked);
 
         Exchange::BinanceSbeSpot.claim(&dir).unwrap();
 
         assert_eq!(
-            Exchange::marked_in(&dir).unwrap(),
-            Some(Exchange::BinanceSbeSpot)
+            Marked::read(&dir).unwrap(),
+            Marked::Exchange(Exchange::BinanceSbeSpot)
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
