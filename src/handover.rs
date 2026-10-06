@@ -185,7 +185,7 @@ pub async fn run(
                     quality.report(QualityEvent::Handover {
                         at_ns: QualityEvent::now_ns(),
                         state,
-                        peer_run_id: Some(incumbent_run_id),
+                        peer_run_id: incumbent_run_id,
                     });
                 }
                 break listener;
@@ -319,7 +319,7 @@ async fn challenge(
     quality.report(QualityEvent::Handover {
         at_ns: QualityEvent::now_ns(),
         state: HandoverState::ChallengerReady,
-        peer_run_id: Some(incumbent_run_id.clone()),
+        peer_run_id: incumbent_run_id.clone(),
     });
     let ready_message = Message::Ready {
         run_id: run_id.to_owned(),
@@ -336,7 +336,7 @@ async fn challenge(
             quality.report(QualityEvent::Handover {
                 at_ns: QualityEvent::now_ns(),
                 state: HandoverState::drained(outcome.is_ok()),
-                peer_run_id: Some(incumbent_run_id),
+                peer_run_id: incumbent_run_id,
             });
             if let Err(error) = outcome {
                 tracing::error!(error, "incumbent reported a degraded drain");
@@ -438,7 +438,7 @@ async fn server_loop(
         quality.report(QualityEvent::Handover {
             at_ns: QualityEvent::now_ns(),
             state: HandoverState::TakeoverRequested,
-            peer_run_id: Some(peer_run_id.clone()),
+            peer_run_id: peer_run_id.clone(),
         });
         let (complete_tx, complete_rx) = oneshot::channel();
         takeover_tx
@@ -920,7 +920,7 @@ mod tests {
                 QualityEvent::Handover {
                     state, peer_run_id, ..
                 } => {
-                    assert_eq!(peer_run_id.as_deref(), Some("old"));
+                    assert_eq!(peer_run_id, "old");
                     Some(state)
                 }
                 _ => None,

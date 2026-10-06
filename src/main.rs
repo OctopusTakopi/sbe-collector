@@ -296,7 +296,7 @@ async fn main() -> anyhow::Result<()> {
         quality.report(QualityEvent::Handover {
             at_ns: QualityEvent::now_ns(),
             state: HandoverState::drained(outcome.is_ok()),
-            peer_run_id: Some(request.peer_run_id.clone()),
+            peer_run_id: request.peer_run_id.clone(),
         });
         request.complete(outcome);
     }

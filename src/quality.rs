@@ -47,7 +47,7 @@ pub enum QualityEvent {
     Handover {
         at_ns: i64,
         state: HandoverState,
-        peer_run_id: Option<String>,
+        peer_run_id: String,
     },
 }
 
@@ -175,10 +175,12 @@ mod tests {
         drop(log.reporter);
         log.writer.join().unwrap().unwrap();
 
-        let line = std::fs::read_to_string(log.path).unwrap();
-        let value: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
-        assert_eq!(value["kind"], "market_data_dropped");
-        assert_eq!(value["dropped_total"], 3);
+        assert_eq!(
+            std::fs::read_to_string(log.path).unwrap(),
+            "{\"kind\":\"market_data_dropped\",\"at_ns\":42,\"source\":\"test\",\
+             \"dropped_total\":3,\"dropped_since_last_report\":3}\n",
+            "one line per event, synced as written"
+        );
 
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -205,12 +207,72 @@ mod tests {
             let event = QualityEvent::Handover {
                 at_ns: 1,
                 state,
-                peer_run_id: Some("peer".to_owned()),
+                peer_run_id: "peer".to_owned(),
             };
             assert_eq!(
                 serde_json::to_string(&event).unwrap(),
                 format!(r#"{{"kind":"handover","at_ns":1,"state":"{name}","peer_run_id":"peer"}}"#)
             );
+        }
+    }
+
+    /// Scripts read the log's lines: every kind's bytes, field order
+    /// included, are part of the format.
+    #[test]
+    fn every_event_kind_keeps_its_bytes() {
+        let events = [
+            (
+                QualityEvent::MarketDataDropped {
+                    at_ns: 1,
+                    source: "s".to_owned(),
+                    dropped_total: 3,
+                    dropped_since_last_report: 2,
+                },
+                r#"{"kind":"market_data_dropped","at_ns":1,"source":"s","dropped_total":3,"dropped_since_last_report":2}"#,
+            ),
+            (
+                QualityEvent::MarketDataRecovered {
+                    at_ns: 1,
+                    source: "s".to_owned(),
+                    dropped_total: 3,
+                },
+                r#"{"kind":"market_data_recovered","at_ns":1,"source":"s","dropped_total":3}"#,
+            ),
+            (
+                QualityEvent::FeedDegraded {
+                    at_ns: 1,
+                    source: "s".to_owned(),
+                    detail: "d".to_owned(),
+                },
+                r#"{"kind":"feed_degraded","at_ns":1,"source":"s","detail":"d"}"#,
+            ),
+            (
+                QualityEvent::CriticalTaskFailed {
+                    at_ns: 1,
+                    task: "t".to_owned(),
+                    error: "e".to_owned(),
+                },
+                r#"{"kind":"critical_task_failed","at_ns":1,"task":"t","error":"e"}"#,
+            ),
+            (
+                QualityEvent::StorageDegraded {
+                    at_ns: 1,
+                    target: "f".to_owned(),
+                    error: "e".to_owned(),
+                },
+                r#"{"kind":"storage_degraded","at_ns":1,"target":"f","error":"e"}"#,
+            ),
+            (
+                QualityEvent::Handover {
+                    at_ns: 1,
+                    state: HandoverState::IncumbentDrained,
+                    peer_run_id: "p".to_owned(),
+                },
+                r#"{"kind":"handover","at_ns":1,"state":"incumbent_drained","peer_run_id":"p"}"#,
+            ),
+        ];
+        for (event, line) in events {
+            assert_eq!(serde_json::to_string(&event).unwrap(), line);
         }
     }
 }
