@@ -51,6 +51,7 @@ enum Step {
     SetAside,
     Append,
     Resume,
+    Flush,
     Finish,
     Trailer,
     Sync,
@@ -499,13 +500,18 @@ enum Sink {
     /// A run-local sidecar, while the daily file is held by another writer
     /// or cannot be taken.
     Sidecar { encoder: Encoder, path: PathBuf },
+    /// The sidecar after a failed write dropped its encoder (see
+    /// [`RotatingFile::tear`]): it ends mid-frame and is never appended. The
+    /// switch writes the batched records it lacks to the daily file.
+    Torn(PathBuf),
     /// Sealed, or left without a file by a failed switch.
     Closed,
 }
 
 impl Sink {
+    /// This run's sidecar, whole or torn: what a switch moves off.
     fn is_sidecar(&self) -> bool {
-        matches!(self, Self::Sidecar { .. })
+        matches!(self, Self::Sidecar { .. } | Self::Torn(_))
     }
 }
 
@@ -710,7 +716,22 @@ impl RotatingFile {
     /// that fails is an error.
     fn finalize(&mut self) -> io::Result<Option<PathBuf>> {
         match mem::replace(&mut self.sink, Sink::Closed) {
-            Sink::Closed => Ok(None),
+            Sink::Torn(_) | Sink::Closed => {
+                if !self.batch.is_empty() {
+                    let path = day_file(&self.prefix, self.day.date, "");
+                    let lost = io::Error::other(format!(
+                        "{} batched bytes have no open file",
+                        self.batch.len()
+                    ));
+                    self.batch.clear();
+                    self.faults.report(
+                        &path,
+                        &lost,
+                        "batched records lost: no file to seal them in",
+                    );
+                }
+                Ok(None)
+            }
             Sink::Daily(encoder) => {
                 let path = day_file(&self.prefix, self.day.date, "");
                 seal(encoder, &mut self.batch, &path).map_err(|error| {
@@ -756,8 +777,15 @@ impl RotatingFile {
                 return Switch::Stay(self.lock_failed(self.day.date, &error));
             }
         };
-        let Sink::Sidecar { encoder, path } = mem::replace(&mut self.sink, Sink::Closed) else {
-            unreachable!("checked above");
+        let (encoder, path) = match mem::replace(&mut self.sink, Sink::Closed) {
+            Sink::Sidecar { encoder, path } => (encoder, path),
+            // Never appended: it ends mid-frame. The fault was reported when
+            // it tore; the batched records it lacks go to the daily file.
+            Sink::Torn(path) => {
+                self.drop_persisted(&path);
+                return Switch::Switched(daily);
+            }
+            Sink::Daily(_) | Sink::Closed => unreachable!("checked above"),
         };
         match seal(encoder, &mut self.batch, &path) {
             Ok(()) => {}
@@ -906,14 +934,53 @@ impl RotatingFile {
     fn flush_batch(&mut self) -> io::Result<()> {
         let encoder = match &mut self.sink {
             Sink::Daily(encoder) | Sink::Sidecar { encoder, .. } => encoder,
-            Sink::Closed => return Err(no_sink(&self.prefix)),
+            Sink::Torn(_) | Sink::Closed => return Err(no_sink(&self.prefix)),
         };
         // Flushed per batch, so a frame that fails unfinished can have
         // persisted only part of the batch being sealed.
-        encoder.write_all(&self.batch)?;
-        encoder.flush()?;
+        let flushed = encoder
+            .write_all(&self.batch)
+            .and_then(|()| fault(Step::Flush))
+            .and_then(|()| encoder.flush());
+        if let Err(error) = flushed {
+            self.tear(&error);
+            return Err(error);
+        }
         self.batch.clear();
         Ok(())
+    }
+
+    /// Drop the encoder after a failed write or flush, unfinished.
+    ///
+    /// zstd takes input before it reports an earlier write's failure, so the
+    /// encoder may already hold part of the batch: sealed with the batch, it
+    /// would record that part twice behind a valid trailer. Unfinished, the
+    /// file ends mid-frame: the daily file is set aside by its day's next
+    /// writer, readable up to the tear, and a torn sidecar is never appended.
+    /// The sidecar's batch is kept for the switch to the daily file.
+    fn tear(&mut self, error: &io::Error) {
+        match mem::replace(&mut self.sink, Sink::Closed) {
+            Sink::Sidecar { path, .. } => {
+                self.faults.report(
+                    &path,
+                    error,
+                    "failed to write the overlap sidecar; leaving it on disk unfinished",
+                );
+                self.sink = Sink::Torn(path);
+            }
+            Sink::Daily(_) | Sink::Torn(_) | Sink::Closed => {
+                let path = day_file(&self.prefix, self.day.date, "");
+                let lost = self.batch.len();
+                self.batch.clear();
+                self.faults.report(
+                    &path,
+                    error,
+                    &format!(
+                        "failed to write the daily file; leaving it unfinished, {lost} batched bytes lost"
+                    ),
+                );
+            }
+        }
     }
 
     /// Only failing to put the record into the open sink is an error.
@@ -925,7 +992,7 @@ impl RotatingFile {
             let progress = self.switch_to_daily()?.max(self.merge_pending_sidecars());
             self.retry.record(progress, Instant::now());
         }
-        if matches!(self.sink, Sink::Closed) {
+        if !matches!(self.sink, Sink::Daily(_) | Sink::Sidecar { .. }) {
             return Err(no_sink(&self.prefix));
         }
 
@@ -1924,6 +1991,120 @@ mod tests {
                 (day_one(), b"after"),
             ])
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `count` distinct 1 KiB records numbered from `first`, so a little over
+    /// a hundred fill a batch.
+    fn numbered(first: u64, count: u64) -> impl Iterator<Item = WriteRecord> {
+        (first..first + count).map(|n| {
+            let mut data = vec![7; 1024];
+            data[..8].copy_from_slice(&n.to_le_bytes());
+            WriteRecord {
+                recv_time: day_one(),
+                symbol: Symbol::from("btcusdt"),
+                tag: Tag::Sbe,
+                data: Bytes::from(data),
+            }
+        })
+    }
+
+    /// The numbers of the whole numbered records in decoded bytes.
+    fn numbers(mut bytes: &[u8]) -> Vec<u64> {
+        let mut numbers = Vec::new();
+        while let Some(header) = bytes.first_chunk() {
+            let end = HEADER_LEN + Header::parse(header).len as usize;
+            let Some(record) = bytes.get(..end) else {
+                break;
+            };
+            let payload = &record[HEADER_LEN..];
+            if let Some(number) = payload.first_chunk()
+                && payload.len() == 1024
+            {
+                numbers.push(u64::from_le_bytes(*number));
+            }
+            bytes = &bytes[end..];
+        }
+        numbers
+    }
+
+    /// What a file decodes to up to where it stops, whole or torn.
+    fn readable(path: &Path) -> Vec<u8> {
+        let mut decoder = ZstdDecoder::new(File::open(path).unwrap()).unwrap();
+        let (mut bytes, mut chunk) = (Vec::new(), vec![0; 64 * 1024]);
+        while let Ok(read @ 1..) = decoder.read(&mut chunk) {
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+        bytes
+    }
+
+    /// Writes numbered records until one fails; the number of the one that
+    /// failed, which was batched before its flush did.
+    fn write_until_failure(writer: &mut Writer, first: u64, count: u64) -> u64 {
+        numbered(first, count)
+            .position(|record| writer.write(record).is_err())
+            .map(|offset| first + offset as u64)
+            .expect("a flush must fail")
+    }
+
+    /// zstd takes input before it reports a failed write, so an encoder whose
+    /// flush failed may hold the batch already: sealed with it at close, it
+    /// would record the batch twice behind a valid trailer.
+    #[test]
+    fn a_failed_flush_tears_the_frame_instead_of_writing_the_batch_twice() {
+        let dir = test_dir("failed-flush");
+        let mut first = writer(&dir, "first");
+        for record in numbered(0, 130) {
+            first.write(record).unwrap();
+        }
+        arm(&[Step::Flush]);
+        write_until_failure(&mut first, 130, 200);
+        assert!(first.close().is_err(), "a torn frame is not a clean close");
+
+        let daily = dir.join("btcusdt_20270115.zst");
+        assert!(!ends_cleanly(&File::open(&daily).unwrap()).unwrap());
+        let kept = numbers(&readable(&daily));
+        assert!(!kept.is_empty(), "the first flushed batch stays readable");
+        assert_eq!(kept, (0..kept.len() as u64).collect::<Vec<_>>());
+
+        // The next writer of the day sets the torn file aside.
+        let mut next = writer(&dir, "next");
+        next.write(sbe(day_one(), b"after")).unwrap();
+        next.close().unwrap();
+        assert_eq!(decoded(&daily), decoded_records(&[(day_one(), b"after")]));
+        assert!(
+            names(&dir)
+                .iter()
+                .any(|name| name.starts_with("btcusdt_20270115_unterminated-"))
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The same for a sidecar: it stays on disk torn, and the switch writes
+    /// the records it lacks to the daily file, once.
+    #[test]
+    fn a_torn_sidecar_is_left_and_its_batch_switched() {
+        let dir = test_dir("torn-sidecar");
+        let mut incumbent = writer(&dir, "incumbent");
+        incumbent.write(sbe(day_one(), b"incumbent")).unwrap();
+        let mut challenger = writer(&dir, "challenger");
+        for record in numbered(0, 130) {
+            challenger.write(record).unwrap();
+        }
+        arm(&[Step::Flush]);
+        let last = write_until_failure(&mut challenger, 130, 200);
+        incumbent.close().unwrap();
+        assert!(challenger.close().is_err());
+
+        let sidecar = dir.join("btcusdt_20270115_challenger.zst");
+        assert!(
+            !ends_cleanly(&File::open(&sidecar).unwrap()).unwrap(),
+            "a torn sidecar is never appended"
+        );
+        let mut recorded = numbers(&readable(&sidecar));
+        recorded.extend(numbers(&decoded(&dir.join("btcusdt_20270115.zst"))));
+        recorded.sort_unstable();
+        assert_eq!(recorded, (0..=last).collect::<Vec<_>>(), "each record once");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
