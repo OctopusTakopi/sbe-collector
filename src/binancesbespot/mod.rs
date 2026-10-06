@@ -1,20 +1,14 @@
 pub(crate) mod snapshot;
 mod ws;
 
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
-use bytes::Bytes;
-use jiff::Timestamp;
-use tokio::{
-    sync::{mpsc::Sender, watch},
-    task::JoinSet,
-};
-use tracing::{error, warn};
+use tokio::task::JoinSet;
+use tracing::warn;
 use zerocopy::FromBytes;
 
 use sbe_collector::{
     exchange::Exchange,
-    record::Tag,
     sbe::{
         MessageHeader,
         binance::{DepthDiffBlock, TEMPLATE_DEPTH_DIFF},
@@ -22,13 +16,12 @@ use sbe_collector::{
 };
 
 use crate::{
+    collection::{self, Consumer, Context, Recorder},
     dedup::Dedup,
     error::ConnectorError,
-    feed::{BackgroundResult, Feed},
-    file::{Symbol, WriteRecord},
+    file::Symbol,
     quality::{QualityEvent, QualityReporter},
-    readiness::Readiness,
-    session::{self, Frame, Protocol},
+    session::{Frame, Protocol},
     throttler::{SNAPSHOT_WEIGHT_BUDGET, Throttler},
 };
 use snapshot::Snapshots;
@@ -99,41 +92,40 @@ impl SymbolMatcher {
 /// The single consumer of every connection's frames: duplicate suppression,
 /// symbol routing and depth continuity.
 struct Ingest {
-    writer_tx: Sender<WriteRecord>,
+    recorder: Recorder,
     symbols: SymbolMatcher,
     /// Highest `lastBookUpdateId` seen per symbol.
     last_update_ids: HashMap<Symbol, i64>,
-    dedup: Dedup,
     snapshots: Snapshots,
+    /// Snapshots fetched to repair a depth gap.
+    recoveries: JoinSet<()>,
     quality: QualityReporter,
-    /// Connection supervisors, the periodic snapshot round, and recovery
-    /// snapshots.
-    tasks: JoinSet<BackgroundResult>,
 }
 
 impl Ingest {
     fn new(
-        writer_tx: Sender<WriteRecord>,
+        recorder: Recorder,
         symbols: Vec<Symbol>,
-        connections: usize,
         snapshots: Snapshots,
         quality: QualityReporter,
     ) -> Self {
         Self {
-            writer_tx,
+            recorder,
             symbols: SymbolMatcher::new(symbols),
             last_update_ids: HashMap::new(),
-            dedup: Dedup::for_connections(connections, Exchange::BinanceSbeSpot),
             snapshots,
+            recoveries: JoinSet::new(),
             quality,
-            tasks: JoinSet::new(),
         }
     }
+}
 
-    async fn handle(&mut self, recv_time: Timestamp, data: Bytes) -> Result<(), ConnectorError> {
+impl Consumer for Ingest {
+    async fn handle(&mut self, frame: Frame) -> Result<(), ConnectorError> {
+        let Frame { recv_time, data } = frame;
         // Before anything reads update ids: a second copy of a depth diff
         // starts where the first already ended, so it would read as a gap.
-        if self.dedup.is_duplicate(&data) {
+        if self.recorder.dedup.is_duplicate(&data) {
             return Ok(());
         }
         let Ok((header, body)) = MessageHeader::read_from_prefix(&data) else {
@@ -154,7 +146,10 @@ impl Ingest {
                     data.len()
                 ),
             });
-            return self.write(recv_time, Symbol::from("unknown"), data).await;
+            return self
+                .recorder
+                .write(recv_time, Symbol::from("unknown"), data)
+                .await;
         };
 
         if template_id == TEMPLATE_DEPTH_DIFF {
@@ -170,9 +165,11 @@ impl Ingest {
                 block.last_book_update_id.get(),
             );
         }
-        self.write(recv_time, symbol, data).await
+        self.recorder.write(recv_time, symbol, data).await
     }
+}
 
+impl Ingest {
     /// Report a forward hole in `symbol`'s depth diffs and fetch a snapshot to
     /// repair it.
     ///
@@ -214,31 +211,14 @@ impl Ingest {
                 "depth gap: expected first_u={expected} but got {first_id} (prev_u={prev})"
             ),
         });
+        while self.recoveries.try_join_next().is_some() {}
         let snapshots = self.snapshots.clone();
-        let writer_tx = self.writer_tx.clone();
+        let writer_tx = self.recorder.writer_tx.clone();
         let symbol = Symbol::clone(symbol);
-        self.tasks.spawn(async move {
+        self.recoveries.spawn(async move {
             // A closed writer is the collection's own failure to report.
             let _ = snapshots.record(&symbol, &writer_tx).await;
-            Ok(())
         });
-    }
-
-    async fn write(
-        &self,
-        recv_time: Timestamp,
-        symbol: Symbol,
-        data: Bytes,
-    ) -> Result<(), ConnectorError> {
-        self.writer_tx
-            .send(WriteRecord {
-                recv_time,
-                symbol,
-                tag: Tag::Sbe,
-                data,
-            })
-            .await
-            .map_err(|_| ConnectorError::WriterClosed)
     }
 }
 
@@ -247,11 +227,10 @@ impl Ingest {
 pub struct Subscription {
     endpoint: Endpoint,
     symbols: Vec<String>,
-    connections: usize,
 }
 
 impl Subscription {
-    pub fn from_env(symbols: &[String], connections: usize) -> anyhow::Result<Self> {
+    pub fn from_env(symbols: &[String]) -> anyhow::Result<Self> {
         let api_key = std::env::var("BINANCE_API_KEY").unwrap_or_default();
         if api_key.is_empty() {
             anyhow::bail!("BINANCE_API_KEY env var must be set for the SBE stream endpoint");
@@ -259,66 +238,43 @@ impl Subscription {
         Ok(Self {
             endpoint: Endpoint::new(&STREAMS, symbols, &api_key)?,
             symbols: symbols.to_vec(),
-            connections,
         })
     }
 }
 
-pub async fn run_collection(
-    subscription: Subscription,
-    writer_tx: Sender<WriteRecord>,
-    shutdown: watch::Receiver<bool>,
-    quality: QualityReporter,
-    readiness: Readiness,
-) -> anyhow::Result<()> {
-    let Subscription {
-        endpoint,
-        symbols,
-        connections,
-    } = subscription;
+/// Records `subscription` until shutdown or a critical failure.
+pub async fn collect(subscription: Subscription, cx: Context) -> anyhow::Result<()> {
+    let Subscription { endpoint, symbols } = subscription;
     let symbols: Vec<Symbol> = symbols
         .iter()
         .map(|symbol| Symbol::from(symbol.to_ascii_lowercase()))
         .collect();
     let snapshots = Snapshots::new(Throttler::new(SNAPSHOT_WEIGHT_BUDGET))?;
-    let mut ingest = Ingest::new(
-        writer_tx.clone(),
-        symbols.clone(),
-        connections,
-        snapshots.clone(),
-        quality.clone(),
-    );
-
-    let ws_rx = session::spawn_slots(
-        &mut ingest.tasks,
-        Arc::new(endpoint),
-        connections,
-        &quality,
-        &readiness,
-    );
-    let mut feed = Feed::new(ws_rx, shutdown);
-    ingest.tasks.spawn(async move {
-        snapshots.run_periodic(symbols, writer_tx).await;
-        Err(anyhow::anyhow!("periodic depth-snapshot task exited"))
-    });
-
-    while let Some(Frame {
-        recv_time, data, ..
-    }) = feed.recv(&mut ingest.tasks).await?
+    let mut tasks = JoinSet::new();
     {
-        match ingest.handle(recv_time, data).await {
-            Ok(()) => {}
-            Err(ConnectorError::WriterClosed) => return Err(ConnectorError::WriterClosed.into()),
-            Err(error) => error!(%error, "couldn't handle the received data"),
-        }
+        let snapshots = snapshots.clone();
+        let symbols = symbols.clone();
+        let writer_tx = cx.writer_tx.clone();
+        tasks.spawn(async move {
+            snapshots.run_periodic(symbols, writer_tx).await;
+            Err(anyhow::anyhow!("periodic depth-snapshot task exited"))
+        });
     }
-    Ok(())
+    let recorder = Recorder {
+        dedup: Dedup::for_connections(cx.connections, Exchange::BinanceSbeSpot),
+        writer_tx: cx.writer_tx.clone(),
+    };
+    let ingest = Ingest::new(recorder, symbols, snapshots, cx.quality.clone());
+    collection::run_slots(endpoint, ingest, cx, tasks).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file::WriteRecord;
+    use bytes::Bytes;
     use sbe_collector::sbe::binance::EVENT_TIME;
+    use std::sync::Arc;
     use tokio::sync::mpsc::{Receiver, channel};
 
     #[test]
@@ -371,10 +327,13 @@ mod tests {
     /// snapshot can never reach Binance from a unit test.
     fn ingest(connections: usize) -> (Ingest, Receiver<WriteRecord>) {
         let (writer_tx, writer_rx) = channel(16);
-        let ingest = Ingest::new(
+        let recorder = Recorder {
+            dedup: Dedup::for_connections(connections, Exchange::BinanceSbeSpot),
             writer_tx,
+        };
+        let ingest = Ingest::new(
+            recorder,
             vec![Symbol::from("btcusdt")],
-            connections,
             Snapshots::new(Throttler::new(0)).unwrap(),
             QualityReporter::disabled(),
         );
@@ -383,7 +342,7 @@ mod tests {
 
     impl Ingest {
         async fn feed(&mut self, data: Bytes) {
-            self.handle(Timestamp::now(), data).await.unwrap();
+            self.handle(Frame::now(data)).await.unwrap();
         }
     }
 
@@ -417,7 +376,10 @@ mod tests {
             sequence.len(),
             "each frame is recorded once"
         );
-        assert!(ingest.tasks.is_empty(), "no gap should have been reported");
+        assert!(
+            ingest.recoveries.is_empty(),
+            "no gap should have been reported"
+        );
         assert_eq!(ingest.last_update_ids["btcusdt"], 9);
     }
 
@@ -447,7 +409,7 @@ mod tests {
             "the stream is still complete"
         );
         assert!(
-            ingest.tasks.is_empty(),
+            ingest.recoveries.is_empty(),
             "no gap, so no recovery snapshot to fetch"
         );
     }
@@ -462,7 +424,11 @@ mod tests {
         ingest.feed(sequence[0].clone()).await;
         ingest.feed(sequence[2].clone()).await;
         assert_eq!(ingest.last_update_ids["btcusdt"], 7);
-        assert_eq!(ingest.tasks.len(), 1, "the skipped frame is a real hole");
+        assert_eq!(
+            ingest.recoveries.len(),
+            1,
+            "the skipped frame is a real hole"
+        );
 
         ingest.feed(sequence[1].clone()).await;
         assert_eq!(
@@ -472,7 +438,7 @@ mod tests {
 
         ingest.feed(sequence[3].clone()).await;
         assert_eq!(
-            ingest.tasks.len(),
+            ingest.recoveries.len(),
             1,
             "already-covered frames must not each fetch a snapshot"
         );
@@ -495,9 +461,9 @@ mod tests {
             "the mark follows the restarted stream"
         );
         assert!(
-            ingest.tasks.len() <= 1,
+            ingest.recoveries.len() <= 1,
             "one resync, not a snapshot fetch per frame: {}",
-            ingest.tasks.len()
+            ingest.recoveries.len()
         );
     }
 
@@ -518,7 +484,7 @@ mod tests {
 
         assert_eq!(written(&mut writer_rx), sequence.len() + 1);
         assert!(
-            ingest.tasks.is_empty(),
+            ingest.recoveries.is_empty(),
             "a repeat is already-covered ground, not a hole to refetch"
         );
     }
@@ -527,14 +493,14 @@ mod tests {
     async fn malformed_frames_say_what_is_missing() {
         let (mut ingest, _writer_rx) = ingest(1);
 
-        let runt = ingest.handle(Timestamp::now(), Bytes::from_static(b"\x01\x02"));
+        let runt = ingest.handle(Frame::now(Bytes::from_static(b"\x01\x02")));
         assert_eq!(
             runt.await.unwrap_err().to_string(),
             "2-byte frame is shorter than the SBE message header"
         );
         let mut truncated = depth_diff(2, 3).to_vec();
         truncated.drain(20..42);
-        let truncated = ingest.handle(Timestamp::now(), Bytes::from(truncated));
+        let truncated = ingest.handle(Frame::now(Bytes::from(truncated)));
         assert_eq!(
             truncated.await.unwrap_err().to_string(),
             "28-byte depth diff is shorter than its fixed block"

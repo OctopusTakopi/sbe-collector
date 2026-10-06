@@ -2,24 +2,17 @@ mod protocol;
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
     time::Duration,
 };
 
-use anyhow::{Context, bail};
-use bytes::Bytes;
-use jiff::Timestamp;
+use anyhow::{Context as _, bail};
 use reqwest::StatusCode;
 use serde::Deserialize;
-use tokio::{
-    sync::{mpsc::Sender, watch},
-    task::JoinSet,
-};
-use tracing::{error, warn};
+use tokio::task::JoinSet;
+use tracing::warn;
 
 use sbe_collector::{
     exchange::Exchange,
-    record::Tag,
     sbe::{
         MessageHeader,
         gate::{self, Market, ObuLink},
@@ -28,13 +21,12 @@ use sbe_collector::{
 use zerocopy::FromBytes;
 
 use crate::{
+    collection::{self, Consumer, Context, Recorder},
     dedup::{DEDUP_MAX_ENTRIES, DEDUP_WINDOW, Dedup},
     error::ConnectorError,
-    feed::{BackgroundResult, Feed},
-    file::{Symbol, WriteRecord},
+    file::Symbol,
     quality::{QualityEvent, QualityReporter},
-    readiness::Readiness,
-    session::{self, Frame, Protocol},
+    session::{Frame, Protocol},
 };
 use protocol::Gate;
 
@@ -46,15 +38,10 @@ pub struct Subscription {
     market: Market,
     /// As Gate spells them, `BTC_USDT`.
     pairs: Vec<String>,
-    connections: usize,
 }
 
 impl Subscription {
-    pub async fn prepare(
-        market: Market,
-        symbols: &[String],
-        connections: usize,
-    ) -> anyhow::Result<Self> {
+    pub async fn prepare(market: Market, symbols: &[String]) -> anyhow::Result<Self> {
         let pairs: Vec<String> = symbols
             .iter()
             .map(|symbol| symbol.to_ascii_uppercase())
@@ -77,11 +64,7 @@ impl Subscription {
             let body = response.bytes().await?;
             check_listing(market, pair, status, &body)?;
         }
-        Ok(Self {
-            market,
-            pairs,
-            connections,
-        })
+        Ok(Self { market, pairs })
     }
 }
 
@@ -132,7 +115,7 @@ fn check_listing(
 /// routing by the instrument each frame names, and the merged book chain.
 struct Ingest {
     market: Market,
-    writer_tx: Sender<WriteRecord>,
+    recorder: Recorder,
     /// Gate's spelling, `BTC_USDT`, to the file key, `btc_usdt`.
     symbols: HashMap<Box<[u8]>, Symbol>,
     /// Names already reported as unsubscribed: the quality log syncs each
@@ -140,23 +123,21 @@ struct Ingest {
     unknown: HashSet<Box<[u8]>>,
     /// The highest `obu` id recorded per symbol, across every connection.
     marks: HashMap<Symbol, i64>,
-    dedup: Dedup,
     quality: QualityReporter,
-    /// Connection supervisors.
-    tasks: JoinSet<BackgroundResult>,
+}
+
+/// Filtered even on one connection: it overlaps two sockets every hour, when
+/// its session is replaced, and Gate repeats no frame unchanged, so filtering
+/// a single connection loses nothing.
+fn dedup(exchange: Exchange) -> Dedup {
+    Dedup::new(exchange, DEDUP_WINDOW, DEDUP_MAX_ENTRIES)
 }
 
 impl Ingest {
-    fn new(
-        market: Market,
-        exchange: Exchange,
-        writer_tx: Sender<WriteRecord>,
-        pairs: &[String],
-        quality: QualityReporter,
-    ) -> Self {
+    fn new(market: Market, recorder: Recorder, pairs: &[String], quality: QualityReporter) -> Self {
         Self {
             market,
-            writer_tx,
+            recorder,
             symbols: pairs
                 .iter()
                 .map(|pair| {
@@ -168,17 +149,15 @@ impl Ingest {
                 .collect(),
             unknown: HashSet::new(),
             marks: HashMap::new(),
-            // Even one connection overlaps two sockets every hour, when its
-            // session is replaced, and Gate repeats no frame unchanged, so
-            // filtering a single connection loses nothing.
-            dedup: Dedup::new(exchange, DEDUP_WINDOW, DEDUP_MAX_ENTRIES),
             quality,
-            tasks: JoinSet::new(),
         }
     }
+}
 
-    async fn handle(&mut self, recv_time: Timestamp, data: Bytes) -> Result<(), ConnectorError> {
-        if self.dedup.is_duplicate(&data) {
+impl Consumer for Ingest {
+    async fn handle(&mut self, frame: Frame) -> Result<(), ConnectorError> {
+        let Frame { recv_time, data } = frame;
+        if self.recorder.dedup.is_duplicate(&data) {
             return Ok(());
         }
         let Ok((header, _)) = MessageHeader::read_from_prefix(&data) else {
@@ -200,9 +179,11 @@ impl Ingest {
                 Symbol::from("unknown")
             }
         };
-        self.write(recv_time, symbol, data).await
+        self.recorder.write(recv_time, symbol, data).await
     }
+}
 
+impl Ingest {
     /// Report a hole in `symbol`'s merged book stream when a delta jumps past
     /// the ids recorded so far. A lagging connection may still deliver them:
     /// as with Binance's depth check, this records the moment the hole was
@@ -251,62 +232,29 @@ impl Ingest {
             detail: format!("frames naming {name:?} (template_id={template_id}) go to 'unknown'"),
         });
     }
-
-    async fn write(
-        &self,
-        recv_time: Timestamp,
-        symbol: Symbol,
-        data: Bytes,
-    ) -> Result<(), ConnectorError> {
-        self.writer_tx
-            .send(WriteRecord {
-                recv_time,
-                symbol,
-                tag: Tag::Sbe,
-                data,
-            })
-            .await
-            .map_err(|_| ConnectorError::WriterClosed)
-    }
 }
 
-pub async fn run_collection(
-    subscription: Subscription,
-    writer_tx: Sender<WriteRecord>,
-    shutdown: watch::Receiver<bool>,
-    quality: QualityReporter,
-    readiness: Readiness,
-) -> anyhow::Result<()> {
-    let Subscription {
-        market,
-        pairs,
-        connections,
-    } = subscription;
+/// Records `subscription` until shutdown or a critical failure.
+pub async fn collect(subscription: Subscription, cx: Context) -> anyhow::Result<()> {
+    let Subscription { market, pairs } = subscription;
     let exchange = match market {
         Market::Spot => Exchange::GateSbeSpot,
         Market::Futures => Exchange::GateSbeFutures,
     };
-    let gate = Arc::new(Gate::new(market, &pairs, quality.clone()));
-    let mut ingest = Ingest::new(market, exchange, writer_tx, &pairs, quality.clone());
-    let ws_rx = session::spawn_slots(&mut ingest.tasks, gate, connections, &quality, &readiness);
-    let mut feed = Feed::new(ws_rx, shutdown);
-
-    while let Some(Frame {
-        recv_time, data, ..
-    }) = feed.recv(&mut ingest.tasks).await?
-    {
-        match ingest.handle(recv_time, data).await {
-            Ok(()) => {}
-            Err(ConnectorError::WriterClosed) => return Err(ConnectorError::WriterClosed.into()),
-            Err(error) => error!(%error, "couldn't handle the received data"),
-        }
-    }
-    Ok(())
+    let gate = Gate::new(market, &pairs, cx.quality.clone());
+    let recorder = Recorder {
+        dedup: dedup(exchange),
+        writer_tx: cx.writer_tx.clone(),
+    };
+    let ingest = Ingest::new(market, recorder, &pairs, cx.quality.clone());
+    collection::run_slots(gate, ingest, cx, JoinSet::new()).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file::WriteRecord;
+    use bytes::Bytes;
     use tokio::sync::mpsc::{Receiver, channel};
 
     fn names(frame: &mut Vec<u8>, channel: &str, name: &str) {
@@ -340,14 +288,12 @@ mod tests {
 
     fn ingest(quality: QualityReporter) -> (Ingest, Receiver<WriteRecord>) {
         let (writer_tx, writer_rx) = channel(32);
+        let recorder = Recorder {
+            dedup: dedup(Exchange::GateSbeSpot),
+            writer_tx,
+        };
         (
-            Ingest::new(
-                Market::Spot,
-                Exchange::GateSbeSpot,
-                writer_tx,
-                &["BTC_USDT".to_owned()],
-                quality,
-            ),
+            Ingest::new(Market::Spot, recorder, &["BTC_USDT".to_owned()], quality),
             writer_rx,
         )
     }
@@ -365,7 +311,7 @@ mod tests {
 
         for time in [100, 117] {
             ingest
-                .handle(Timestamp::now(), obu("BTC_USDT", true, 0, 9, time))
+                .handle(Frame::now(obu("BTC_USDT", true, 0, 9, time)))
                 .await
                 .unwrap();
         }
@@ -390,7 +336,7 @@ mod tests {
             obu("BTC_USDT", false, 109, 110, 6),
         ];
         for frame in feed {
-            ingest.handle(Timestamp::now(), frame).await.unwrap();
+            ingest.handle(Frame::now(frame)).await.unwrap();
         }
         assert!(
             events.try_recv().is_err(),
@@ -399,7 +345,7 @@ mod tests {
         );
 
         ingest
-            .handle(Timestamp::now(), obu("BTC_USDT", false, 115, 120, 7))
+            .handle(Frame::now(obu("BTC_USDT", false, 115, 120, 7)))
             .await
             .unwrap();
         let QualityEvent::FeedDegraded { source, detail, .. } = events.try_recv().unwrap() else {
@@ -427,7 +373,7 @@ mod tests {
             ("XRP_USDT", 13, 13),
         ] {
             ingest
-                .handle(Timestamp::now(), obu(pair, false, first_id, last_id, 1))
+                .handle(Frame::now(obu(pair, false, first_id, last_id, 1)))
                 .await
                 .unwrap();
         }

@@ -1,4 +1,5 @@
 mod binancesbespot;
+mod collection;
 mod dedup;
 mod error;
 mod feed;
@@ -15,7 +16,7 @@ mod ws;
 
 use std::{path::PathBuf, time::Duration};
 
-use anyhow::{Context, anyhow};
+use anyhow::{Context as _, anyhow};
 use clap::Parser;
 use sbe_collector::{exchange::Exchange, sbe::gate::Market};
 use tokio::{
@@ -25,6 +26,7 @@ use tokio::{
 };
 use tracing::{error, info};
 
+use collection::Context;
 use file::{WriteRecord, Writer};
 use quality::{HandoverState, QualityEvent, QualityLog};
 use readiness::Readiness;
@@ -121,56 +123,28 @@ enum Venue {
 }
 
 impl Venue {
-    async fn prepare(
-        exchange: Exchange,
-        symbols: &[String],
-        connections: usize,
-    ) -> anyhow::Result<Self> {
+    async fn prepare(exchange: Exchange, symbols: &[String]) -> anyhow::Result<Self> {
         Ok(match exchange {
-            Exchange::BinanceSbeSpot => Self::BinanceSbeSpot(
-                binancesbespot::Subscription::from_env(symbols, connections)?,
-            ),
-            Exchange::OkxSbe => {
-                Self::OkxSbe(okxsbe::Subscription::prepare(symbols, connections).await?)
+            Exchange::BinanceSbeSpot => {
+                Self::BinanceSbeSpot(binancesbespot::Subscription::from_env(symbols)?)
             }
-            Exchange::GateSbeSpot => Self::GateSbe(
-                gatesbe::Subscription::prepare(Market::Spot, symbols, connections).await?,
-            ),
-            Exchange::GateSbeFutures => Self::GateSbe(
-                gatesbe::Subscription::prepare(Market::Futures, symbols, connections).await?,
-            ),
+            Exchange::OkxSbe => Self::OkxSbe(okxsbe::Subscription::prepare(symbols).await?),
+            Exchange::GateSbeSpot => {
+                Self::GateSbe(gatesbe::Subscription::prepare(Market::Spot, symbols).await?)
+            }
+            Exchange::GateSbeFutures => {
+                Self::GateSbe(gatesbe::Subscription::prepare(Market::Futures, symbols).await?)
+            }
         })
     }
 
-    fn spawn(
-        self,
-        writer_tx: mpsc::Sender<WriteRecord>,
-        shutdown: watch::Receiver<bool>,
-        quality: quality::QualityReporter,
-        readiness: Readiness,
-    ) -> JoinHandle<anyhow::Result<()>> {
+    fn spawn(self, cx: Context) -> JoinHandle<anyhow::Result<()>> {
         match self {
-            Self::BinanceSbeSpot(subscription) => tokio::spawn(binancesbespot::run_collection(
-                subscription,
-                writer_tx,
-                shutdown,
-                quality,
-                readiness,
-            )),
-            Self::OkxSbe(subscription) => tokio::spawn(okxsbe::run_collection(
-                subscription,
-                writer_tx,
-                shutdown,
-                quality,
-                readiness,
-            )),
-            Self::GateSbe(subscription) => tokio::spawn(gatesbe::run_collection(
-                subscription,
-                writer_tx,
-                shutdown,
-                quality,
-                readiness,
-            )),
+            Self::BinanceSbeSpot(subscription) => {
+                tokio::spawn(binancesbespot::collect(subscription, cx))
+            }
+            Self::OkxSbe(subscription) => tokio::spawn(okxsbe::collect(subscription, cx)),
+            Self::GateSbe(subscription) => tokio::spawn(gatesbe::collect(subscription, cx)),
         }
     }
 }
@@ -193,7 +167,7 @@ async fn main() -> anyhow::Result<()> {
         info!("SIGHUP is ignored (inherited, e.g. from nohup); a hangup will not stop collection");
     }
     let connections = usize::from(args.connections);
-    let venue = Venue::prepare(args.exchange, &args.symbols, connections).await?;
+    let venue = Venue::prepare(args.exchange, &args.symbols).await?;
     if connections > 1 {
         info!(
             connections,
@@ -246,7 +220,13 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     let (writer_tx, mut writer_rx) = mpsc::channel::<WriteRecord>(WRITER_QUEUE_CAPACITY);
-    let mut collection = venue.spawn(writer_tx, shutdown_rx, quality.clone(), readiness.clone());
+    let mut collection = venue.spawn(Context {
+        writer_tx,
+        shutdown: shutdown_rx,
+        connections,
+        quality: quality.clone(),
+        readiness: readiness.clone(),
+    });
 
     let (writer_done_tx, writer_done_rx) = oneshot::channel();
     let writer_thread = {

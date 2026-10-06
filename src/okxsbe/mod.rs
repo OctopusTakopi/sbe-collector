@@ -2,34 +2,24 @@ mod instruments;
 mod protocol;
 mod snapshot;
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::collections::{HashMap, HashSet};
 
-use bytes::Bytes;
-use jiff::Timestamp;
-use tokio::{
-    sync::{mpsc::Sender, watch},
-    task::JoinSet,
-};
-use tracing::{error, warn};
+use tokio::task::JoinSet;
+use tracing::warn;
 
 use sbe_collector::{
     exchange::Exchange,
-    record::Tag,
     sbe::{MessageHeader, okx},
 };
 use zerocopy::FromBytes;
 
 use crate::{
+    collection::{self, Consumer, Context, Recorder},
     dedup::Dedup,
     error::ConnectorError,
-    feed::{BackgroundResult, Feed},
-    file::{Symbol, WriteRecord},
+    file::Symbol,
     quality::{QualityEvent, QualityReporter},
-    readiness::Readiness,
-    session::{self, Frame, Protocol},
+    session::{Frame, Protocol},
 };
 use instruments::Instrument;
 use protocol::{Credentials, Okx};
@@ -50,13 +40,12 @@ const MAX_SUBSCRIPTIONS: usize = 480;
 pub struct Subscription {
     instruments: Vec<Instrument>,
     credentials: Credentials,
-    connections: usize,
 }
 
 impl Subscription {
     /// Read the credentials and resolve `symbols`, OKX instIds, to the codes
     /// the stream carries.
-    pub async fn prepare(symbols: &[String], connections: usize) -> anyhow::Result<Self> {
+    pub async fn prepare(symbols: &[String]) -> anyhow::Result<Self> {
         let credentials = Credentials::from_env()?;
         let subscriptions = symbols.len() * CHANNELS.len();
         if subscriptions > MAX_SUBSCRIPTIONS {
@@ -67,7 +56,6 @@ impl Subscription {
         Ok(Self {
             instruments: instruments::resolve(symbols).await?,
             credentials,
-            connections,
         })
     }
 }
@@ -75,39 +63,32 @@ impl Subscription {
 /// The single consumer of every connection's frames: duplicate suppression
 /// and routing by `instIdCode`.
 struct Ingest {
-    writer_tx: Sender<WriteRecord>,
+    recorder: Recorder,
     /// `instIdCode` to the file key, the lowercase instId.
     symbols: HashMap<i64, Symbol>,
     /// Codes already reported as unknown: the quality log syncs each event.
     unknown: HashSet<i64>,
-    dedup: Dedup,
     quality: QualityReporter,
-    /// Connection supervisors and the periodic book snapshots.
-    tasks: JoinSet<BackgroundResult>,
 }
 
 impl Ingest {
-    fn new(
-        writer_tx: Sender<WriteRecord>,
-        instruments: &[Instrument],
-        connections: usize,
-        quality: QualityReporter,
-    ) -> Self {
+    fn new(recorder: Recorder, instruments: &[Instrument], quality: QualityReporter) -> Self {
         Self {
-            writer_tx,
+            recorder,
             symbols: instruments
                 .iter()
                 .map(|instrument| (instrument.code, instrument.symbol()))
                 .collect(),
             unknown: HashSet::new(),
-            dedup: Dedup::for_connections(connections, Exchange::OkxSbe),
             quality,
-            tasks: JoinSet::new(),
         }
     }
+}
 
-    async fn handle(&mut self, recv_time: Timestamp, data: Bytes) -> Result<(), ConnectorError> {
-        if self.dedup.is_duplicate(&data) {
+impl Consumer for Ingest {
+    async fn handle(&mut self, frame: Frame) -> Result<(), ConnectorError> {
+        let Frame { recv_time, data } = frame;
+        if self.recorder.dedup.is_duplicate(&data) {
             return Ok(());
         }
         let Ok((header, _)) = MessageHeader::read_from_prefix(&data) else {
@@ -126,9 +107,11 @@ impl Ingest {
                 Symbol::from("unknown")
             }
         };
-        self.write(recv_time, symbol, data).await
+        self.recorder.write(recv_time, symbol, data).await
     }
+}
 
+impl Ingest {
     /// Only subscribed codes should ever arrive, so an unknown one is worth a
     /// quality event, once.
     fn report_unknown(&mut self, code: i64, template_id: u16) {
@@ -147,77 +130,39 @@ impl Ingest {
             ),
         });
     }
-
-    async fn write(
-        &self,
-        recv_time: Timestamp,
-        symbol: Symbol,
-        data: Bytes,
-    ) -> Result<(), ConnectorError> {
-        self.writer_tx
-            .send(WriteRecord {
-                recv_time,
-                symbol,
-                tag: Tag::Sbe,
-                data,
-            })
-            .await
-            .map_err(|_| ConnectorError::WriterClosed)
-    }
 }
 
-pub async fn run_collection(
-    subscription: Subscription,
-    writer_tx: Sender<WriteRecord>,
-    shutdown: watch::Receiver<bool>,
-    quality: QualityReporter,
-    readiness: Readiness,
-) -> anyhow::Result<()> {
+/// Records `subscription` until shutdown or a critical failure.
+pub async fn collect(subscription: Subscription, cx: Context) -> anyhow::Result<()> {
     let Subscription {
         instruments,
         credentials,
-        connections,
     } = subscription;
-    let okx = Arc::new(Okx::new(
-        credentials,
-        &instruments,
-        &CHANNELS,
-        quality.clone(),
-    ));
+    let okx = Okx::new(credentials, &instruments, &CHANNELS, cx.quality.clone());
     let snapshots = Snapshots::new()?;
-    let mut ingest = Ingest::new(
-        writer_tx.clone(),
-        &instruments,
-        connections,
-        quality.clone(),
-    );
-    let ws_rx = session::spawn_slots(&mut ingest.tasks, okx, connections, &quality, &readiness);
-    let mut feed = Feed::new(ws_rx, shutdown);
     let books = instruments
         .iter()
         .map(|instrument| (instrument.code, instrument.symbol()))
         .collect();
-    ingest.tasks.spawn(async move {
+    let mut tasks = JoinSet::new();
+    let writer_tx = cx.writer_tx.clone();
+    tasks.spawn(async move {
         snapshots.run_periodic(books, writer_tx).await;
         Err(anyhow::anyhow!("periodic book-snapshot task exited"))
     });
-
-    while let Some(Frame {
-        recv_time, data, ..
-    }) = feed.recv(&mut ingest.tasks).await?
-    {
-        match ingest.handle(recv_time, data).await {
-            Ok(()) => {}
-            Err(ConnectorError::WriterClosed) => return Err(ConnectorError::WriterClosed.into()),
-            Err(error) => error!(%error, "couldn't handle the received data"),
-        }
-    }
-    Ok(())
+    let recorder = Recorder {
+        dedup: Dedup::for_connections(cx.connections, Exchange::OkxSbe),
+        writer_tx: cx.writer_tx.clone(),
+    };
+    let ingest = Ingest::new(recorder, &instruments, cx.quality.clone());
+    collection::run_slots(okx, ingest, cx, tasks).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file::WriteRecord;
+    use bytes::Bytes;
     use tokio::sync::mpsc::{Receiver, channel};
 
     /// A `bbo-tbt` frame for `code`, sent at `out_time`.
@@ -240,10 +185,11 @@ mod tests {
             inst_id: "BTC-USDT".to_owned(),
             code: 3,
         }];
-        (
-            Ingest::new(writer_tx, &instruments, connections, quality),
-            writer_rx,
-        )
+        let recorder = Recorder {
+            dedup: Dedup::for_connections(connections, Exchange::OkxSbe),
+            writer_tx,
+        };
+        (Ingest::new(recorder, &instruments, quality), writer_rx)
     }
 
     fn written(writer_rx: &mut Receiver<WriteRecord>) -> Vec<WriteRecord> {
@@ -257,7 +203,7 @@ mod tests {
 
         for (seq_id, out_time) in [(1, 100), (1, 117), (2, 130), (2, 129)] {
             ingest
-                .handle(Timestamp::now(), bbo(3, seq_id, out_time))
+                .handle(Frame::now(bbo(3, seq_id, out_time)))
                 .await
                 .unwrap();
         }
@@ -273,7 +219,7 @@ mod tests {
 
         for out_time in [100, 117] {
             ingest
-                .handle(Timestamp::now(), bbo(3, 1, out_time))
+                .handle(Frame::now(bbo(3, 1, out_time)))
                 .await
                 .unwrap();
         }
@@ -288,7 +234,7 @@ mod tests {
 
         for seq_id in [1, 2] {
             ingest
-                .handle(Timestamp::now(), bbo(42, seq_id, 100))
+                .handle(Frame::now(bbo(42, seq_id, 100)))
                 .await
                 .unwrap();
         }
@@ -306,12 +252,12 @@ mod tests {
     async fn malformed_frames_say_what_is_missing() {
         let (mut ingest, _writer_rx) = ingest(1, QualityReporter::disabled());
 
-        let runt = ingest.handle(Timestamp::now(), Bytes::from_static(b"\x01\x02"));
+        let runt = ingest.handle(Frame::now(Bytes::from_static(b"\x01\x02")));
         assert_eq!(
             runt.await.unwrap_err().to_string(),
             "2-byte frame is shorter than the SBE message header"
         );
-        let header_only = ingest.handle(Timestamp::now(), bbo(3, 1, 1).slice(..12));
+        let header_only = ingest.handle(Frame::now(bbo(3, 1, 1).slice(..12)));
         assert_eq!(
             header_only.await.unwrap_err().to_string(),
             "12-byte OKX stream frame is shorter than its fixed block"

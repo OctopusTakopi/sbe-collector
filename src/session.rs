@@ -94,6 +94,17 @@ pub(crate) struct Frame {
     pub(crate) data: Bytes,
 }
 
+#[cfg(test)]
+impl Frame {
+    /// `data` as read now.
+    pub(crate) fn now(data: impl Into<Bytes>) -> Self {
+        Self {
+            recv_time: Timestamp::now(),
+            data: data.into(),
+        }
+    }
+}
+
 /// Where one connection attempt goes and what its upgrade request carries.
 pub(crate) struct Handshake<'a> {
     pub(crate) url: &'a str,
