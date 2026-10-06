@@ -1,8 +1,6 @@
 //! Binance spot's REST depth snapshot, 5000 levels a side, recorded as the
 //! venue sent it.
 
-use std::future::Future;
-
 use bytes::Bytes;
 use jiff::Timestamp;
 
@@ -10,8 +8,8 @@ use super::ws::Endpoint;
 use crate::{
     file::Symbol,
     session::Protocol,
-    snapshot::Depth,
-    throttler::{self, Throttler},
+    snapshot::{Depth, FetchError},
+    throttler,
 };
 
 /// Depth levels requested per snapshot.
@@ -56,51 +54,49 @@ impl Depth for Book {
         SNAPSHOT_WEIGHT
     }
 
-    fn fetch(
-        &self,
-        client: reqwest::Client,
-        throttler: Throttler,
-        symbol: Symbol,
-    ) -> impl Future<Output = anyhow::Result<Bytes>> + Send + use<> {
-        async move {
-            let url = format!(
-                "https://api.binance.com/api/v3/depth?symbol={}&limit={SNAPSHOT_LIMIT}",
-                symbol.to_uppercase()
+    async fn fetch(&self, client: &reqwest::Client, symbol: &Symbol) -> Result<Bytes, FetchError> {
+        let url = format!(
+            "https://api.binance.com/api/v3/depth?symbol={}&limit={SNAPSHOT_LIMIT}",
+            symbol.to_uppercase()
+        );
+        let response = client
+            .get(&url)
+            .header("Accept", "application/json")
+            .send()
+            .await?;
+        let status = response.status();
+        // Headers must be read before the body consumes the response.
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let body = response.bytes().await?;
+        if !status.is_success() {
+            let error = anyhow::anyhow!(
+                "Binance depth snapshot returned {status}: {}",
+                preview(&body)
             );
-            let response = client
-                .get(&url)
-                .header("Accept", "application/json")
-                .send()
-                .await?;
-            let status = response.status();
-            // Headers must be read before the body consumes the response.
-            let retry_after = response
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned);
-            let body = response.bytes().await?;
-            if !status.is_success() {
-                // 418 is Binance's ban; 429 is the warning shot before one.
-                if matches!(status.as_u16(), 418 | 429) {
-                    throttler.note_ban(throttler::ban_expiry(
-                        retry_after.as_deref(),
-                        &body,
-                        Timestamp::now(),
-                    ));
+            // 418 is Binance's ban; 429 is the warning shot before one.
+            return Err(if matches!(status.as_u16(), 418 | 429) {
+                FetchError::Banned {
+                    until: throttler::ban_expiry(retry_after.as_deref(), &body, Timestamp::now()),
+                    error,
                 }
-                anyhow::bail!(
-                    "Binance depth snapshot returned {status}: {}",
-                    preview(&body)
-                );
-            }
-            // Recorded as a book, an error or a proxy's page under 200 would
-            // read as one to every tool downstream.
-            if !is_book(&body) {
-                anyhow::bail!("Binance depth snapshot is not a book: {}", preview(&body));
-            }
-            Ok(body)
+            } else {
+                FetchError::Failed(error)
+            });
         }
+        // Recorded as a book, an error or a proxy's page under 200 would
+        // read as one to every tool downstream.
+        if !is_book(&body) {
+            return Err(anyhow::anyhow!(
+                "Binance depth snapshot is not a book: {}",
+                preview(&body)
+            )
+            .into());
+        }
+        Ok(body)
     }
 }
 

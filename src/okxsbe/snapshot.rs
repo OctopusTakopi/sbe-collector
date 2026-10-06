@@ -1,7 +1,7 @@
 //! OKX's REST book snapshot, 400 levels a side where `bbo-tbt` shows one,
 //! recorded as the venue sent it.
 
-use std::{collections::HashMap, future::Future};
+use std::collections::HashMap;
 
 use anyhow::bail;
 use bytes::Bytes;
@@ -13,7 +13,11 @@ use sbe_collector::sbe::{
 use zerocopy::FromBytes;
 
 use super::{instruments::Instrument, protocol::Okx};
-use crate::{file::Symbol, session::Protocol, snapshot::Depth, throttler::Throttler};
+use crate::{
+    file::Symbol,
+    session::Protocol,
+    snapshot::{Depth, FetchError},
+};
 
 const BOOKS_URL: &str = "https://www.okx.com/api/v5/market/books-sbe";
 
@@ -78,30 +82,22 @@ impl Depth for Books {
         1
     }
 
-    fn fetch(
-        &self,
-        client: reqwest::Client,
-        _throttler: Throttler,
-        symbol: Symbol,
-    ) -> impl Future<Output = anyhow::Result<Bytes>> + Send + use<> {
-        let code = self.codes.get(&symbol).copied();
-        async move {
-            let Some(code) = code else {
-                bail!("{symbol} is not a subscribed instrument");
-            };
-            let response = client
-                .get(format!("{BOOKS_URL}?instIdCode={code}&source=0"))
-                .send()
-                .await?;
-            let status = response.status();
-            let is_sbe = response
-                .headers()
-                .get(CONTENT_TYPE)
-                .is_some_and(|value| value.as_bytes().starts_with(b"application/sbe"));
-            let body = response.bytes().await?;
-            check(code, status, is_sbe, &body)?;
-            Ok(body)
-        }
+    async fn fetch(&self, client: &reqwest::Client, symbol: &Symbol) -> Result<Bytes, FetchError> {
+        let Some(&code) = self.codes.get(symbol) else {
+            return Err(anyhow::anyhow!("{symbol} is not a subscribed instrument").into());
+        };
+        let response = client
+            .get(format!("{BOOKS_URL}?instIdCode={code}&source=0"))
+            .send()
+            .await?;
+        let status = response.status();
+        let is_sbe = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .is_some_and(|value| value.as_bytes().starts_with(b"application/sbe"));
+        let body = response.bytes().await?;
+        check(code, status, is_sbe, &body)?;
+        Ok(body)
     }
 }
 

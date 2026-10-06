@@ -2,10 +2,7 @@ mod instruments;
 mod protocol;
 mod snapshot;
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::collections::{HashMap, HashSet};
 
 use tokio::task::JoinSet;
 use tracing::warn;
@@ -143,16 +140,18 @@ pub async fn collect(subscription: Subscription, cx: Context) -> anyhow::Result<
         credentials,
     } = subscription;
     let okx = Okx::new(credentials, &instruments, &CHANNELS, cx.quality.clone());
-    let snapshots = Snapshots::new(
-        Arc::new(Books::new(&instruments)),
+    let symbols = instruments.iter().map(Instrument::symbol).collect();
+    // `bbo-tbt` has no chain to break, so nothing asks for repairs.
+    let (snapshots, _) = Snapshots::new(
+        Books::new(&instruments),
         BOOKS_PER_MINUTE,
+        symbols,
         cx.writer_tx.clone(),
     )?;
-    let symbols = instruments.iter().map(Instrument::symbol).collect();
     let mut tasks = JoinSet::new();
     tasks.spawn(async move {
-        snapshots.periodically(symbols).await;
-        Err(anyhow::anyhow!("periodic book-snapshot task exited"))
+        snapshots.run().await;
+        Err(anyhow::anyhow!("book-snapshot task exited"))
     });
     let recorder = Recorder {
         dedup: Dedup::for_connections(cx.connections, Exchange::OkxSbe),
