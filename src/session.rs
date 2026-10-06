@@ -11,7 +11,7 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -617,21 +617,41 @@ fn jittered(failures: u32) -> Duration {
 }
 
 /// Spaces the connection attempts of every slot in the process by
-/// [`CONNECT_SPACING`].
-#[derive(Default)]
+/// [`CONNECT_SPACING`]: each attempt reserves the next free turn.
 struct Pacer {
-    next: tokio::sync::Mutex<Option<tokio::time::Instant>>,
+    start: tokio::time::Instant,
+    /// The next free turn, in nanoseconds after `start`.
+    next: AtomicU64,
 }
 
 impl Pacer {
-    /// Waits for this attempt's turn. Holding the lock through the sleep is
-    /// what queues the slots behind one another.
-    async fn wait(&self) {
-        let mut next = self.next.lock().await;
-        if let Some(at) = *next {
-            tokio::time::sleep_until(at).await;
+    fn new() -> Self {
+        Self {
+            start: tokio::time::Instant::now(),
+            next: AtomicU64::new(0),
         }
-        *next = Some(tokio::time::Instant::now() + CONNECT_SPACING);
+    }
+
+    /// Waits for this attempt's turn: now, or the next free one if that is
+    /// later, which then moves on by [`CONNECT_SPACING`].
+    async fn wait(&self) {
+        let nanos = |duration: Duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
+        let now = nanos(self.start.elapsed());
+        let spacing = nanos(CONNECT_SPACING);
+        let mut next = self.next.load(Ordering::Relaxed);
+        let turn = loop {
+            let turn = next.max(now);
+            match self.next.compare_exchange_weak(
+                next,
+                turn.saturating_add(spacing),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break turn,
+                Err(taken) => next = taken,
+            }
+        };
+        tokio::time::sleep_until(self.start + Duration::from_nanos(turn)).await;
     }
 }
 
@@ -858,7 +878,7 @@ pub(crate) fn spawn_slots<P: Protocol>(
     let (ws_tx, ws_rx) = mpsc::channel(WS_QUEUE_CAPACITY.saturating_mul(connections));
     let shared = Arc::new(Shared {
         tls: ws::tls_config(),
-        pacer: Pacer::default(),
+        pacer: Pacer::new(),
         delivered: Arc::new(AtomicBool::new(false)),
     });
     for connection in 0..connections {
@@ -1527,7 +1547,7 @@ mod tests {
     /// and their reconnects must not burst past a per-IP attempt limit.
     #[tokio::test(start_paused = true)]
     async fn connection_attempts_are_spaced_across_slots() {
-        let pacer = Arc::new(Pacer::default());
+        let pacer = Arc::new(Pacer::new());
         let start = tokio::time::Instant::now();
 
         let attempts = three_attempts(Arc::clone(&pacer)).await;
