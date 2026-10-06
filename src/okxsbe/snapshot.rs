@@ -1,37 +1,26 @@
-//! Hourly REST book snapshots, recorded beside the stream: 400 levels a side
-//! where `bbo-tbt` shows one.
+//! OKX's REST book snapshot, 400 levels a side where `bbo-tbt` shows one,
+//! recorded as the venue sent it.
 
-use std::time::Duration;
+use std::{collections::HashMap, future::Future};
 
 use anyhow::bail;
 use bytes::Bytes;
-use jiff::Timestamp;
 use reqwest::{StatusCode, header::CONTENT_TYPE};
-use sbe_collector::{
-    record::Tag,
-    sbe::{
-        MessageHeader,
-        okx::{SnapshotDepthBlock, TEMPLATE_SNAPSHOT_DEPTH},
-    },
+use sbe_collector::sbe::{
+    MessageHeader,
+    okx::{SnapshotDepthBlock, TEMPLATE_SNAPSHOT_DEPTH},
 };
-use tokio::sync::mpsc::Sender;
-use tracing::error;
 use zerocopy::FromBytes;
 
-use crate::file::{Symbol, WriteRecord};
+use super::{instruments::Instrument, protocol::Okx};
+use crate::{file::Symbol, session::Protocol, snapshot::Depth, throttler::Throttler};
 
 const BOOKS_URL: &str = "https://www.okx.com/api/v5/market/books-sbe";
 
-/// How often every instrument's book is recorded.
-const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(60 * 60);
-
-/// Held back before the first request, so a crash-looping collector sends
-/// none.
-const SNAPSHOT_START_DELAY: Duration = Duration::from_secs(5);
-
-/// Spacing between requests. The limit is 10 per 10 s per instrument, and a
-/// round asks each instrument once.
-const SNAPSHOT_PACE: Duration = Duration::from_secs(2);
+/// Book snapshots a minute. A round asks each instrument once, paced, which
+/// keeps within OKX's 10 requests per 10 s per instrument; this only bounds
+/// what the pace allows.
+pub(crate) const BOOKS_PER_MINUTE: u32 = 60;
 
 /// Whether a reply is a whole snapshot of instrument `code`. OKX answers an
 /// unknown code, or a rate limit, with JSON, sometimes under HTTP 200; that
@@ -62,70 +51,56 @@ fn check(code: i64, status: StatusCode, is_sbe: bool, body: &[u8]) -> anyhow::Re
     Ok(())
 }
 
-pub(crate) struct Snapshots {
-    client: reqwest::Client,
+/// The REST books of the subscribed instruments, asked for by the
+/// `instIdCode` the lookup resolved each one to.
+pub(crate) struct Books {
+    codes: HashMap<Symbol, i64>,
 }
 
-impl Snapshots {
-    pub(crate) fn new() -> reqwest::Result<Self> {
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            .build()?;
-        Ok(Self { client })
+impl Books {
+    pub(crate) fn new(instruments: &[Instrument]) -> Self {
+        Self {
+            codes: instruments
+                .iter()
+                .map(|instrument| (instrument.symbol(), instrument.code))
+                .collect(),
+        }
+    }
+}
+
+impl Depth for Books {
+    fn label(&self) -> &'static str {
+        Okx::SOURCE
     }
 
-    async fn fetch(&self, code: i64) -> anyhow::Result<Bytes> {
-        let response = self
-            .client
-            .get(format!("{BOOKS_URL}?instIdCode={code}&source=0"))
-            .send()
-            .await?;
-        let status = response.status();
-        let is_sbe = response
-            .headers()
-            .get(CONTENT_TYPE)
-            .is_some_and(|value| value.as_bytes().starts_with(b"application/sbe"));
-        let body = response.bytes().await?;
-        check(code, status, is_sbe, &body)?;
-        Ok(body)
+    /// OKX limits requests, not weight.
+    fn weight(&self) -> u32 {
+        1
     }
 
-    /// Snapshot every instrument after [`SNAPSHOT_START_DELAY`] and then every
-    /// [`SNAPSHOT_INTERVAL`], one request per [`SNAPSHOT_PACE`]. Returns once
-    /// the writer is gone.
-    pub(crate) async fn run_periodic(
-        self,
-        books: Vec<(i64, Symbol)>,
-        writer_tx: Sender<WriteRecord>,
-    ) {
-        tokio::time::sleep(SNAPSHOT_START_DELAY).await;
-        // The first tick is immediate.
-        let mut ticker = tokio::time::interval(SNAPSHOT_INTERVAL);
-        let mut pacer = tokio::time::interval(SNAPSHOT_PACE);
-        // An overrun must not fire the backlog at once.
-        pacer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            ticker.tick().await;
-            for (code, symbol) in &books {
-                pacer.tick().await;
-                let data = match self.fetch(*code).await {
-                    Ok(data) => data,
-                    Err(error) => {
-                        error!(%symbol, %error, "failed to fetch an OKX book snapshot");
-                        continue;
-                    }
-                };
-                let record = WriteRecord {
-                    recv_time: Timestamp::now(),
-                    symbol: Symbol::clone(symbol),
-                    tag: Tag::Rest,
-                    data,
-                };
-                if writer_tx.send(record).await.is_err() {
-                    return;
-                }
-            }
+    fn fetch(
+        &self,
+        client: reqwest::Client,
+        _throttler: Throttler,
+        symbol: Symbol,
+    ) -> impl Future<Output = anyhow::Result<Bytes>> + Send + use<> {
+        let code = self.codes.get(&symbol).copied();
+        async move {
+            let Some(code) = code else {
+                bail!("{symbol} is not a subscribed instrument");
+            };
+            let response = client
+                .get(format!("{BOOKS_URL}?instIdCode={code}&source=0"))
+                .send()
+                .await?;
+            let status = response.status();
+            let is_sbe = response
+                .headers()
+                .get(CONTENT_TYPE)
+                .is_some_and(|value| value.as_bytes().starts_with(b"application/sbe"));
+            let body = response.bytes().await?;
+            check(code, status, is_sbe, &body)?;
+            Ok(body)
         }
     }
 }

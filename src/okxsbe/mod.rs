@@ -2,7 +2,10 @@ mod instruments;
 mod protocol;
 mod snapshot;
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use tokio::task::JoinSet;
 use tracing::warn;
@@ -20,10 +23,11 @@ use crate::{
     file::Symbol,
     quality::{QualityEvent, QualityReporter},
     session::{Frame, Protocol},
+    snapshot::Snapshots,
 };
 use instruments::Instrument;
 use protocol::{Credentials, Okx};
-use snapshot::Snapshots;
+use snapshot::{BOOKS_PER_MINUTE, Books};
 
 /// Channels subscribed per instrument.
 ///
@@ -139,15 +143,15 @@ pub async fn collect(subscription: Subscription, cx: Context) -> anyhow::Result<
         credentials,
     } = subscription;
     let okx = Okx::new(credentials, &instruments, &CHANNELS, cx.quality.clone());
-    let snapshots = Snapshots::new()?;
-    let books = instruments
-        .iter()
-        .map(|instrument| (instrument.code, instrument.symbol()))
-        .collect();
+    let snapshots = Snapshots::new(
+        Arc::new(Books::new(&instruments)),
+        BOOKS_PER_MINUTE,
+        cx.writer_tx.clone(),
+    )?;
+    let symbols = instruments.iter().map(Instrument::symbol).collect();
     let mut tasks = JoinSet::new();
-    let writer_tx = cx.writer_tx.clone();
     tasks.spawn(async move {
-        snapshots.run_periodic(books, writer_tx).await;
+        snapshots.periodically(symbols).await;
         Err(anyhow::anyhow!("periodic book-snapshot task exited"))
     });
     let recorder = Recorder {

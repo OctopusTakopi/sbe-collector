@@ -10,6 +10,7 @@ mod okxsbe;
 mod quality;
 mod readiness;
 mod session;
+mod snapshot;
 mod subscriptions;
 mod throttler;
 mod ws;

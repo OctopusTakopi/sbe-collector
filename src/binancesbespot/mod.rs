@@ -1,7 +1,7 @@
 pub(crate) mod snapshot;
 mod ws;
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use tokio::task::JoinSet;
 use tracing::warn;
@@ -22,9 +22,9 @@ use crate::{
     file::Symbol,
     quality::{QualityEvent, QualityReporter},
     session::{Frame, Protocol},
-    throttler::{SNAPSHOT_WEIGHT_BUDGET, Throttler},
+    snapshot::Snapshots,
 };
-use snapshot::Snapshots;
+use snapshot::{Book, SNAPSHOT_WEIGHT_BUDGET};
 use ws::Endpoint;
 
 /// Streams subscribed per symbol; `$symbol` becomes the lowercase symbol.
@@ -96,7 +96,7 @@ struct Ingest {
     symbols: SymbolMatcher,
     /// Highest `lastBookUpdateId` seen per symbol.
     last_update_ids: HashMap<Symbol, i64>,
-    snapshots: Snapshots,
+    snapshots: Snapshots<Book>,
     /// Snapshots fetched to repair a depth gap.
     recoveries: JoinSet<()>,
     quality: QualityReporter,
@@ -106,7 +106,7 @@ impl Ingest {
     fn new(
         recorder: Recorder,
         symbols: Vec<Symbol>,
-        snapshots: Snapshots,
+        snapshots: Snapshots<Book>,
         quality: QualityReporter,
     ) -> Self {
         Self {
@@ -211,14 +211,7 @@ impl Ingest {
                 "depth gap: expected first_u={expected} but got {first_id} (prev_u={prev})"
             ),
         });
-        while self.recoveries.try_join_next().is_some() {}
-        let snapshots = self.snapshots.clone();
-        let writer_tx = self.recorder.writer_tx.clone();
-        let symbol = Symbol::clone(symbol);
-        self.recoveries.spawn(async move {
-            // A closed writer is the collection's own failure to report.
-            let _ = snapshots.record(&symbol, &writer_tx).await;
-        });
+        self.snapshots.repair(&mut self.recoveries, symbol);
     }
 }
 
@@ -249,14 +242,13 @@ pub async fn collect(subscription: Subscription, cx: Context) -> anyhow::Result<
         .iter()
         .map(|symbol| Symbol::from(symbol.to_ascii_lowercase()))
         .collect();
-    let snapshots = Snapshots::new(Throttler::new(SNAPSHOT_WEIGHT_BUDGET))?;
+    let snapshots = Snapshots::new(Arc::new(Book), SNAPSHOT_WEIGHT_BUDGET, cx.writer_tx.clone())?;
     let mut tasks = JoinSet::new();
     {
         let snapshots = snapshots.clone();
         let symbols = symbols.clone();
-        let writer_tx = cx.writer_tx.clone();
         tasks.spawn(async move {
-            snapshots.run_periodic(symbols, writer_tx).await;
+            snapshots.periodically(symbols).await;
             Err(anyhow::anyhow!("periodic depth-snapshot task exited"))
         });
     }
@@ -274,7 +266,6 @@ mod tests {
     use crate::file::WriteRecord;
     use bytes::Bytes;
     use sbe_collector::sbe::binance::EVENT_TIME;
-    use std::sync::Arc;
     use tokio::sync::mpsc::{Receiver, channel};
 
     #[test]
@@ -327,6 +318,7 @@ mod tests {
     /// snapshot can never reach Binance from a unit test.
     fn ingest(connections: usize) -> (Ingest, Receiver<WriteRecord>) {
         let (writer_tx, writer_rx) = channel(16);
+        let snapshots = Snapshots::new(Arc::new(Book), 0, writer_tx.clone()).unwrap();
         let recorder = Recorder {
             dedup: Dedup::for_connections(connections, Exchange::BinanceSbeSpot),
             writer_tx,
@@ -334,7 +326,7 @@ mod tests {
         let ingest = Ingest::new(
             recorder,
             vec![Symbol::from("btcusdt")],
-            Snapshots::new(Throttler::new(0)).unwrap(),
+            snapshots,
             QualityReporter::disabled(),
         );
         (ingest, writer_rx)
