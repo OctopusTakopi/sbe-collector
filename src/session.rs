@@ -83,6 +83,11 @@ const DRAIN_GRACE: Duration = Duration::from_secs(2);
 /// dropped.
 const RETIRE_GRACE: Duration = Duration::from_secs(2);
 
+/// How long a retired session waits for the frame it is reading to arrive
+/// whole, so the backlog behind it can be drained. One cut off mid-frame is
+/// closed without another read: the rest of its bytes would parse as frames.
+const RETIRE_QUIET: Duration = Duration::from_millis(250);
+
 /// Where one connection attempt goes and what its upgrade request carries.
 pub(crate) struct Handshake<'a> {
     pub(crate) url: &'a str,
@@ -276,7 +281,8 @@ async fn deliver_frame(
     crate::ws::deliver(ws_tx, overflow, (recv_time, payload), |_| true).await
 }
 
-/// Deliver what already arrived on a socket about to be closed.
+/// Deliver what already arrived on a socket about to be closed. Call only on
+/// a frame boundary: after a whole frame, never after a cancelled `read`.
 ///
 /// The replacement only sees events from its own subscription on, so this
 /// backlog exists nowhere else. The zero timeout takes what is buffered and
@@ -300,8 +306,10 @@ where
         let Ok(Ok(message)) = timeout(Duration::ZERO, conn.read()).await else {
             break;
         };
-        if message.opcode != OpCode::Binary {
-            continue;
+        match message.opcode {
+            OpCode::Binary => {}
+            OpCode::Close => break,
+            _ => continue,
         }
         match deliver_frame(ws_tx, overflow, message.payload).await {
             Delivery::Sent => drained.delivered += 1,
@@ -393,49 +401,46 @@ where
     tokio::pin!(keepalive);
     let unanswered = tokio::time::sleep_until(opened + SUBSCRIBE_TIMEOUT);
     tokio::pin!(unanswered);
+    let quiet = tokio::time::sleep(RETIRE_QUIET);
+    tokio::pin!(quiet);
+    let mut retiring = false;
 
-    loop {
-        // Every arm that completes ends the session, which is what makes
-        // racing the non-cancel-safe `read` sound.
-        let message = select! {
-            biased;
-            _ = &mut retire => {
-                let drained = drain_buffered(
-                    &mut conn,
-                    &slot.ws_tx,
-                    &mut overflow,
-                    Instant::now() + DRAIN_GRACE,
-                )
-                .await;
-                // Hand the slot back rather than dropping the socket: a
-                // handover holds two of this IP's limited connections.
-                let _ = timeout(RETIRE_GRACE, async {
-                    if sender.close(CLOSE_GOING_AWAY, "replaced").await.is_ok() {
-                        conn.flush_close().await;
+    // Once retired: whether the socket stopped on a frame boundary, so the
+    // backlog it holds can still be read.
+    let drain = loop {
+        // `read` is not cancel-safe, so it lives across wake-ups. Only an arm
+        // that ends the session may drop it mid-frame, and nothing reads the
+        // socket after that.
+        let message = {
+            let read = timeout(IDLE_TIMEOUT, conn.read());
+            tokio::pin!(read);
+            loop {
+                select! {
+                    biased;
+                    _ = &mut retire, if !retiring => {
+                        retiring = true;
+                        quiet
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + RETIRE_QUIET);
                     }
-                })
-                .await;
-                info!(
-                    connection,
-                    session = id,
-                    lifetime = ?opened.elapsed(),
-                    recovered = drained.delivered,
-                    shed = drained.shed,
-                    "the replacement is carrying the feed; retiring this session"
-                );
-                return SessionEnd::Retired;
+                    loss = &mut keepalive => return SessionEnd::Lost(loss),
+                    result = &mut read => break Some(result),
+                    // A quiet socket has no backlog to drain.
+                    () = &mut quiet, if retiring => break None,
+                    // After `read`, so a reply already waiting is still
+                    // taken; this arm is for a socket that sends nothing at
+                    // all.
+                    () = &mut unanswered, if !session.settled() => {
+                        return SessionEnd::Lost(Loss::Unanswered);
+                    }
+                }
             }
-            loss = &mut keepalive => return SessionEnd::Lost(loss),
-            result = timeout(IDLE_TIMEOUT, conn.read()) => match result {
-                Ok(Ok(message)) => message,
-                Ok(Err(error)) => return SessionEnd::Lost(Loss::Io(error)),
-                Err(_) => return SessionEnd::Lost(Loss::Idle),
-            },
-            // After `read`, so a reply already waiting is still taken; this
-            // arm is for a socket that sends nothing at all.
-            () = &mut unanswered, if !session.settled() => {
-                return SessionEnd::Lost(Loss::Unanswered);
-            }
+        };
+        let message = match message {
+            Some(Ok(Ok(message))) => message,
+            Some(Ok(Err(error))) => return SessionEnd::Lost(Loss::Io(error)),
+            Some(Err(_)) => return SessionEnd::Lost(Loss::Idle),
+            None => break false,
         };
 
         // Checked between reads, not raced in the `select!`, which would
@@ -504,7 +509,39 @@ where
         if !session.settled() && opened.elapsed() >= SUBSCRIBE_TIMEOUT {
             return SessionEnd::Lost(Loss::Unanswered);
         }
-    }
+        if retiring {
+            break true;
+        }
+    };
+
+    let drained = if drain {
+        drain_buffered(
+            &mut conn,
+            &slot.ws_tx,
+            &mut overflow,
+            Instant::now() + DRAIN_GRACE,
+        )
+        .await
+    } else {
+        Drained::default()
+    };
+    // Hand the slot back rather than dropping the socket: a handover holds
+    // two of this IP's limited connections.
+    let _ = timeout(RETIRE_GRACE, async {
+        if sender.close(CLOSE_GOING_AWAY, "replaced").await.is_ok() {
+            conn.flush_close().await;
+        }
+    })
+    .await;
+    info!(
+        connection,
+        session = id,
+        lifetime = ?opened.elapsed(),
+        recovered = drained.delivered,
+        shed = drained.shed,
+        "the replacement is carrying the feed; retiring this session"
+    );
+    SessionEnd::Retired
 }
 
 /// Truncated exponential backoff with ±25 % jitter, so instances that lost
@@ -1082,6 +1119,55 @@ mod tests {
         assert_eq!(drained.delivered, 3, "the backlog must not be discarded");
         assert_eq!(drained.shed, 0);
         assert_eq!(data.len(), 3);
+    }
+
+    /// A retire that lands while a frame is half-read must not cut the read:
+    /// the rest of the frame would then be parsed as frames. The frame
+    /// completes, and the backlog behind it is drained intact.
+    #[tokio::test(start_paused = true)]
+    async fn retiring_mid_frame_finishes_the_frame_then_drains() {
+        use tokio::io::AsyncWriteExt;
+
+        let (client, mut venue) = tokio::io::duplex(64 * 1024);
+        let mut client = WebSocket::after_handshake(client, fastwebsockets::Role::Client);
+        client.set_auto_pong(false);
+        let (event_tx, _events) = mpsc::channel(2);
+        let (ws_tx, mut data) = mpsc::channel(16);
+        let (retire, retire_rx) = oneshot::channel();
+        let slot = Slot {
+            connection: 0,
+            source: "test".to_owned(),
+            ws_tx,
+            events: event_tx,
+            max_age: None,
+            keepalive: None,
+            quality: QualityReporter::disabled(),
+            readiness: Readiness::new(1).0,
+        };
+        let session = tokio::spawn(run_session(
+            slot,
+            Connection::from_websocket(client),
+            TEST_SESSION,
+            retire_rx,
+            Script::default(),
+            Vec::new(),
+        ));
+        // Unmasked binary frames, as a venue sends them.
+        let (first, second) = ([1u8; 100], [2u8; 100]);
+        venue.write_all(&[0x82, 100]).await.unwrap();
+        venue.write_all(&first[..50]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        retire.send(()).unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        venue.write_all(&first[50..]).await.unwrap();
+        venue.write_all(&[0x82, 100]).await.unwrap();
+        venue.write_all(&second).await.unwrap();
+
+        assert!(matches!(session.await.unwrap(), SessionEnd::Retired));
+        let delivered: Vec<Bytes> =
+            std::iter::from_fn(|| data.try_recv().ok().map(|(_, payload)| payload)).collect();
+        assert_eq!(delivered, [&first[..], &second[..]]);
     }
 
     /// No latency and no overlap beyond what was already in flight.
