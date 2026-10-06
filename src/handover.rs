@@ -1,4 +1,5 @@
 use std::{
+    fs::{File, TryLockError},
     io,
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
@@ -564,7 +565,36 @@ async fn reject(stream: &mut UnixStream, reason: String) {
     }
 }
 
+/// Holds `<socket>.lock` while this process chooses its role. Two processes
+/// starting together would otherwise both find the socket stale, and the
+/// second would unlink the listener the first had just bound: an orphan no
+/// later challenger can reach, beside a second incumbent. Older binaries do
+/// not take it.
+async fn selecting(path: &Path) -> anyhow::Result<File> {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".lock");
+    let lock = File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&name)
+        .with_context(|| format!("cannot open {}", Path::new(&name).display()))?;
+    timeout(HANDSHAKE_TIMEOUT, async {
+        loop {
+            match lock.try_lock() {
+                Ok(()) => return Ok(()),
+                Err(TryLockError::WouldBlock) => tokio::time::sleep(BIND_RETRY).await,
+                Err(TryLockError::Error(error)) => return Err(error),
+            }
+        }
+    })
+    .await
+    .map_err(|_| anyhow!("timed out waiting to choose a role at {}", path.display()))??;
+    Ok(lock)
+}
+
 async fn select_role(path: &Path) -> anyhow::Result<Role> {
+    let _selecting = selecting(path).await?;
     for attempt in 0..3 {
         match UnixStream::connect(path).await {
             Ok(stream) => return Ok(Role::Challenger(stream)),
@@ -834,6 +864,21 @@ mod tests {
 
     /// Blocking, for peers on their own threads.
     impl Fixture {
+        /// The role-selection lock, as another process starting would take
+        /// it.
+        fn selection_lock(&self) -> std::fs::File {
+            let mut name = self.path.as_os_str().to_owned();
+            name.push(".lock");
+            let lock = std::fs::File::options()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(name)
+                .unwrap();
+            lock.lock().unwrap();
+            lock
+        }
+
         fn wait_for_socket(&self) {
             let deadline = std::time::Instant::now() + Duration::from_secs(2);
             while !self.path.exists() {
@@ -1071,12 +1116,124 @@ mod tests {
         let fixture = Fixture::new("rebound");
         let old = Process::spawn(&fixture, "old");
         fixture.wait_for_socket();
-        // Another process cleared the path as stale and bound its own socket.
+        // Another process clears the path as stale and binds its own socket,
+        // once the incumbent has chosen its role.
+        let lock = fixture.selection_lock();
         std::fs::remove_file(&fixture.path).unwrap();
         let _other = std::os::unix::net::UnixListener::bind(&fixture.path).unwrap();
+        drop(lock);
         let other = std::fs::metadata(&fixture.path).unwrap().ino();
         old.shut_down().unwrap();
         assert_eq!(std::fs::metadata(&fixture.path).unwrap().ino(), other);
+    }
+
+    /// Older binaries on the other end of the socket parse exactly these
+    /// bytes, field order included.
+    #[test]
+    fn every_message_keeps_its_bytes() {
+        let hello = Message::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            run_id: "new".to_owned(),
+            identity: Identity {
+                exchange: "binance".to_owned(),
+                symbols: vec!["btcusdt".to_owned(), "ethusdt".to_owned()],
+                connections: 2,
+                output: "/data".to_owned(),
+            },
+        };
+        let messages = [
+            (
+                hello,
+                r#"{"type":"hello","protocol_version":1,"run_id":"new","identity":{"exchange":"binance","symbols":["btcusdt","ethusdt"],"connections":2,"output":"/data"}}"#,
+            ),
+            (
+                Message::HelloAck {
+                    run_id: "old".to_owned(),
+                },
+                r#"{"type":"hello_ack","run_id":"old"}"#,
+            ),
+            (
+                Message::Ready {
+                    run_id: "new".to_owned(),
+                },
+                r#"{"type":"ready","run_id":"new"}"#,
+            ),
+            (
+                Message::Drained {
+                    clean: true,
+                    error: None,
+                },
+                r#"{"type":"drained","clean":true,"error":null}"#,
+            ),
+            (
+                Message::Drained {
+                    clean: false,
+                    error: Some("writer failed".to_owned()),
+                },
+                r#"{"type":"drained","clean":false,"error":"writer failed"}"#,
+            ),
+            (
+                Message::Reject {
+                    reason: "identity differs".to_owned(),
+                },
+                r#"{"type":"reject","reason":"identity differs"}"#,
+            ),
+        ];
+        for (message, bytes) in messages {
+            assert_eq!(serde_json::to_string(&message).unwrap(), bytes);
+        }
+    }
+
+    /// Two processes finding a stale socket at once: one takes the path,
+    /// the other challenges it, and no listener is orphaned.
+    #[test]
+    fn starters_racing_over_a_stale_socket_choose_one_incumbent() {
+        let dir = std::env::temp_dir().join(format!(
+            "handover-race-test-{}-{}",
+            std::process::id(),
+            QualityEvent::now_ns()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("collector.sock");
+        // Left stale, as an ungraceful exit would; so does every round's
+        // incumbent.
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+
+        for _ in 0..20 {
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let starters: Vec<_> = (0..2)
+                .map(|_| {
+                    let (path, barrier) = (path.clone(), std::sync::Arc::clone(&barrier));
+                    std::thread::spawn(move || {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .unwrap();
+                        barrier.wait();
+                        // Never panicking before the second barrier, which
+                        // would leave the other starter waiting there.
+                        let role = runtime.block_on(select_role(&path));
+                        let bound = match &role {
+                            Err(error) => Some(Err(format!("{error:#}"))),
+                            Ok(Role::Incumbent(listener)) => Some(Ok(listener.inode)),
+                            Ok(Role::Challenger(_)) => None,
+                        };
+                        // Both have chosen before either lets go.
+                        barrier.wait();
+                        bound
+                    })
+                })
+                .collect();
+            let bound: Vec<_> = starters
+                .into_iter()
+                .filter_map(|starter| starter.join().unwrap())
+                .collect();
+            assert!(
+                matches!(bound.as_slice(), [Ok(_)]),
+                "exactly one incumbent, and no starter failed: {bound:?}"
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
