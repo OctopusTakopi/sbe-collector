@@ -1,6 +1,7 @@
 use std::{
     borrow::Cow,
     collections::HashMap,
+    fmt::{self, Write as _},
     fs::{File, TryLockError},
     io::{self, BufReader, Read, Seek, SeekFrom, Write},
     mem,
@@ -104,10 +105,13 @@ fn encode_symbol(symbol: &str) -> Cow<'_, str> {
 }
 
 /// `<prefix>_<YYYYMMDD><suffix>.zst`, where `prefix` is `<dir>/<encoded symbol>`.
-fn day_file(prefix: &Path, date: Date, suffix: &str) -> PathBuf {
+/// Formatted straight into the path: a sidecar probes its daily file's name
+/// often through a handover.
+fn day_file(prefix: &Path, date: Date, suffix: fmt::Arguments<'_>) -> PathBuf {
     let mut name = prefix.as_os_str().to_owned();
-    name.push(format!("_{}{suffix}.zst", date.strftime("%Y%m%d")));
-    name.into()
+    write!(name, "_{}{suffix}.zst", date.strftime("%Y%m%d"))
+        .expect("formatting into an OsString cannot fail");
+    PathBuf::from(name)
 }
 
 /// `flock(LOCK_EX | LOCK_NB)` on Linux, so it excludes older binaries too.
@@ -267,7 +271,7 @@ enum DailyLock {
 /// moved aside first: a decoder cannot step past a torn tail, so anything
 /// appended after it would be lost.
 fn lock_daily(prefix: &Path, date: Date) -> DailyLock {
-    let path = day_file(prefix, date, "");
+    let path = day_file(prefix, date, format_args!(""));
     let daily = match open_locked(&path) {
         Ok(Some(daily)) => daily,
         Ok(None) => return DailyLock::Busy,
@@ -281,7 +285,7 @@ fn lock_daily(prefix: &Path, date: Date) -> DailyLock {
     let salvage = day_file(
         prefix,
         date,
-        &format!("_unterminated-{}", Timestamp::now().as_nanosecond()),
+        format_args!("_unterminated-{}", Timestamp::now().as_nanosecond()),
     );
     if let Err(error) = set_aside(&path, &salvage) {
         return DailyLock::Failed(error);
@@ -665,7 +669,7 @@ impl RotatingFile {
                 self.retry.record(progress, Instant::now());
             }
         }
-        let path = day_file(&self.prefix, date, &format!("_{}", self.run_id));
+        let path = day_file(&self.prefix, date, format_args!("_{}", self.run_id));
         let file = File::options().create_new(true).write(true).open(&path)?;
         lock_exclusively(&file, &path)?;
         warn!(
@@ -679,7 +683,7 @@ impl RotatingFile {
     }
 
     fn lock_failed(&mut self, date: Date, error: &io::Error) -> Progress {
-        let path = day_file(&self.prefix, date, "");
+        let path = day_file(&self.prefix, date, format_args!(""));
         self.faults
             .report(&path, error, "cannot take the daily file");
         Progress::Failed
@@ -718,7 +722,7 @@ impl RotatingFile {
         match mem::replace(&mut self.sink, Sink::Closed) {
             Sink::Torn(_) | Sink::Closed => {
                 if !self.batch.is_empty() {
-                    let path = day_file(&self.prefix, self.day.date, "");
+                    let path = day_file(&self.prefix, self.day.date, format_args!(""));
                     let lost = io::Error::other(format!(
                         "{} batched bytes have no open file",
                         self.batch.len()
@@ -733,7 +737,7 @@ impl RotatingFile {
                 Ok(None)
             }
             Sink::Daily(encoder) => {
-                let path = day_file(&self.prefix, self.day.date, "");
+                let path = day_file(&self.prefix, self.day.date, format_args!(""));
                 seal(encoder, &mut self.batch, &path).map_err(|error| {
                     let error = io::Error::from(error);
                     self.faults
@@ -969,7 +973,7 @@ impl RotatingFile {
                 self.sink = Sink::Torn(path);
             }
             Sink::Daily(_) | Sink::Torn(_) | Sink::Closed => {
-                let path = day_file(&self.prefix, self.day.date, "");
+                let path = day_file(&self.prefix, self.day.date, format_args!(""));
                 let lost = self.batch.len();
                 self.batch.clear();
                 self.faults.report(
