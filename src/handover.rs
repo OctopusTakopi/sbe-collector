@@ -30,6 +30,9 @@ const BIND_RETRY: Duration = Duration::from_millis(10);
 /// peer cannot keep it spinning.
 const RESELECT_DELAY: Duration = Duration::from_millis(250);
 const MAX_RESELECTIONS: u32 = 5;
+/// Pause after a failed `accept`, so a persistent failure logs once a
+/// second instead of spinning.
+const ACCEPT_RETRY: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Identity {
@@ -157,19 +160,31 @@ pub async fn run(
     }
 
     let mut reselections = 0;
-    // The incumbent of the last challenge, if it vanished after this
-    // process reported ready.
-    let mut lost_after_ready = None;
+    // The incumbent of the last challenge, if it vanished before draining.
+    let mut lost_incumbent: Option<Lost> = None;
     let listener = loop {
         let lost = match select_role(&path).await? {
             Role::Incumbent(listener) => {
-                if let Some(incumbent_run_id) = lost_after_ready {
+                // A rollout watching this process's quality log waits for a
+                // terminal state, which a promotion must provide too.
+                if let Some(Lost {
+                    incumbent: Some(incumbent_run_id),
+                    after_ready,
+                    ..
+                }) = lost_incumbent
+                {
+                    let state = if after_ready {
+                        HandoverState::IncumbentLostAfterReadyPromoted
+                    } else {
+                        HandoverState::IncumbentLostPromoted
+                    };
                     tracing::warn!(
-                        "incumbent disappeared after challenger readiness; promoted challenger"
+                        after_ready,
+                        "incumbent disappeared before draining; promoted challenger"
                     );
                     quality.report(QualityEvent::Handover {
                         at_ns: QualityEvent::now_ns(),
-                        state: HandoverState::IncumbentLostAfterReadyPromoted,
+                        state,
                         peer_run_id: Some(incumbent_run_id),
                     });
                 }
@@ -203,7 +218,7 @@ pub async fn run(
             error = %lost.error,
             "handover incumbent disappeared before draining; choosing a role again"
         );
-        lost_after_ready = lost.after_ready;
+        lost_incumbent = Some(lost);
         tokio::time::sleep(RESELECT_DELAY).await;
     };
     server_loop(
@@ -231,16 +246,22 @@ enum Challenge {
 
 struct Lost {
     error: io::Error,
-    /// The incumbent's run id, if it was told this process is ready.
-    after_ready: Option<String>,
+    /// The incumbent's run id, once its acknowledgement named it.
+    incumbent: Option<String>,
+    /// Whether this process had reported itself ready (`challenger_ready`).
+    after_ready: bool,
 }
 
 impl Challenge {
     /// A peer that is gone lost the challenge; one that broke the protocol
     /// fails it.
-    fn lost(error: WireError, after_ready: Option<String>) -> anyhow::Result<Self> {
+    fn lost(error: WireError, incumbent: Option<&str>, after_ready: bool) -> anyhow::Result<Self> {
         match error {
-            WireError::Gone(error) => Ok(Self::Lost(Lost { error, after_ready })),
+            WireError::Gone(error) => Ok(Self::Lost(Lost {
+                error,
+                incumbent: incumbent.map(str::to_owned),
+                after_ready,
+            })),
             error => Err(error.into()),
         }
     }
@@ -262,7 +283,7 @@ async fn challenge(
         identity: identity.clone(),
     };
     if let Err(error) = write_message(&mut stream, &hello).await {
-        return Challenge::lost(error, None);
+        return Challenge::lost(error, None, false);
     }
     let acknowledgement = tokio::select! {
         biased;
@@ -273,7 +294,7 @@ async fn challenge(
         Ok(Ok(Message::HelloAck { run_id })) => run_id,
         Ok(Ok(Message::Reject { reason })) => bail!("handover rejected: {reason}"),
         Ok(Ok(message)) => bail!("unexpected handover response: {message:?}"),
-        Ok(Err(error)) => return Challenge::lost(error, None),
+        Ok(Err(error)) => return Challenge::lost(error, None, false),
         Err(_) => bail!("timed out waiting for handover acknowledgement"),
     };
 
@@ -287,10 +308,12 @@ async fn challenge(
         read = stream.read(&mut probe) => match read {
             Ok(0) => {
                 let eof = io::Error::from(io::ErrorKind::UnexpectedEof);
-                return Challenge::lost(WireError::Gone(eof), None);
+                return Challenge::lost(WireError::Gone(eof), Some(&incumbent_run_id), false);
             }
             Ok(_) => bail!("handover incumbent sent data before draining"),
-            Err(error) => return Challenge::lost(WireError::Gone(error), None),
+            Err(error) => {
+                return Challenge::lost(WireError::Gone(error), Some(&incumbent_run_id), false);
+            }
         },
     }
     quality.report(QualityEvent::Handover {
@@ -301,8 +324,10 @@ async fn challenge(
     let ready_message = Message::Ready {
         run_id: run_id.to_owned(),
     };
+    // `challenger_ready` is in the quality log already, so a lost incumbent
+    // from here on needs the terminal state that says so.
     if let Err(error) = write_message(&mut stream, &ready_message).await {
-        return Challenge::lost(error, None);
+        return Challenge::lost(error, Some(&incumbent_run_id), true);
     }
 
     match read_message(&mut stream).await {
@@ -320,7 +345,7 @@ async fn challenge(
         }
         Ok(Message::Reject { reason }) => bail!("handover rejected after readiness: {reason}"),
         Ok(message) => bail!("unexpected handover completion: {message:?}"),
-        Err(error) => Challenge::lost(error, Some(incumbent_run_id)),
+        Err(error) => Challenge::lost(error, Some(&incumbent_run_id), true),
     }
 }
 
@@ -371,13 +396,30 @@ async fn server_loop(
 ) -> anyhow::Result<()> {
     tracing::info!(path = %path.display(), "UDS handover listener ready");
     loop {
-        let mut stream = tokio::select! {
+        let accepted = tokio::select! {
             biased;
             () = stop_requested(shutdown) => {
                 listener.release(path);
                 return Ok(());
             }
-            accepted = listener.socket.accept() => accepted?.0,
+            accepted = listener.socket.accept() => accepted,
+        };
+        let mut stream = match accepted {
+            Ok((stream, _)) => stream,
+            // Out of descriptors, or a peer gone before it was accepted:
+            // nothing that should stop collection, which this task failing
+            // would.
+            Err(error) => {
+                tracing::warn!(%error, "cannot accept a handover connection; retrying");
+                tokio::select! {
+                    biased;
+                    () = stop_requested(shutdown) => {
+                        listener.release(path);
+                        return Ok(());
+                    }
+                    () = tokio::time::sleep(ACCEPT_RETRY) => continue,
+                }
+            }
         };
         // Shutting down drops a challenger mid-handshake once the path is
         // gone: it sees EOF and chooses its role again.
@@ -693,6 +735,10 @@ mod tests {
 
         /// A challenger is `ready` from the start: writer up, source live.
         fn start(&self, run_id: &str, ready: bool) -> Peer {
+            self.start_reporting(run_id, ready, QualityReporter::disabled())
+        }
+
+        fn start_reporting(&self, run_id: &str, ready: bool, quality: QualityReporter) -> Peer {
             let (readiness, ready_rx) = Readiness::new(1);
             let source = ready.then(|| {
                 readiness.mark_writer_ready();
@@ -706,7 +752,7 @@ mod tests {
                 run_id.to_owned(),
                 ready_rx,
                 takeover_tx,
-                QualityReporter::disabled(),
+                quality,
                 shutdown_rx,
             ));
             Peer {
@@ -861,11 +907,28 @@ mod tests {
         stop(new).await;
     }
 
+    /// The handover states this peer reported, in order.
+    fn handover_states(events: &std::sync::mpsc::Receiver<QualityEvent>) -> Vec<HandoverState> {
+        events
+            .try_iter()
+            .filter_map(|event| match event {
+                QualityEvent::Handover {
+                    state, peer_run_id, ..
+                } => {
+                    assert_eq!(peer_run_id.as_deref(), Some("old"));
+                    Some(state)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn ready_challenger_promotes_when_incumbent_disappears() {
         let fixture = Fixture::new("promotion");
         let mut old = fixture.start_incumbent().await;
-        let new = fixture.start("new", true);
+        let (quality, events) = QualityReporter::test_channel();
+        let new = fixture.start_reporting("new", true, quality);
 
         let request = timeout(Duration::from_secs(5), old.takeover.recv())
             .await
@@ -882,6 +945,44 @@ mod tests {
 
         fixture.wait_until_listening().await;
         assert!(!new.task.is_finished());
+        assert_eq!(
+            handover_states(&events),
+            [
+                HandoverState::ChallengerReady,
+                HandoverState::IncumbentLostAfterReadyPromoted
+            ]
+        );
+        stop(new).await;
+    }
+
+    /// An incumbent that vanishes while the challenger warms up leaves it
+    /// to take over, and a rollout watching for a terminal state must see
+    /// one.
+    #[tokio::test]
+    async fn a_challenger_reports_its_promotion_when_the_incumbent_vanishes_early() {
+        let fixture = Fixture::new("early-loss");
+        let listener = UnixListener::bind(&fixture.path).unwrap();
+        let (quality, events) = QualityReporter::test_channel();
+        let new = fixture.start_reporting("new", false, quality);
+
+        // Acknowledge the challenger, then vanish without unlinking.
+        let (mut stream, _) = listener.accept().await.unwrap();
+        assert!(matches!(
+            read_message(&mut stream).await.unwrap(),
+            Message::Hello { .. }
+        ));
+        let ack = Message::HelloAck {
+            run_id: "old".to_owned(),
+        };
+        write_message(&mut stream, &ack).await.unwrap();
+        drop((stream, listener));
+
+        fixture.wait_until_listening().await;
+        assert!(!new.task.is_finished());
+        assert_eq!(
+            handover_states(&events),
+            [HandoverState::IncumbentLostPromoted]
+        );
         stop(new).await;
     }
 

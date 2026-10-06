@@ -305,18 +305,17 @@ async fn main() -> anyhow::Result<()> {
         shutdown_tx.send_replace(true);
         drop(takeover_rx);
     }
+    let mut handover_result = Ok(());
     let (collection_result, takeover) = match shutdown {
         Shutdown::Collection(result) => (result, None),
         Shutdown::Takeover(request) => (
             stop_collection(&shutdown_tx, &mut collection).await,
             Some(request),
         ),
-        Shutdown::HandoverFailed(error) => (
-            stop_collection(&shutdown_tx, &mut collection)
-                .await
-                .and(Err(error)),
-            None,
-        ),
+        Shutdown::HandoverFailed(error) => {
+            handover_result = Err(error);
+            (stop_collection(&shutdown_tx, &mut collection).await, None)
+        }
         Shutdown::Signal | Shutdown::Writer | Shutdown::Quality => {
             (stop_collection(&shutdown_tx, &mut collection).await, None)
         }
@@ -326,12 +325,17 @@ async fn main() -> anyhow::Result<()> {
         .join()
         .unwrap_or_else(|_| Err(anyhow!("writer thread panicked")));
 
-    if let Err(error) = &collection_result {
-        quality.report(QualityEvent::CriticalTaskFailed {
-            at_ns: QualityEvent::now_ns(),
-            task: "collection".to_owned(),
-            error: error.to_string(),
-        });
+    for (task, result) in [
+        ("handover", &handover_result),
+        ("collection", &collection_result),
+    ] {
+        if let Err(error) = result {
+            quality.report(QualityEvent::CriticalTaskFailed {
+                at_ns: QualityEvent::now_ns(),
+                task: task.to_owned(),
+                error: error.to_string(),
+            });
+        }
     }
     if let Err(error) = &writer_result {
         quality.report(QualityEvent::StorageDegraded {
@@ -361,7 +365,9 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| Err(std::io::Error::other("quality writer thread panicked")))
         .map_err(anyhow::Error::from);
 
-    let result = root_cause(collection_result, writer_result, "the writer");
+    // A failed handover is what stopped the collection, so it comes first.
+    let result = root_cause(handover_result, collection_result, "the collection");
+    let result = root_cause(result, writer_result, "the writer");
     root_cause(result, quality_result, "the quality log")
 }
 
