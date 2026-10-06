@@ -29,7 +29,7 @@ use crate::{
     file::{Symbol, WriteRecord},
     quality::{QualityEvent, QualityReporter},
     readiness::Readiness,
-    session::{self, Protocol},
+    session::{self, Frame, Protocol},
 };
 use instruments::Instrument;
 use protocol::{Credentials, Okx};
@@ -202,7 +202,10 @@ pub async fn run_collection(
         Err(anyhow::anyhow!("periodic book-snapshot task exited"))
     });
 
-    while let Some((recv_time, data)) = feed.recv(&mut ingest.tasks).await? {
+    while let Some(Frame {
+        recv_time, data, ..
+    }) = feed.recv(&mut ingest.tasks).await?
+    {
         match ingest.handle(recv_time, data).await {
             Ok(()) => {}
             Err(ConnectorError::WriterClosed) => return Err(ConnectorError::WriterClosed.into()),

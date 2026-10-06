@@ -14,7 +14,7 @@ use tracing::{info, warn};
 use super::instruments::Instrument;
 use crate::{
     quality::QualityReporter,
-    session::{Handshake, Protocol, Reason, Session, Verdict},
+    session::{Handshake, Protocol, Reason, Requests, Session, Verdict},
     subscriptions::{Answers, Topic, Topics},
 };
 
@@ -33,6 +33,10 @@ const TIER_TOO_LOW: &str = "64003";
 
 /// No such channel or `instIdCode`: a relisting changes an instrument's code.
 const NO_SUCH_TOPIC: &str = "60018";
+
+/// OKX closes a connection that pushed nothing for 30 s itself (4004), and
+/// the subscribed books tick far more often.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The API key, its secret and passphrase. Deliberately not `Debug`.
 pub(crate) struct Credentials {
@@ -129,13 +133,17 @@ impl Protocol for Okx {
         Ok(Handshake { url: URL, headers })
     }
 
-    fn max_age(&self, _connection: usize) -> Option<Duration> {
-        None
+    fn credentialed(&self) -> bool {
+        true
+    }
+
+    fn idle_timeout(&self) -> Duration {
+        IDLE_TIMEOUT
     }
 
     /// One request per topic: an error names the request's `id` but not its
     /// channel, so only one topic per request can be told apart.
-    fn open(&self) -> (Replies, Vec<String>) {
+    fn open(&self) -> (Replies, Requests) {
         let requests = self
             .topics
             .numbered()
@@ -151,7 +159,13 @@ impl Protocol for Okx {
         let replies = Replies {
             answers: Answers::new(Arc::clone(&self.topics)),
         };
-        (replies, requests)
+        (
+            replies,
+            Requests {
+                initial: requests,
+                keepalive: None,
+            },
+        )
     }
 }
 
@@ -174,7 +188,7 @@ pub(crate) struct Replies {
 }
 
 impl Session for Replies {
-    fn on_text(&mut self, text: &[u8]) -> Verdict {
+    fn on_control(&mut self, text: &[u8]) -> Verdict {
         let Ok(reply) = serde_json::from_slice::<Reply>(text) else {
             warn!(
                 "unexpected WS text frame: {}",
@@ -268,11 +282,20 @@ mod tests {
         for secret in ["ok-access-key", "ok-access-sign", "ok-access-passphrase"] {
             assert!(headers[secret].is_sensitive(), "{secret}");
         }
+        assert!(
+            okx.credentialed(),
+            "a refused login ends a run that never delivered"
+        );
     }
 
     #[test]
     fn each_topic_is_its_own_request() {
-        let (_, requests) = okx(QualityReporter::disabled()).open();
+        let (
+            _,
+            Requests {
+                initial: requests, ..
+            },
+        ) = okx(QualityReporter::disabled()).open();
         assert_eq!(
             requests,
             [
@@ -293,12 +316,12 @@ mod tests {
             )
         };
         assert!(matches!(
-            replies.on_text(ack(0).as_bytes()),
+            replies.on_control(ack(0).as_bytes()),
             Verdict::Continue
         ));
         assert!(!replies.settled());
         assert!(matches!(
-            replies.on_text(ack(1).as_bytes()),
+            replies.on_control(ack(1).as_bytes()),
             Verdict::Continue
         ));
         assert!(replies.settled());
@@ -315,8 +338,8 @@ mod tests {
 
         for _ in 0..2 {
             let (mut replies, _) = okx.open();
-            assert!(matches!(replies.on_text(acked), Verdict::Continue));
-            assert!(matches!(replies.on_text(refused), Verdict::Continue));
+            assert!(matches!(replies.on_control(acked), Verdict::Continue));
+            assert!(matches!(replies.on_control(refused), Verdict::Continue));
             assert!(replies.settled(), "a refusal answers its subscription");
         }
 
@@ -338,11 +361,11 @@ mod tests {
         };
 
         assert!(matches!(
-            replies.on_text(refused(0).as_bytes()),
+            replies.on_control(refused(0).as_bytes()),
             Verdict::Continue
         ));
         assert!(matches!(
-            replies.on_text(refused(1).as_bytes()),
+            replies.on_control(refused(1).as_bytes()),
             Verdict::End(Loss::Refused(_))
         ));
     }
@@ -354,17 +377,17 @@ mod tests {
         let error = br#"{"event":"error","msg":"Requests too frequent.","code":"60014","connId":"d39d1fe0"}"#;
         let (mut replies, _) = okx(QualityReporter::disabled()).open();
         assert!(matches!(
-            replies.on_text(error),
+            replies.on_control(error),
             Verdict::End(Loss::Rejected(_))
         ));
 
         let (mut replies, _) = okx(QualityReporter::disabled()).open();
         for id in 0..2 {
             let ack = format!(r#"{{"id":"{id}","event":"subscribe"}}"#);
-            replies.on_text(ack.as_bytes());
+            replies.on_control(ack.as_bytes());
         }
         assert!(matches!(
-            replies.on_text(error),
+            replies.on_control(error),
             Verdict::Relieve(Reason::VenueError)
         ));
     }
@@ -374,7 +397,7 @@ mod tests {
         let (mut replies, _) = okx(QualityReporter::disabled()).open();
         let notice = br#"{"event":"notice","code":"64008","msg":"The connection will soon be closed for a service upgrade. Please reconnect.","connId":"a4d3ae55"}"#;
         assert!(matches!(
-            replies.on_text(notice),
+            replies.on_control(notice),
             Verdict::Relieve(Reason::ServerShutdown)
         ));
     }
@@ -386,7 +409,7 @@ mod tests {
             &b"pong"[..],
             br#"{"event":"channel-conn-count","connCount":"2"}"#,
         ] {
-            assert!(matches!(replies.on_text(text), Verdict::Continue));
+            assert!(matches!(replies.on_control(text), Verdict::Continue));
         }
         assert!(!replies.settled());
     }

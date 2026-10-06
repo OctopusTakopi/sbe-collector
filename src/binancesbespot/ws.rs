@@ -3,7 +3,7 @@ use std::time::Duration;
 use hyper::header::{HeaderMap, HeaderValue};
 use tracing::warn;
 
-use crate::session::{Handshake, Protocol, Reason, Session, Verdict};
+use crate::session::{Handshake, Protocol, Reason, Requests, Session, Verdict};
 
 const WSS_HOST: &str = "stream-sbe.binance.com";
 const WSS_PORT: u16 = 9443;
@@ -14,6 +14,9 @@ const WSS_PORT: u16 = 9443;
 /// 24 hours; expect to be disconnected at the 24 hour mark". The idle timeout
 /// bounds how late the check can run.
 const MAX_SESSION_AGE: Duration = Duration::from_secs(23 * 60 * 60);
+
+/// The venue pings every 20 s, so a minute without a frame is a dead socket.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Spreads redundant connections' handovers. A fixed age cap would
 /// re-synchronise a day later what the connect stagger spread out at startup.
@@ -88,13 +91,22 @@ impl Protocol for Endpoint {
         })
     }
 
+    /// The API key rides on the upgrade.
+    fn credentialed(&self) -> bool {
+        true
+    }
+
+    fn idle_timeout(&self) -> Duration {
+        IDLE_TIMEOUT
+    }
+
     fn max_age(&self, connection: usize) -> Option<Duration> {
         Some(max_session_age(connection))
     }
 
     /// The stream list is in the URL, so there is nothing to subscribe.
-    fn open(&self) -> (Announcements, Vec<String>) {
-        (Announcements, Vec::new())
+    fn open(&self) -> (Announcements, Requests) {
+        (Announcements, Requests::default())
     }
 }
 
@@ -102,7 +114,7 @@ impl Protocol for Endpoint {
 pub(crate) struct Announcements;
 
 impl Session for Announcements {
-    fn on_text(&mut self, text: &[u8]) -> Verdict {
+    fn on_control(&mut self, text: &[u8]) -> Verdict {
         let text_lossy = String::from_utf8_lossy(text);
         if is_server_shutdown(text) {
             warn!(text = %text_lossy, "the venue announced a server shutdown");
@@ -152,6 +164,7 @@ mod tests {
         let handshake = endpoint.handshake().unwrap();
         assert_eq!(handshake.headers["x-mbx-apikey"], "key");
         assert!(handshake.headers["x-mbx-apikey"].is_sensitive());
+        assert!(endpoint.credentialed());
     }
 
     #[test]
@@ -176,11 +189,11 @@ mod tests {
     #[test]
     fn the_announcement_asks_for_a_replacement() {
         assert!(matches!(
-            Announcements.on_text(ANNOUNCEMENT.as_bytes()),
+            Announcements.on_control(ANNOUNCEMENT.as_bytes()),
             Verdict::Relieve(Reason::ServerShutdown)
         ));
         assert!(matches!(
-            Announcements.on_text(br#"{"result":null,"id":1}"#),
+            Announcements.on_control(br#"{"result":null,"id":1}"#),
             Verdict::Continue
         ));
     }

@@ -1,22 +1,34 @@
+//! Websocket transport: TLS and the upgrade, a read half the caller polls,
+//! and a write half owned by its own task; plus the one way a frame is handed
+//! to the collection queue.
+
+use std::{
+    borrow::Cow,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use fastwebsockets::{
     FragmentCollectorRead, Frame, OpCode, Payload, Role, WebSocket, WebSocketWrite, handshake,
 };
 use http_body_util::{BodyExt, Empty};
-use hyper::body::Incoming;
-use hyper::header::{CONNECTION, HeaderMap, UPGRADE};
-use hyper::upgrade::Upgraded;
-use hyper::{Request, StatusCode};
+use hyper::{
+    Request, StatusCode,
+    body::Incoming,
+    header::{CONNECTION, HeaderMap, UPGRADE},
+    upgrade::Upgraded,
+};
 use hyper_util::rt::TokioIo;
 use rustls::ClientConfig;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncWrite, ReadHalf};
-use tokio::net::TcpStream;
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadHalf},
+    net::TcpStream,
+    sync::mpsc,
+    task::JoinHandle,
+    time::timeout,
+};
 use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, warn};
 use url::Url;
@@ -28,20 +40,18 @@ use crate::{
 
 type Io = TokioIo<Upgraded>;
 
-/// How long a frame may wait for room in the websocket queue before it is
-/// dropped.
+/// How long a frame may wait for room in the queue before frames are shed.
 ///
 /// The wait blocks the read loop, which then cannot answer a server ping, so
-/// it must stay far below the venue's pong deadline (Binance closes after
-/// about a minute).
+/// it stays far below the shortest pong deadline (Binance: about a minute).
 pub const QUEUE_FULL_GRACE: Duration = Duration::from_secs(1);
 
 /// Outgoing frames go through a queue so control replies never race the read
 /// loop.
 const OUTGOING_QUEUE_CAPACITY: usize = 64;
 
-/// Bound on TCP, TLS and the websocket upgrade together, so a black-holed
-/// connection becomes a retry instead of a task parked forever.
+/// Bound on TCP, TLS and the upgrade together: far beyond a healthy
+/// handshake, short enough that a black-holed connect becomes a retry.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// RFC 6455 caps a control frame's payload at 125 bytes.
@@ -61,29 +71,30 @@ const REFUSAL_LIMIT: usize = 4 * 1024;
 /// the socket.
 const REFUSAL_GRACE: Duration = Duration::from_secs(2);
 
-/// A TLS client config over the Mozilla root bundle. Build it once and share
-/// the `Arc`: each build clones ~140 root certificates.
-pub fn build_tls_config() -> ClientConfig {
-    let root_store =
-        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth()
+/// TLS settings backed by the Mozilla root bundle. Build once and share it, so
+/// a reconnect does not re-parse every root certificate.
+pub fn tls_config() -> Arc<ClientConfig> {
+    let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    )
 }
 
-/// Rate-limited accounting for frames dropped because the writer cannot keep
-/// up.
+/// Rate-limited accounting for frames shed because the writer cannot keep up.
 ///
-/// Dropping beats stalling: a stalled read loop stops answering pings, and
-/// the venue's disconnect costs far more than the overflow. Dropping silently
-/// is what must never happen.
+/// Shedding beats stalling: a stalled read loop stops answering pings, the
+/// venue closes the connection, and that gap is far larger than the overflow.
+/// What must never happen is shedding silently.
 pub struct Overflow {
     source: Source,
     quality: QualityReporter,
     dropped: u64,
     reported: u64,
     last_report: Instant,
-    /// The consumer is known to be too slow: shed without waiting.
+    /// Set once the consumer has proved too slow; frames are then shed without
+    /// waiting until one gets through.
     shedding: bool,
 }
 
@@ -99,7 +110,7 @@ impl Overflow {
         }
     }
 
-    pub fn record_drop(&mut self) {
+    fn record_drop(&mut self) {
         self.dropped += 1;
         if self.dropped == 1 || self.last_report.elapsed() >= OVERFLOW_REPORT_INTERVAL {
             error!(
@@ -119,8 +130,8 @@ impl Overflow {
         }
     }
 
-    /// Record one frame that made it through, reporting recovery once.
-    pub fn record_sent(&mut self) {
+    /// Reports recovery once, on the first frame through after a drop.
+    fn record_sent(&mut self) {
         if self.dropped > 0 {
             info!(
                 endpoint = %self.source,
@@ -139,37 +150,23 @@ impl Overflow {
     }
 }
 
-/// Outcome of handing a frame to the consumer.
+/// Outcome of handing a frame to the queue.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Delivery {
     Sent,
-    /// Shed because the consumer is saturated. Counted and reported.
+    /// Shed because the consumer is saturated; counted and reported.
     Dropped,
-    /// The consumer is gone; the collector is shutting down.
+    /// The consumer is gone: the collector is shutting down.
     Closed,
-    /// A frame that must not be shed could not be delivered.
-    Undeliverable,
 }
 
-/// Hand a frame to the consumer without ever starving control frames.
+/// Queues `value` without ever starving the read loop.
 ///
-/// Waiting on every frame would throttle reads to one frame per grace period
-/// and bury the server's ping behind market data, so the wait happens only
-/// when the queue first fills; after that, frames are shed at once until the
-/// consumer catches up.
-///
-/// `sheddable` is consulted only on that slow path. Subscription acks and
-/// rejections must not be shed: losing one leaves topics unsubscribed with
-/// nothing to trigger a retry.
-pub async fn deliver<T, F>(
-    tx: &mpsc::Sender<T>,
-    overflow: &mut Overflow,
-    value: T,
-    sheddable: F,
-) -> Delivery
-where
-    F: FnOnce(&T) -> bool,
-{
+/// Waiting on every frame would throttle reads to one per grace period and
+/// leave the venue's ping stuck behind market data in the kernel buffer, so
+/// the wait happens only when the queue first fills; after that, frames are
+/// shed at once until one gets through.
+pub async fn deliver<T>(tx: &mpsc::Sender<T>, overflow: &mut Overflow, value: T) -> Delivery {
     match tx.try_reserve() {
         Ok(permit) => {
             permit.send(value);
@@ -179,13 +176,10 @@ where
         Err(mpsc::error::TrySendError::Closed(())) => return Delivery::Closed,
         Err(mpsc::error::TrySendError::Full(())) => {}
     }
-
-    let may_shed = sheddable(&value);
-    if may_shed && overflow.shedding {
+    if overflow.shedding {
         overflow.record_drop();
         return Delivery::Dropped;
     }
-
     match timeout(QUEUE_FULL_GRACE, tx.reserve()).await {
         Ok(Ok(permit)) => {
             permit.send(value);
@@ -193,25 +187,25 @@ where
             Delivery::Sent
         }
         Ok(Err(_)) => Delivery::Closed,
-        Err(_) if may_shed => {
+        Err(_) => {
             overflow.shedding = true;
             overflow.record_drop();
             Delivery::Dropped
         }
-        Err(_) => Delivery::Undeliverable,
     }
 }
 
 /// A frame handed to the writer task.
-pub enum Outgoing {
+enum Outgoing {
     Text(String),
-    Ping(Vec<u8>),
+    Ping,
     Pong(Vec<u8>),
     CloseRaw(Vec<u8>),
 }
 
 impl Outgoing {
-    fn from_obligated(frame: &Frame<'_>) -> Self {
+    /// The reply `read_frame` is obliged to send: a pong or a close echo.
+    fn obligated(frame: &Frame<'_>) -> Self {
         let payload = frame.payload.to_vec();
         match frame.opcode {
             OpCode::Close => Outgoing::CloseRaw(payload),
@@ -222,9 +216,7 @@ impl Outgoing {
     fn into_frame(self) -> Frame<'static> {
         match self {
             Outgoing::Text(text) => Frame::text(Payload::Owned(text.into_bytes())),
-            Outgoing::Ping(payload) => {
-                Frame::new(true, OpCode::Ping, None, Payload::Owned(payload))
-            }
+            Outgoing::Ping => Frame::new(true, OpCode::Ping, None, Payload::Owned(Vec::new())),
             Outgoing::Pong(payload) => Frame::pong(Payload::Owned(payload)),
             Outgoing::CloseRaw(payload) => Frame::close_raw(Payload::Owned(payload)),
         }
@@ -232,7 +224,7 @@ impl Outgoing {
 }
 
 /// Write handle for a [`Connection`]. Cheap to clone, and safe to use from a
-/// task running concurrently with the read loop.
+/// task running alongside the read loop.
 #[derive(Clone)]
 pub struct FrameSender(mpsc::Sender<Outgoing>);
 
@@ -245,27 +237,24 @@ impl FrameSender {
     }
 
     /// A request in the venue's text protocol, such as a subscription.
-    pub async fn text(&self, text: String) -> Result<()> {
-        self.send(Outgoing::Text(text)).await
+    pub async fn text(&self, text: impl Into<String>) -> Result<()> {
+        self.send(Outgoing::Text(text.into())).await
     }
 
-    /// A keepalive for venues that never ping first; the pong it earns is a
-    /// frame like any other, so the idle timeout stays meaningful on a quiet
-    /// feed.
-    pub async fn ping(&self, payload: impl Into<Vec<u8>>) -> Result<()> {
-        self.send(Outgoing::Ping(payload.into())).await
+    /// A keepalive for a venue that never pings first: the pong it earns is
+    /// a frame like any other, so the idle timeout stays meaningful on a
+    /// quiet feed.
+    pub async fn ping(&self) -> Result<()> {
+        self.send(Outgoing::Ping).await
     }
 
     pub async fn pong(&self, payload: impl Into<Vec<u8>>) -> Result<()> {
         self.send(Outgoing::Pong(payload.into())).await
     }
 
-    /// Start a close handshake from this side; pair with
-    /// [`Connection::flush_close`] to wait for it to reach the wire.
-    ///
-    /// Dropping the socket instead leaves the venue holding a connection slot
-    /// this IP is limited on. `reason` is truncated to the 125-byte control
-    /// frame limit, past which the close becomes a protocol error.
+    /// Starts a close handshake from this side, handing the venue back a
+    /// connection slot this IP is limited on. `reason` is truncated to fit a
+    /// control frame. Pair with [`Connection::flush_close`].
     pub async fn close(&self, code: u16, reason: &str) -> Result<()> {
         let room = MAX_CONTROL_PAYLOAD - size_of::<u16>();
         let reason = &reason.as_bytes()[..reason.len().min(room)];
@@ -278,13 +267,13 @@ impl FrameSender {
 /// The status code and reason of a close frame's payload, for the log: a
 /// venue's own codes (OKX 4004 "no data received in 30s", 4005 "buffer is
 /// full") are what tell one disconnect from another.
-pub fn close_reason(payload: &[u8]) -> (Option<u16>, std::borrow::Cow<'_, str>) {
+pub fn close_reason(payload: &[u8]) -> (Option<u16>, Cow<'_, str>) {
     match payload {
         [high, low, reason @ ..] => (
             Some(u16::from_be_bytes([*high, *low])),
             String::from_utf8_lossy(reason),
         ),
-        _ => (None, std::borrow::Cow::Borrowed("")),
+        _ => (None, Cow::Borrowed("")),
     }
 }
 
@@ -294,11 +283,10 @@ pub struct Message {
     pub payload: Bytes,
 }
 
-/// A split websocket connection.
+/// A split websocket connection whose write half is a task fed through
+/// [`FrameSender`], so the read loop never shares a `select!` with writes.
 ///
-/// The write half is owned by a task fed through [`FrameSender`], so the
-/// caller's read loop never shares a `select!` with writes (see
-/// [`Connection::read`]). Generic over the transport for in-memory tests.
+/// Generic over the transport so tests can run it over an in-memory duplex.
 pub struct Connection<S = Io> {
     read: FragmentCollectorRead<ReadHalf<S>>,
     out_tx: mpsc::Sender<Outgoing>,
@@ -309,7 +297,6 @@ impl<S> Connection<S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    /// Split an already-handshaken websocket and start its writer task.
     pub fn from_websocket(ws: WebSocket<S>) -> Self {
         let (read, write) = ws.split(tokio::io::split);
         let (out_tx, out_rx) = mpsc::channel(OUTGOING_QUEUE_CAPACITY);
@@ -322,19 +309,17 @@ where
 }
 
 impl<S> Connection<S> {
-    /// A clonable handle for writing frames from another task.
     pub fn sender(&self) -> FrameSender {
         FrameSender(self.out_tx.clone())
     }
 
-    /// Read the next frame.
+    /// Reads the next frame.
     ///
-    /// **Not cancel-safe.** `fastwebsockets` consumes the frame header
-    /// (`buffer.advance(2)`) before awaiting the payload, so dropping this
-    /// future mid-frame makes the next read parse payload bytes as a header:
-    /// `ReservedBitsNotZero`, `FrameTooLarge`, or silently corrupted frames.
-    /// Cancel it only when discarding the connection; any `select!` arm racing
-    /// it must end the session, never `continue`.
+    /// **Not cancel-safe.** `fastwebsockets` consumes the frame header before
+    /// awaiting the payload, so dropping this future mid-frame makes the next
+    /// read parse payload bytes as a header. Cancelling it is sound only when
+    /// the connection is being discarded: any `select!` arm racing it must end
+    /// the session.
     pub async fn read(&mut self) -> Result<Message>
     where
         S: AsyncRead + Unpin,
@@ -342,7 +327,7 @@ impl<S> Connection<S> {
         let out_tx = self.out_tx.clone();
         let mut send_fn = |frame: Frame<'_>| {
             let out_tx = out_tx.clone();
-            let outgoing = Outgoing::from_obligated(&frame);
+            let outgoing = Outgoing::obligated(&frame);
             async move {
                 out_tx
                     .send(outgoing)
@@ -364,13 +349,11 @@ impl<S> Connection<S> {
         })
     }
 
-    /// Wait for a queued close frame to reach the wire.
+    /// Waits for a queued close frame to reach the wire.
     ///
-    /// [`read`](Self::read) and [`FrameSender::close`] only queue the close;
-    /// without this, dropping the connection aborts the writer first and the
-    /// close handshake becomes an abrupt teardown. The writer stops after a
-    /// close frame, so this returns as soon as it is out. Safe to call twice:
-    /// a finished writer is not polled again.
+    /// Without this, dropping the connection aborts the writer and the close
+    /// loses the race. The writer stops after a close frame, so this returns as
+    /// soon as it is out; calling it twice is safe.
     pub async fn flush_close(&mut self) {
         if self.writer.is_finished() {
             return;
@@ -397,7 +380,7 @@ where
             warn!(%error, "websocket write failed");
             return;
         }
-        // Nothing may follow a close frame; `flush_close` waits on this exit.
+        // Nothing may follow a close frame.
         if closing {
             return;
         }
@@ -445,14 +428,14 @@ impl ConnectError {
                 reason,
             }
         } else {
-            Self::Failed(anyhow!("WebSocket upgrade answered {status}: {reason}"))
+            Self::Failed(anyhow!("websocket upgrade answered {status}: {reason}"))
         }
     }
 }
 
-/// Open a TLS WebSocket to `url` with `headers` added to the upgrade request,
-/// within [`CONNECT_TIMEOUT`]: none of the three handshakes has a deadline of
-/// its own.
+/// Opens a TLS websocket to `url` with `headers` added to the upgrade
+/// request, within [`CONNECT_TIMEOUT`]: none of the three handshakes has a
+/// deadline of its own.
 pub async fn connect(
     url: &str,
     headers: HeaderMap,
@@ -493,28 +476,25 @@ async fn handshake_all(
         .map_err(|e| anyhow!("Invalid domain: {}", e))?
         .to_owned();
 
-    let connector = TlsConnector::from(tls);
-
-    let addr = format!("{}:{}", host, port);
-    let tcp_stream = TcpStream::connect(&addr)
+    let tcp_stream = TcpStream::connect((host, port))
         .await
         .context("Failed to connect via TCP")?;
-    let tls_stream = connector
+    let tls_stream = TlsConnector::from(tls)
         .connect(domain, tcp_stream)
         .await
         .context("Failed to perform TLS handshake")?;
 
     let request = upgrade_request(&url, headers)?;
     let mut ws = upgrade(request, tls_stream).await?;
-    // Pings reach the caller, which answers them through the writer task.
+    // Pings are surfaced so the read loop answers them on the writer task.
     ws.set_auto_pong(false);
 
     Ok(Connection::from_websocket(ws))
 }
 
-/// Send the upgrade `request` over `socket` and take the websocket it
-/// opens, as `fastwebsockets::handshake::client` does, but keeping the
-/// venue's reason when it refuses: the body says which credential is wrong.
+/// Sends the upgrade `request` over `socket` and takes the websocket it
+/// opens, as `fastwebsockets::handshake::client` does, but keeps the venue's
+/// reason when it refuses: the body says what the venue did not accept.
 async fn upgrade<S>(
     request: Request<Empty<Bytes>>,
     socket: S,
@@ -592,14 +572,12 @@ pub fn duplex_pair() -> (
     Connection<tokio::io::DuplexStream>,
     WebSocket<tokio::io::DuplexStream>,
 ) {
-    use fastwebsockets::Role;
-
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
     let mut client = WebSocket::after_handshake(client_io, Role::Client);
     client.set_auto_pong(false);
     let mut server = WebSocket::after_handshake(server_io, Role::Server);
-    // The stand-in venue replies only when told to: automatic replies to a
-    // client the test already dropped would fail its read with a broken pipe.
+    // The stand-in venue replies only when a test tells it to; automatic
+    // replies to a client the test has let go would fail the read under test.
     server.set_auto_pong(false);
     server.set_auto_close(false);
     (Connection::from_websocket(client), server)
@@ -614,21 +592,27 @@ mod tests {
         connection: 0,
     };
 
+    fn overflow() -> Overflow {
+        Overflow::new(TEST_SOURCE, QualityReporter::disabled())
+    }
+
     #[test]
-    fn overflow_emits_loss_and_recovery_quality_events() {
+    fn overflow_reports_the_first_drop_and_resets_after_recovery() {
         let (quality, rx) = QualityReporter::test_channel();
         let mut overflow = Overflow::new(TEST_SOURCE, quality);
         overflow.record_drop();
         overflow.record_drop();
+        assert_eq!(overflow.dropped, 2);
         overflow.record_sent();
-
+        assert_eq!(overflow.dropped, 0);
         assert!(matches!(
             rx.recv().unwrap(),
             QualityEvent::MarketDataDropped {
                 dropped_total: 1,
                 dropped_since_last_report: 1,
+                source,
                 ..
-            }
+            } if source == "test/connection-0"
         ));
         assert!(matches!(
             rx.recv().unwrap(),
@@ -639,7 +623,50 @@ mod tests {
         ));
     }
 
-    /// Queuing the pong is not evidence that it reached the wire.
+    /// A sustained stall must not cost one grace period per frame: that would
+    /// throttle socket reads and leave pings stuck behind market data.
+    #[tokio::test(start_paused = true)]
+    async fn sustained_backpressure_sheds_without_waiting_after_the_first_grace() {
+        let (tx, _rx) = mpsc::channel::<u32>(1);
+        tx.try_reserve().unwrap().send(0);
+        let mut overflow = overflow();
+
+        let before = tokio::time::Instant::now();
+        assert_eq!(deliver(&tx, &mut overflow, 1).await, Delivery::Dropped);
+        let after_first = tokio::time::Instant::now();
+        assert!(
+            after_first - before >= QUEUE_FULL_GRACE,
+            "the first frame should absorb a burst"
+        );
+
+        for value in 2..100 {
+            assert_eq!(deliver(&tx, &mut overflow, value).await, Delivery::Dropped);
+        }
+        assert_eq!(
+            tokio::time::Instant::now(),
+            after_first,
+            "shedding must not wait"
+        );
+        assert_eq!(overflow.dropped, 99);
+    }
+
+    /// A brief burst is absorbed losslessly rather than shed.
+    #[tokio::test(start_paused = true)]
+    async fn a_short_burst_is_absorbed_without_dropping() {
+        let (tx, mut rx) = mpsc::channel::<u32>(1);
+        tx.try_reserve().unwrap().send(0);
+        tokio::spawn(async move {
+            tokio::time::sleep(QUEUE_FULL_GRACE / 2).await;
+            let _ = rx.recv().await;
+            std::future::pending::<()>().await;
+        });
+
+        let mut overflow = overflow();
+        assert_eq!(deliver(&tx, &mut overflow, 1).await, Delivery::Sent);
+        assert_eq!(overflow.dropped, 0);
+    }
+
+    /// The pong must reach the wire with the ping's exact payload.
     #[tokio::test]
     async fn server_ping_is_answered_with_a_matching_pong() {
         let (mut conn, mut server) = duplex_pair();
@@ -657,85 +684,46 @@ mod tests {
         let message = conn.read().await.unwrap();
         assert_eq!(message.opcode, OpCode::Ping);
         assert_eq!(&message.payload[..], b"keepalive-42");
-        conn.sender().pong(message.payload.to_vec()).await.unwrap();
+        conn.sender().pong(message.payload).await.unwrap();
 
         let reply = server.read_frame().await.unwrap();
         assert_eq!(reply.opcode, OpCode::Pong);
         assert_eq!(&reply.payload[..], b"keepalive-42");
     }
 
-    /// A sustained stall must not cost one grace period per frame: that would
-    /// throttle socket reads and leave pings stuck behind market data.
-    #[tokio::test(start_paused = true)]
-    async fn sustained_backpressure_sheds_without_waiting_after_the_first_grace() {
-        let (tx, _rx) = mpsc::channel::<u32>(1);
-        tx.try_reserve().unwrap().send(0); // fill it
-        let mut overflow = Overflow::new(TEST_SOURCE, QualityReporter::disabled());
+    #[tokio::test]
+    async fn text_and_ping_frames_reach_the_peer() {
+        let (conn, mut server) = duplex_pair();
+        let sender = conn.sender();
 
-        let before = tokio::time::Instant::now();
-        assert_eq!(
-            deliver(&tx, &mut overflow, 1, |_| true).await,
-            Delivery::Dropped
-        );
-        let after_first = tokio::time::Instant::now();
-        assert!(
-            after_first - before >= QUEUE_FULL_GRACE,
-            "the first frame should absorb a burst"
-        );
+        sender.text(r#"{"op":"subscribe"}"#).await.unwrap();
+        sender.ping().await.unwrap();
 
-        // Every subsequent frame is shed immediately.
-        for value in 2..100 {
-            assert_eq!(
-                deliver(&tx, &mut overflow, value, |_| true).await,
-                Delivery::Dropped
-            );
-        }
-        assert_eq!(
-            tokio::time::Instant::now(),
-            after_first,
-            "shedding must not wait"
-        );
-        assert_eq!(overflow.dropped, 99);
+        let text = server.read_frame().await.unwrap();
+        assert_eq!(text.opcode, OpCode::Text);
+        assert_eq!(&text.payload[..], br#"{"op":"subscribe"}"#);
+        let ping = server.read_frame().await.unwrap();
+        assert_eq!(ping.opcode, OpCode::Ping);
+        assert!(ping.payload.is_empty());
     }
 
-    /// A brief burst is absorbed losslessly rather than shed.
-    #[tokio::test(start_paused = true)]
-    async fn a_short_burst_is_absorbed_without_dropping() {
-        let (tx, mut rx) = mpsc::channel::<u32>(1);
-        tx.try_reserve().unwrap().send(0);
+    #[tokio::test]
+    async fn binary_frames_round_trip_with_their_payload() {
+        let (mut conn, mut server) = duplex_pair();
 
-        tokio::spawn(async move {
-            tokio::time::sleep(QUEUE_FULL_GRACE / 2).await;
-            let _ = rx.recv().await;
-            std::future::pending::<()>().await;
-        });
+        server
+            .write_frame(Frame::new(
+                true,
+                OpCode::Binary,
+                None,
+                Payload::Owned(vec![0x12, 0x00, 0x10, 0x27]),
+            ))
+            .await
+            .unwrap();
 
-        let mut overflow = Overflow::new(TEST_SOURCE, QualityReporter::disabled());
-        assert_eq!(
-            deliver(&tx, &mut overflow, 1, |_| true).await,
-            Delivery::Sent
-        );
-        assert_eq!(overflow.dropped, 0);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn control_frames_are_never_shed() {
-        let (tx, _rx) = mpsc::channel::<u32>(1);
-        tx.try_reserve().unwrap().send(0);
-        let mut overflow = Overflow::new(TEST_SOURCE, QualityReporter::disabled());
-
-        // Get into the shedding state with a data frame.
-        assert_eq!(
-            deliver(&tx, &mut overflow, 1, |_| true).await,
-            Delivery::Dropped
-        );
-        assert!(overflow.shedding);
-
-        // A non-sheddable frame reports undeliverable instead of vanishing.
-        assert_eq!(
-            deliver(&tx, &mut overflow, 2, |_| false).await,
-            Delivery::Undeliverable
-        );
+        let message = conn.read().await.unwrap();
+        assert_eq!(message.opcode, OpCode::Binary);
+        assert_eq!(&message.payload[..], &[0x12, 0x00, 0x10, 0x27]);
     }
 
     #[tokio::test]
@@ -755,6 +743,17 @@ mod tests {
         let reply = server.read_frame().await.unwrap();
         assert_eq!(reply.opcode, OpCode::Close);
         assert_eq!(&reply.payload[2..], b"going away");
+    }
+
+    #[test]
+    fn a_close_payload_yields_its_code_and_reason() {
+        let mut payload = 1008u16.to_be_bytes().to_vec();
+        payload.extend_from_slice(b"policy violation");
+        assert_eq!(
+            close_reason(&payload),
+            (Some(1008), "policy violation".into())
+        );
+        assert_eq!(close_reason(&[]), (None, "".into()));
     }
 
     #[test]
@@ -796,32 +795,26 @@ mod tests {
     }
 
     fn request() -> Request<Empty<Bytes>> {
-        let url =
-            Url::parse("wss://stream-sbe.binance.com:9443/stream?streams=btcusdt@trade").unwrap();
+        let url = Url::parse("wss://ws-feed.exchange.coinbase.com").unwrap();
         upgrade_request(&url, HeaderMap::new()).unwrap()
     }
 
-    /// What Binance answered a key whitelisted for another IP.
     #[tokio::test]
     async fn a_refused_upgrade_keeps_the_venues_reason() {
-        let socket = venue(
-            "HTTP/1.1 400 Bad Request\r\ncontent-length: 27\r\n\r\nInvalid X-MBX-APIKEY header",
-        );
+        let socket = venue("HTTP/1.1 400 Bad Request\r\ncontent-length: 14\r\n\r\nInvalid stream");
 
         let Err(error) = upgrade(request(), socket).await else {
             panic!("a 400 must not open a websocket");
         };
 
         assert!(
-            matches!(&error, ConnectError::Refused { status: 400, reason } if reason == "Invalid X-MBX-APIKEY header"),
+            matches!(&error, ConnectError::Refused { status: 400, reason } if reason == "Invalid stream"),
             "{error:?}"
         );
-        let message = error.to_string();
         assert!(
-            message.contains("HTTP 400 (Invalid X-MBX-APIKEY header)"),
-            "{message}"
+            error.to_string().contains("HTTP 400 (Invalid stream)"),
+            "{error}"
         );
-        assert!(message.contains("API key"), "{message}");
     }
 
     /// An error page longer than the limit still names the reason.
@@ -845,14 +838,17 @@ mod tests {
     /// open must not turn the refusal into a connect timeout.
     #[tokio::test(start_paused = true)]
     async fn a_reason_that_never_ends_is_cut_off() {
-        let socket = venue("HTTP/1.1 401 Unauthorized\r\n\r\n{\"code\":\"60024\"}");
+        let socket = venue("HTTP/1.1 404 Not Found\r\n\r\n{\"error\":\"no such stream\"}");
 
         let started = tokio::time::Instant::now();
         let Err(ConnectError::Refused { status, reason }) = upgrade(request(), socket).await else {
-            panic!("a 401 is a refusal");
+            panic!("a 404 is a refusal");
         };
 
-        assert_eq!((status, reason.as_str()), (401, r#"{"code":"60024"}"#));
+        assert_eq!(
+            (status, reason.as_str()),
+            (404, r#"{"error":"no such stream"}"#)
+        );
         assert_eq!(started.elapsed(), REFUSAL_GRACE);
     }
 
@@ -905,56 +901,5 @@ mod tests {
             unreachable!()
         };
         assert_eq!(reason, "no reason given");
-    }
-
-    /// Subscriptions go out as text, keepalives as protocol pings.
-    #[tokio::test]
-    async fn text_and_ping_frames_reach_the_peer() {
-        let (conn, mut server) = duplex_pair();
-        let sender = conn.sender();
-
-        sender
-            .text(r#"{"op":"subscribe"}"#.to_owned())
-            .await
-            .unwrap();
-        sender.ping(b"k1".to_vec()).await.unwrap();
-
-        let text = server.read_frame().await.unwrap();
-        assert_eq!(text.opcode, OpCode::Text);
-        assert_eq!(&text.payload[..], br#"{"op":"subscribe"}"#);
-        let ping = server.read_frame().await.unwrap();
-        assert_eq!(ping.opcode, OpCode::Ping);
-        assert_eq!(&ping.payload[..], b"k1");
-    }
-
-    #[test]
-    fn a_close_payload_yields_its_code_and_reason() {
-        let mut payload = 4004u16.to_be_bytes().to_vec();
-        payload.extend_from_slice(b"No data received in 30s");
-        assert_eq!(
-            close_reason(&payload),
-            (Some(4004), "No data received in 30s".into())
-        );
-        assert_eq!(close_reason(&[]), (None, "".into()));
-    }
-
-    /// SBE market data arrives as binary frames.
-    #[tokio::test]
-    async fn binary_frames_round_trip_with_their_payload() {
-        let (mut conn, mut server) = duplex_pair();
-
-        server
-            .write_frame(Frame::new(
-                true,
-                OpCode::Binary,
-                None,
-                Payload::Owned(vec![0x12, 0x00, 0x10, 0x27]),
-            ))
-            .await
-            .unwrap();
-
-        let message = conn.read().await.unwrap();
-        assert_eq!(message.opcode, OpCode::Binary);
-        assert_eq!(&message.payload[..], &[0x12, 0x00, 0x10, 0x27]);
     }
 }

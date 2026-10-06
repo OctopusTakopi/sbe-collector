@@ -11,7 +11,7 @@ use tracing::warn;
 
 use crate::{
     quality::QualityReporter,
-    session::{Handshake, Protocol, Reason, Session, Verdict},
+    session::{Handshake, Protocol, Reason, Requests, Session, Verdict},
     subscriptions::{Answers, Topic, Topics},
 };
 
@@ -22,6 +22,9 @@ const FUTURES_URL: &str = "wss://fx-ws.gateio.ws/v4/ws/usdt/sbe?sbe_schema_id=1"
 /// Gate sent no ping in six minutes of watching, so a quiet pair could fall
 /// silent past the idle timeout; the pongs a keepalive earns prevent that.
 const KEEPALIVE: Duration = Duration::from_secs(20);
+
+/// Three keepalives' worth of silence.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// `obu` sends a full snapshot only on subscribing. Replacing every session
 /// hourly, make-before-break, puts a fresh one in each daily file within the
@@ -92,17 +95,17 @@ impl Protocol for Gate {
         })
     }
 
+    fn idle_timeout(&self) -> Duration {
+        IDLE_TIMEOUT
+    }
+
     fn max_age(&self, connection: usize) -> Option<Duration> {
         Some(MAX_SESSION_AGE.saturating_sub(SESSION_AGE_STAGGER * connection as u32))
     }
 
-    fn keepalive(&self) -> Option<Duration> {
-        Some(KEEPALIVE)
-    }
-
     /// One request per topic, so a refusal names its topic. Gate wants a
     /// `time` within 60 s of its own.
-    fn open(&self) -> (Replies, Vec<String>) {
+    fn open(&self) -> (Replies, Requests) {
         let time = Timestamp::now().as_second();
         let requests = self
             .topics
@@ -123,7 +126,13 @@ impl Protocol for Gate {
             answers: Answers::new(Arc::clone(&self.topics)),
             books: HashMap::new(),
         };
-        (replies, requests)
+        (
+            replies,
+            Requests {
+                initial: requests,
+                keepalive: Some(KEEPALIVE),
+            },
+        )
     }
 }
 
@@ -156,7 +165,7 @@ pub(crate) struct Replies {
 }
 
 impl Session for Replies {
-    fn on_text(&mut self, text: &[u8]) -> Verdict {
+    fn on_control(&mut self, text: &[u8]) -> Verdict {
         let Ok(reply) = serde_json::from_slice::<Reply>(text) else {
             warn!(
                 "unexpected WS text frame: {}",
@@ -195,7 +204,7 @@ impl Session for Replies {
     /// Follow this socket's own `obu` chains: a delta that does not start at
     /// the last id plus one leaves this socket's book broken until a fresh
     /// subscription's snapshot, so the session asks to be replaced.
-    fn on_binary(&mut self, frame: &[u8]) -> Verdict {
+    fn on_data(&mut self, frame: &[u8]) -> Verdict {
         let Some(link) = gate::obu_link(self.market, frame) else {
             return Verdict::Continue;
         };
@@ -274,7 +283,12 @@ mod tests {
 
     #[test]
     fn each_channel_and_pair_is_its_own_request() {
-        let (_, requests) = gate(Market::Futures, QualityReporter::disabled()).open();
+        let (
+            _,
+            Requests {
+                initial: requests, ..
+            },
+        ) = gate(Market::Futures, QualityReporter::disabled()).open();
         assert_eq!(requests.len(), 6);
         let first: serde_json::Value = serde_json::from_str(&requests[0]).unwrap();
         assert_eq!(first["channel"], "futures.book_ticker");
@@ -297,23 +311,29 @@ mod tests {
         assert_eq!(futures.handshake().unwrap().url, FUTURES_URL);
         assert_eq!(spot.max_age(0), Some(MAX_SESSION_AGE));
         assert_eq!(spot.max_age(7), Some(Duration::from_secs(25 * 60)));
-        assert_eq!(spot.keepalive(), Some(KEEPALIVE));
+        assert_eq!(spot.open().1.keepalive, Some(KEEPALIVE));
+        assert!(!spot.credentialed(), "market data takes no login");
     }
 
     #[test]
     fn every_ack_settles_and_a_pong_changes_nothing() {
-        let (mut replies, requests) = gate(Market::Spot, QualityReporter::disabled()).open();
+        let (
+            mut replies,
+            Requests {
+                initial: requests, ..
+            },
+        ) = gate(Market::Spot, QualityReporter::disabled()).open();
         let pong = br#"{"time":1791182070,"time_ms":1791182070045,"conn_id":"cf39484c4f270f22","channel":"spot.pong","event":"","result":null}"#;
 
         for id in 0..requests.len() {
             assert!(!replies.settled());
             assert!(matches!(
-                replies.on_text(ack(id).as_bytes()),
+                replies.on_control(ack(id).as_bytes()),
                 Verdict::Continue
             ));
         }
         assert!(replies.settled());
-        assert!(matches!(replies.on_text(pong), Verdict::Continue));
+        assert!(matches!(replies.on_control(pong), Verdict::Continue));
     }
 
     #[test]
@@ -324,7 +344,7 @@ mod tests {
         for _ in 0..2 {
             let (mut replies, _) = gate.open();
             assert!(matches!(
-                replies.on_text(refusal(4, 2).as_bytes()),
+                replies.on_control(refusal(4, 2).as_bytes()),
                 Verdict::Continue
             ));
         }
@@ -342,31 +362,41 @@ mod tests {
 
     #[test]
     fn a_session_with_every_subscription_refused_gives_up() {
-        let (mut replies, requests) = gate(Market::Spot, QualityReporter::disabled()).open();
+        let (
+            mut replies,
+            Requests {
+                initial: requests, ..
+            },
+        ) = gate(Market::Spot, QualityReporter::disabled()).open();
         let last = requests.len() - 1;
         for id in 0..last {
-            replies.on_text(refusal(id, 2).as_bytes());
+            replies.on_control(refusal(id, 2).as_bytes());
         }
         assert!(matches!(
-            replies.on_text(refusal(last, 2).as_bytes()),
+            replies.on_control(refusal(last, 2).as_bytes()),
             Verdict::End(Loss::Refused(_))
         ));
     }
 
     #[test]
     fn a_server_error_reconnects_or_replaces() {
-        let (mut replies, requests) = gate(Market::Spot, QualityReporter::disabled()).open();
+        let (
+            mut replies,
+            Requests {
+                initial: requests, ..
+            },
+        ) = gate(Market::Spot, QualityReporter::disabled()).open();
         assert!(matches!(
-            replies.on_text(refusal(0, 3).as_bytes()),
+            replies.on_control(refusal(0, 3).as_bytes()),
             Verdict::End(Loss::Rejected(_))
         ));
 
         let (mut replies, _) = gate(Market::Spot, QualityReporter::disabled()).open();
         for id in 0..requests.len() {
-            replies.on_text(ack(id).as_bytes());
+            replies.on_control(ack(id).as_bytes());
         }
         assert!(matches!(
-            replies.on_text(refusal(0, 3).as_bytes()),
+            replies.on_control(refusal(0, 3).as_bytes()),
             Verdict::Relieve(Reason::VenueError)
         ));
     }
@@ -381,26 +411,26 @@ mod tests {
             obu(false, 106, 106, "ob.BTC_USDT.50"),
             obu(false, 8, 9, "ob.ETH_USDT.50"),
         ] {
-            assert!(matches!(replies.on_binary(&frame), Verdict::Continue));
+            assert!(matches!(replies.on_data(&frame), Verdict::Continue));
         }
     }
 
     #[test]
     fn a_gap_in_this_sockets_book_asks_for_a_fresh_snapshot() {
         let (mut replies, _) = gate(Market::Spot, QualityReporter::disabled()).open();
-        replies.on_binary(&obu(true, 0, 100, "ob.BTC_USDT.50"));
+        replies.on_data(&obu(true, 0, 100, "ob.BTC_USDT.50"));
 
         assert!(matches!(
-            replies.on_binary(&obu(false, 103, 105, "ob.BTC_USDT.50")),
+            replies.on_data(&obu(false, 103, 105, "ob.BTC_USDT.50")),
             Verdict::Relieve(Reason::Gap)
         ));
         // A later snapshot re-anchors the chain.
         assert!(matches!(
-            replies.on_binary(&obu(true, 0, 200, "ob.BTC_USDT.50")),
+            replies.on_data(&obu(true, 0, 200, "ob.BTC_USDT.50")),
             Verdict::Continue
         ));
         assert!(matches!(
-            replies.on_binary(&obu(false, 201, 202, "ob.BTC_USDT.50")),
+            replies.on_data(&obu(false, 201, 202, "ob.BTC_USDT.50")),
             Verdict::Continue
         ));
     }
@@ -409,7 +439,7 @@ mod tests {
     fn a_delta_before_its_snapshot_is_a_gap() {
         let (mut replies, _) = gate(Market::Spot, QualityReporter::disabled()).open();
         assert!(matches!(
-            replies.on_binary(&obu(false, 5, 9, "ob.BTC_USDT.50")),
+            replies.on_data(&obu(false, 5, 9, "ob.BTC_USDT.50")),
             Verdict::Relieve(Reason::Gap)
         ));
     }

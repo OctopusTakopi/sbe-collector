@@ -34,7 +34,7 @@ use crate::{
     file::{Symbol, WriteRecord},
     quality::{QualityEvent, QualityReporter},
     readiness::Readiness,
-    session::{self, Protocol},
+    session::{self, Frame, Protocol},
 };
 use protocol::Gate;
 
@@ -291,7 +291,10 @@ pub async fn run_collection(
     let ws_rx = session::spawn_slots(&mut ingest.tasks, gate, connections, &quality, &readiness);
     let mut feed = Feed::new(ws_rx, shutdown);
 
-    while let Some((recv_time, data)) = feed.recv(&mut ingest.tasks).await? {
+    while let Some(Frame {
+        recv_time, data, ..
+    }) = feed.recv(&mut ingest.tasks).await?
+    {
         match ingest.handle(recv_time, data).await {
             Ok(()) => {}
             Err(ConnectorError::WriterClosed) => return Err(ConnectorError::WriterClosed.into()),
