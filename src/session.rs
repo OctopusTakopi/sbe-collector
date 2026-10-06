@@ -461,21 +461,24 @@ where
                 // channels still unanswered.
                 let settled = session.settled();
                 match deliver_frame(&slot.ws_tx, &mut overflow, message.payload).await {
-                    Delivery::Sent => {
-                        if settled && liveness.is_none() {
-                            liveness = Some(slot.readiness.source_live(slot.source.as_str()));
+                    // Lease first: going live may retire an older session at
+                    // once. Only a frame that reached the queue proves this
+                    // session carries the feed.
+                    Delivery::Sent if settled => {
+                        liveness.get_or_insert_with(|| {
+                            slot.readiness.source_live(slot.source.as_str())
+                        });
+                        if !std::mem::replace(&mut announced_live, true) {
+                            let _ = slot.events.try_send(Event::Live(id));
                         }
                     }
+                    Delivery::Sent => {}
                     // The socket is alive but this process is not carrying
                     // the feed: revoke handover readiness until delivery
                     // succeeds again.
                     Delivery::Dropped => liveness = None,
                     Delivery::Closed => return SessionEnd::Finished,
                     Delivery::Undeliverable => return SessionEnd::Lost(Loss::Undeliverable),
-                }
-                if settled && !announced_live {
-                    announced_live = true;
-                    let _ = slot.events.try_send(Event::Live(id));
                 }
                 verdict
             }
@@ -1168,6 +1171,51 @@ mod tests {
         let delivered: Vec<Bytes> =
             std::iter::from_fn(|| data.try_recv().ok().map(|(_, payload)| payload)).collect();
         assert_eq!(delivered, [&first[..], &second[..]]);
+    }
+
+    /// A shed frame never reached the queue, so it proves nothing: it must
+    /// neither make the process ready nor retire an older session.
+    #[tokio::test(start_paused = true)]
+    async fn a_shed_frame_does_not_make_the_session_live() {
+        let (conn, mut server) = crate::ws::duplex_pair();
+        let (event_tx, mut events) = mpsc::channel(2);
+        let (ws_tx, mut data) = mpsc::channel(1);
+        ws_tx.try_send((Timestamp::now(), Bytes::new())).unwrap();
+        let (readiness, ready) = Readiness::new(1);
+        readiness.mark_writer_ready();
+        let (_retire, retire_rx) = oneshot::channel();
+        let slot = Slot {
+            connection: 0,
+            source: "test".to_owned(),
+            ws_tx,
+            events: event_tx,
+            max_age: None,
+            keepalive: None,
+            quality: QualityReporter::disabled(),
+            readiness,
+        };
+        let _session = tokio::spawn(run_session(
+            slot,
+            conn,
+            TEST_SESSION,
+            retire_rx,
+            Script::default(),
+            Vec::new(),
+        ));
+        let frame = || WsFrame::binary(Payload::Owned(vec![0x12, 0x00, 0x10, 0x27]));
+
+        server.write_frame(frame()).await.unwrap();
+        tokio::time::sleep(crate::ws::QUEUE_FULL_GRACE * 2).await;
+        assert!(events.try_recv().is_err(), "shed, so not live");
+        assert!(!ready.borrow().is_ready());
+
+        data.recv().await.unwrap();
+        server.write_frame(frame()).await.unwrap();
+        assert!(matches!(
+            events.recv().await,
+            Some(Event::Live(TEST_SESSION))
+        ));
+        assert!(ready.borrow().is_ready());
     }
 
     /// No latency and no overlap beyond what was already in flight.
