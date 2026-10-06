@@ -62,6 +62,7 @@ enum Step {
     Trailer,
     Sync,
     Rollback,
+    SyncDir,
 }
 
 /// Never fails outside tests.
@@ -284,6 +285,13 @@ fn lock_daily(prefix: &Path, date: Date) -> DailyLock {
         Err(error) => return DailyLock::Failed(error),
     };
     match ends_cleanly(&daily) {
+        // Empty, it may have just been created.
+        Ok(true) if daily.metadata().is_ok_and(|meta| meta.len() == 0) => {
+            return match sync_dir(&path) {
+                Ok(()) => DailyLock::Held(daily),
+                Err(error) => DailyLock::Failed(error),
+            };
+        }
         Ok(true) => return DailyLock::Held(daily),
         Ok(false) => warn!(path = %path.display(), "daily file ends mid-frame"),
         Err(error) => warn!(path = %path.display(), %error, "cannot verify daily file"),
@@ -304,7 +312,12 @@ fn lock_daily(prefix: &Path, date: Date) -> DailyLock {
     let fresh = open_locked(&path);
     // The damaged inode stays locked until the fresh one is.
     drop(daily);
-    match fresh {
+    match fresh.and_then(|fresh| {
+        if fresh.is_some() {
+            sync_dir(&path)?;
+        }
+        Ok(fresh)
+    }) {
         Ok(Some(daily)) => DailyLock::Held(daily),
         Ok(None) => DailyLock::Busy,
         Err(error) => DailyLock::Failed(error),
@@ -313,12 +326,26 @@ fn lock_daily(prefix: &Path, date: Date) -> DailyLock {
 
 fn set_aside(path: &Path, salvage: &Path) -> io::Result<()> {
     fault(Step::SetAside)?;
-    std::fs::rename(path, salvage).map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!("cannot move {} aside: {error}", path.display()),
-        )
-    })
+    std::fs::rename(path, salvage)
+        .and_then(|()| sync_dir(path))
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("cannot move {} aside: {error}", path.display()),
+            )
+        })
+}
+
+/// Make a file's creation, renaming or removal durable: an fsync of the
+/// file does not cover its directory entry, so after a crash a merged
+/// sidecar could come back, or a fresh one vanish.
+fn sync_dir(path: &Path) -> io::Result<()> {
+    fault(Step::SyncDir)?;
+    let dir = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    File::open(dir)?.sync_all()
 }
 
 fn rollback_append(daily: &mut File, start: u64) -> io::Result<()> {
@@ -384,7 +411,7 @@ fn merge_sidecar(daily: &mut File, sidecar: &Path) -> Merge {
     if let Err(merge) = append_sidecar(daily, source) {
         return merge;
     }
-    match std::fs::remove_file(sidecar) {
+    match std::fs::remove_file(sidecar).and_then(|()| sync_dir(sidecar)) {
         Ok(()) => info!(
             sidecar = %sidecar.display(),
             "switch complete; merged and removed overlap sidecar"
@@ -392,7 +419,7 @@ fn merge_sidecar(daily: &mut File, sidecar: &Path) -> Merge {
         Err(error) => warn!(
             sidecar = %sidecar.display(),
             %error,
-            "switch complete; merged overlap sidecar but failed to remove it"
+            "switch complete; merged overlap sidecar but failed to remove it durably"
         ),
     }
     Merge::Done
@@ -700,6 +727,7 @@ impl RotatingFile {
         let path = day_file(&self.prefix, date, format_args!("_{}", self.run_id));
         let file = File::options().create_new(true).write(true).open(&path)?;
         lock_exclusively(&file, &path)?;
+        sync_dir(&path)?;
         warn!(
             path = %path.display(),
             "daily file unavailable; writing a run-local sidecar until it is free"
@@ -2340,6 +2368,29 @@ mod tests {
         assert_eq!(names(&dir), ["btcusdt_20270115.zst"]);
         let daily = decoded(&dir.join("btcusdt_20270115.zst"));
         assert_eq!(numbers(&daily), (1..=1_000).collect::<Vec<_>>());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Creating the daily file, creating the sidecar and removing it once
+    /// merged each sync the directory.
+    #[test]
+    fn directory_changes_are_synced() {
+        let dir = test_dir("sync-dir");
+        let before = reached(Step::SyncDir);
+        let mut incumbent = writer(&dir, "incumbent");
+        incumbent.write(sbe(day_one(), b"incumbent")).unwrap();
+        assert_eq!(reached(Step::SyncDir) - before, 1, "the new daily file");
+        let mut challenger = writer(&dir, "challenger");
+        challenger.write(sbe(day_one(), b"overlap")).unwrap();
+        assert_eq!(reached(Step::SyncDir) - before, 2, "the new sidecar");
+        incumbent.close().unwrap();
+        challenger.close().unwrap();
+        assert_eq!(
+            reached(Step::SyncDir) - before,
+            3,
+            "the merged sidecar's removal"
+        );
+        assert_eq!(names(&dir), ["btcusdt_20270115.zst"]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
