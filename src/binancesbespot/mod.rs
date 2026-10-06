@@ -1,7 +1,10 @@
 pub(crate) mod snapshot;
 mod ws;
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use anyhow::bail;
 use serde::Deserialize;
@@ -101,6 +104,9 @@ struct Ingest {
     symbols: SymbolMatcher,
     /// Highest `lastBookUpdateId` seen per symbol.
     last_update_ids: HashMap<Symbol, i64>,
+    /// Templates whose frames already went to 'unknown': the quality log
+    /// syncs each event.
+    unknown: HashSet<u16>,
     snapshots: Snapshots<Book>,
     /// Snapshots fetched to repair a depth gap.
     recoveries: JoinSet<()>,
@@ -118,6 +124,7 @@ impl Ingest {
             recorder,
             symbols: SymbolMatcher::new(symbols),
             last_update_ids: HashMap::new(),
+            unknown: HashSet::new(),
             snapshots,
             recoveries: JoinSet::new(),
             quality,
@@ -139,18 +146,7 @@ impl Consumer for Ingest {
         let template_id = header.template_id.get();
 
         let Some(symbol) = self.symbols.resolve(&data) else {
-            warn!(
-                len = data.len(),
-                template_id, "could not identify symbol in SBE frame; writing to 'unknown'"
-            );
-            self.quality.report(QualityEvent::FeedDegraded {
-                at_ns: QualityEvent::now_ns(),
-                source: Endpoint::SOURCE.to_owned(),
-                detail: format!(
-                    "could not identify symbol in SBE frame (template_id={template_id}, len={})",
-                    data.len()
-                ),
-            });
+            self.report_unknown(template_id, data.len());
             return self
                 .recorder
                 .write(recv_time, Symbol::from("unknown"), data)
@@ -175,6 +171,25 @@ impl Consumer for Ingest {
 }
 
 impl Ingest {
+    /// Every frame ends with a subscribed symbol, so one that does not is
+    /// worth a quality event: once per template, not once per frame.
+    fn report_unknown(&mut self, template_id: u16, len: usize) {
+        if !self.unknown.insert(template_id) {
+            return;
+        }
+        warn!(
+            len,
+            template_id, "could not identify the symbol of an SBE frame; writing to 'unknown'"
+        );
+        self.quality.report(QualityEvent::FeedDegraded {
+            at_ns: QualityEvent::now_ns(),
+            source: Endpoint::SOURCE.to_owned(),
+            detail: format!(
+                "frames of template_id={template_id} name no subscribed symbol; they go to 'unknown'"
+            ),
+        });
+    }
+
     /// Report a forward hole in `symbol`'s depth diffs and fetch a snapshot to
     /// repair it.
     ///
@@ -368,18 +383,20 @@ mod tests {
     /// An ingest for BTCUSDT. Its weight budget is zero, so a gap's recovery
     /// snapshot can never reach Binance from a unit test.
     fn ingest(connections: usize) -> (Ingest, Receiver<WriteRecord>) {
+        ingest_reporting(connections, QualityReporter::disabled())
+    }
+
+    fn ingest_reporting(
+        connections: usize,
+        quality: QualityReporter,
+    ) -> (Ingest, Receiver<WriteRecord>) {
         let (writer_tx, writer_rx) = channel(16);
         let snapshots = Snapshots::new(Arc::new(Book), 0, writer_tx.clone()).unwrap();
         let recorder = Recorder {
             dedup: Dedup::for_connections(connections, Exchange::BinanceSbeSpot),
             writer_tx,
         };
-        let ingest = Ingest::new(
-            recorder,
-            vec![Symbol::from("btcusdt")],
-            snapshots,
-            QualityReporter::disabled(),
-        );
+        let ingest = Ingest::new(recorder, vec![Symbol::from("btcusdt")], snapshots, quality);
         (ingest, writer_rx)
     }
 
@@ -570,16 +587,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unidentified_frame_is_written_to_unknown() {
-        let (mut ingest, mut writer_rx) = ingest(1);
-        let mut frame = depth_diff(2, 3).to_vec();
-        let len = frame.len();
-        frame[len - 7..].copy_from_slice(b"XRPUSDT");
+    async fn an_unidentified_frame_is_written_to_unknown_and_reported_once() {
+        let (quality, events) = QualityReporter::test_channel();
+        let (mut ingest, mut writer_rx) = ingest_reporting(1, quality);
+        for first_u in [2, 4] {
+            let mut frame = depth_diff(first_u, first_u + 1).to_vec();
+            let len = frame.len();
+            frame[len - 7..].copy_from_slice(b"XRPUSDT");
+            ingest.feed(Bytes::from(frame)).await;
+        }
 
-        ingest.feed(Bytes::from(frame)).await;
-
-        let record = writer_rx.try_recv().unwrap();
-        assert_eq!(&*record.symbol, "unknown");
+        for _ in 0..2 {
+            assert_eq!(&*writer_rx.try_recv().unwrap().symbol, "unknown");
+        }
         assert!(ingest.last_update_ids.is_empty());
+        assert!(matches!(
+            events.try_recv(),
+            Ok(QualityEvent::FeedDegraded { .. })
+        ));
+        assert!(events.try_recv().is_err(), "one report per template");
     }
 }
