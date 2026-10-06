@@ -355,7 +355,7 @@ async fn wait_until_stably_ready(
 ) -> anyhow::Result<()> {
     timeout(READY_TIMEOUT, async {
         loop {
-            while !ready.borrow_and_update().is_ready() {
+            while !ready.borrow_and_update().ready() {
                 ready
                     .changed()
                     .await
@@ -371,7 +371,7 @@ async fn wait_until_stably_ready(
                     result = ready.changed() => {
                         result.map_err(|_| anyhow!("readiness sender closed"))?;
                         let state = ready.borrow_and_update();
-                        if !state.is_ready() || state.outage_epoch != outage_epoch {
+                        if !state.ready() || state.outage_epoch != outage_epoch {
                             break;
                         }
                     }
@@ -668,13 +668,18 @@ async fn read_message(stream: &mut UnixStream) -> Result<Message, WireError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::readiness::{Readiness, SourceLease};
+    use crate::readiness::{Readiness, Source, SourceLease};
+
+    const TEST_SOURCE: Source = Source {
+        endpoint: "test",
+        connection: 0,
+    };
 
     #[tokio::test]
     async fn readiness_must_remain_live_for_the_whole_overlap() {
         let (readiness, mut ready) = Readiness::new(1);
         readiness.mark_writer_ready();
-        let first = readiness.source_live("source");
+        let first = readiness.source_live(TEST_SOURCE);
         let mut waiter = tokio::spawn(async move {
             wait_until_stably_ready(&mut ready, Duration::from_millis(200)).await
         });
@@ -682,7 +687,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(80)).await;
         drop(first);
         // Reconnect without yielding, so only the outage epoch shows it.
-        let _second = readiness.source_live("source");
+        let _second = readiness.source_live(TEST_SOURCE);
         assert!(
             timeout(Duration::from_millis(150), &mut waiter)
                 .await
@@ -742,7 +747,7 @@ mod tests {
             let (readiness, ready_rx) = Readiness::new(1);
             let source = ready.then(|| {
                 readiness.mark_writer_ready();
-                readiness.source_live("source")
+                readiness.source_live(TEST_SOURCE)
             });
             let (takeover_tx, takeover) = mpsc::channel(1);
             let (shutdown, shutdown_rx) = watch::channel(false);
@@ -996,7 +1001,7 @@ mod tests {
         new.shutdown.send_replace(true);
         // Readiness that arrives now must not retire the incumbent.
         new.readiness.mark_writer_ready();
-        let _source = new.readiness.source_live("source");
+        let _source = new.readiness.source_live(TEST_SOURCE);
 
         timeout(Duration::from_secs(1), new.task)
             .await

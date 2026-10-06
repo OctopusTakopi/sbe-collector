@@ -21,7 +21,10 @@ use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, warn};
 use url::Url;
 
-use crate::quality::{QualityEvent, QualityReporter};
+use crate::{
+    quality::{QualityEvent, QualityReporter},
+    readiness::Source,
+};
 
 type Io = TokioIo<Upgraded>;
 
@@ -75,7 +78,7 @@ pub fn build_tls_config() -> ClientConfig {
 /// the venue's disconnect costs far more than the overflow. Dropping silently
 /// is what must never happen.
 pub struct Overflow {
-    label: String,
+    source: Source,
     quality: QualityReporter,
     dropped: u64,
     reported: u64,
@@ -85,9 +88,9 @@ pub struct Overflow {
 }
 
 impl Overflow {
-    pub fn new(label: impl Into<String>, quality: QualityReporter) -> Self {
+    pub fn new(source: Source, quality: QualityReporter) -> Self {
         Self {
-            label: label.into(),
+            source,
             quality,
             dropped: 0,
             reported: 0,
@@ -100,14 +103,14 @@ impl Overflow {
         self.dropped += 1;
         if self.dropped == 1 || self.last_report.elapsed() >= OVERFLOW_REPORT_INTERVAL {
             error!(
-                endpoint = %self.label,
+                endpoint = %self.source,
                 dropped_total = self.dropped,
                 dropped_since_last_report = self.dropped - self.reported,
                 "writer cannot keep up; dropping frames"
             );
             self.quality.report(QualityEvent::MarketDataDropped {
                 at_ns: QualityEvent::now_ns(),
-                source: self.label.clone(),
+                source: self.source.to_string(),
                 dropped_total: self.dropped,
                 dropped_since_last_report: self.dropped - self.reported,
             });
@@ -120,13 +123,13 @@ impl Overflow {
     pub fn record_sent(&mut self) {
         if self.dropped > 0 {
             info!(
-                endpoint = %self.label,
+                endpoint = %self.source,
                 dropped_total = self.dropped,
                 "writer caught up; no longer dropping frames"
             );
             self.quality.report(QualityEvent::MarketDataRecovered {
                 at_ns: QualityEvent::now_ns(),
-                source: self.label.clone(),
+                source: self.source.to_string(),
                 dropped_total: self.dropped,
             });
             self.dropped = 0;
@@ -606,10 +609,15 @@ pub fn duplex_pair() -> (
 mod tests {
     use super::*;
 
+    const TEST_SOURCE: Source = Source {
+        endpoint: "test",
+        connection: 0,
+    };
+
     #[test]
     fn overflow_emits_loss_and_recovery_quality_events() {
         let (quality, rx) = QualityReporter::test_channel();
-        let mut overflow = Overflow::new("test", quality);
+        let mut overflow = Overflow::new(TEST_SOURCE, quality);
         overflow.record_drop();
         overflow.record_drop();
         overflow.record_sent();
@@ -662,7 +670,7 @@ mod tests {
     async fn sustained_backpressure_sheds_without_waiting_after_the_first_grace() {
         let (tx, _rx) = mpsc::channel::<u32>(1);
         tx.try_reserve().unwrap().send(0); // fill it
-        let mut overflow = Overflow::new("test", QualityReporter::disabled());
+        let mut overflow = Overflow::new(TEST_SOURCE, QualityReporter::disabled());
 
         let before = tokio::time::Instant::now();
         assert_eq!(
@@ -702,7 +710,7 @@ mod tests {
             std::future::pending::<()>().await;
         });
 
-        let mut overflow = Overflow::new("test", QualityReporter::disabled());
+        let mut overflow = Overflow::new(TEST_SOURCE, QualityReporter::disabled());
         assert_eq!(
             deliver(&tx, &mut overflow, 1, |_| true).await,
             Delivery::Sent
@@ -714,7 +722,7 @@ mod tests {
     async fn control_frames_are_never_shed() {
         let (tx, _rx) = mpsc::channel::<u32>(1);
         tx.try_reserve().unwrap().send(0);
-        let mut overflow = Overflow::new("test", QualityReporter::disabled());
+        let mut overflow = Overflow::new(TEST_SOURCE, QualityReporter::disabled());
 
         // Get into the shedding state with a data frame.
         assert_eq!(

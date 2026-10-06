@@ -30,7 +30,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     feed::BackgroundResult,
     quality::{QualityEvent, QualityReporter},
-    readiness::Readiness,
+    readiness::{Readiness, Source},
     ws::{ConnectError, Connection, Delivery, FrameSender, Overflow},
 };
 
@@ -324,8 +324,8 @@ where
 #[derive(Clone)]
 struct Slot {
     connection: usize,
-    /// Names the slot in quality events and readiness.
-    source: String,
+    /// Names the slot in logs, quality events and readiness.
+    source: Source,
     ws_tx: mpsc::Sender<Frame>,
     /// One channel for every session of the slot, so a session relieved
     /// before it went live can still report going live.
@@ -392,7 +392,7 @@ where
             return SessionEnd::Lost(Loss::Io(error));
         }
     }
-    let mut overflow = Overflow::new(slot.source.clone(), slot.quality.clone());
+    let mut overflow = Overflow::new(slot.source, slot.quality.clone());
     let opened = tokio::time::Instant::now();
     let mut liveness = None;
     let mut announced_live = false;
@@ -465,9 +465,7 @@ where
                     // once. Only a frame that reached the queue proves this
                     // session carries the feed.
                     Delivery::Sent if settled => {
-                        liveness.get_or_insert_with(|| {
-                            slot.readiness.source_live(slot.source.as_str())
-                        });
+                        liveness.get_or_insert_with(|| slot.readiness.source_live(slot.source));
                         if !std::mem::replace(&mut announced_live, true) {
                             let _ = slot.events.try_send(Event::Live(id));
                         }
@@ -654,7 +652,10 @@ async fn keep_connection<P: Protocol>(
     let (event_tx, mut event_rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
     let slot = Slot {
         connection,
-        source: format!("{}/connection-{connection}", P::SOURCE),
+        source: Source {
+            endpoint: P::SOURCE,
+            connection,
+        },
         ws_tx,
         events: event_tx,
         max_age: protocol.max_age(connection),
@@ -696,7 +697,7 @@ async fn keep_connection<P: Protocol>(
                 if !std::mem::replace(&mut refusal_reported, true) {
                     slot.quality.report(QualityEvent::FeedDegraded {
                         at_ns: QualityEvent::now_ns(),
-                        source: slot.source.clone(),
+                        source: slot.source.to_string(),
                         detail: refused.to_string(),
                     });
                 }
@@ -856,6 +857,10 @@ mod tests {
     use tokio::{io::DuplexStream, sync::watch};
 
     const TEST_SESSION: SessionId = 7;
+    const TEST_SOURCE: Source = Source {
+        endpoint: "test",
+        connection: 0,
+    };
 
     /// Asks for a replacement on the text `relieve` and gives up on `refuse`;
     /// each `ack` answers one of `pending` subscriptions.
@@ -912,7 +917,7 @@ mod tests {
             readiness.mark_writer_ready();
             let slot = Slot {
                 connection: 0,
-                source: "test".to_owned(),
+                source: TEST_SOURCE,
                 ws_tx,
                 events: event_tx,
                 max_age,
@@ -1102,7 +1107,7 @@ mod tests {
     async fn retiring_delivers_the_backlog_that_already_arrived() {
         let (mut conn, mut server) = crate::ws::duplex_pair();
         let (ws_tx, data) = mpsc::channel(16);
-        let mut overflow = Overflow::new("test", QualityReporter::disabled());
+        let mut overflow = Overflow::new(TEST_SOURCE, QualityReporter::disabled());
 
         for _ in 0..3 {
             server
@@ -1139,7 +1144,7 @@ mod tests {
         let (retire, retire_rx) = oneshot::channel();
         let slot = Slot {
             connection: 0,
-            source: "test".to_owned(),
+            source: TEST_SOURCE,
             ws_tx,
             events: event_tx,
             max_age: None,
@@ -1186,7 +1191,7 @@ mod tests {
         let (_retire, retire_rx) = oneshot::channel();
         let slot = Slot {
             connection: 0,
-            source: "test".to_owned(),
+            source: TEST_SOURCE,
             ws_tx,
             events: event_tx,
             max_age: None,
@@ -1207,7 +1212,7 @@ mod tests {
         server.write_frame(frame()).await.unwrap();
         tokio::time::sleep(crate::ws::QUEUE_FULL_GRACE * 2).await;
         assert!(events.try_recv().is_err(), "shed, so not live");
-        assert!(!ready.borrow().is_ready());
+        assert!(!ready.borrow().ready());
 
         data.recv().await.unwrap();
         server.write_frame(frame()).await.unwrap();
@@ -1215,7 +1220,7 @@ mod tests {
             events.recv().await,
             Some(Event::Live(TEST_SESSION))
         ));
-        assert!(ready.borrow().is_ready());
+        assert!(ready.borrow().ready());
     }
 
     /// No latency and no overlap beyond what was already in flight.
@@ -1223,7 +1228,7 @@ mod tests {
     async fn draining_a_caught_up_socket_returns_at_once() {
         let (mut conn, _server) = crate::ws::duplex_pair();
         let (ws_tx, _data) = mpsc::channel(16);
-        let mut overflow = Overflow::new("test", QualityReporter::disabled());
+        let mut overflow = Overflow::new(TEST_SOURCE, QualityReporter::disabled());
 
         let before = tokio::time::Instant::now();
         let drained = drain_buffered(
@@ -1268,7 +1273,7 @@ mod tests {
             harness.events.try_recv().is_err(),
             "no Live before the reply"
         );
-        assert!(!harness.ready.borrow().is_ready());
+        assert!(!harness.ready.borrow().ready());
 
         harness.send_text("ack").await;
         harness.send_market_data().await;
@@ -1277,7 +1282,7 @@ mod tests {
             Some(Event::Live(TEST_SESSION))
         ));
         assert!(harness.data.recv().await.is_some());
-        assert!(harness.ready.borrow().is_ready());
+        assert!(harness.ready.borrow().ready());
     }
 
     #[tokio::test]
