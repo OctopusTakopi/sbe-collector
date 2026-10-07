@@ -727,7 +727,12 @@ impl RotatingFile {
         let path = day_file(&self.prefix, date, format_args!("_{}", self.run_id));
         let file = File::options().create_new(true).write(true).open(&path)?;
         lock_exclusively(&file, &path)?;
-        sync_dir(&path)?;
+        // Created, locked and writable: only its directory entry's durability
+        // is in doubt, which is no reason to stop recording.
+        if let Err(error) = sync_dir(&path) {
+            self.faults
+                .report(&path, &error, "cannot sync the new sidecar's directory");
+        }
         warn!(
             path = %path.display(),
             "daily file unavailable; writing a run-local sidecar until it is free"
@@ -1807,6 +1812,29 @@ mod tests {
             &decoded(&dir.join("btcusdt_20270115.zst")),
             b"frame"
         ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A sidecar whose directory cannot be synced is still written: only its
+    /// entry's durability is in doubt, and that is reported.
+    #[test]
+    fn a_sidecar_whose_directory_cannot_be_synced_is_still_written() {
+        let dir = test_dir("sidecar-sync-dir");
+        let mut incumbent = writer(&dir, "incumbent");
+        incumbent.write(sbe(day_one(), b"incumbent")).unwrap();
+        let (quality, events) = QualityReporter::test_channel();
+        let mut challenger = Writer::new(&dir, "challenger", quality);
+        arm(&[Step::SyncDir]);
+        challenger.write(sbe(day_one(), b"overlap")).unwrap();
+        assert!(challenger.files["btcusdt"].sink.is_sidecar());
+        assert_eq!(degraded(&events), 1);
+
+        incumbent.close().unwrap();
+        assert!(
+            challenger.close().is_err(),
+            "a degraded run must not exit clean"
+        );
+        assert_merged(&dir, &[b"incumbent", b"overlap"]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
