@@ -133,17 +133,14 @@ impl Dedup {
         }
     }
 
-    /// True if this frame's event was already seen inside the window: the
-    /// frame without its venue's per-connection stamp. A `false` return
-    /// records it, so call this once per frame.
-    pub fn is_duplicate(&mut self, frame: &[u8]) -> bool {
-        let exchange = self.exchange;
-        self.is_duplicate_by(|| event_key(frame, exchange.frame_stamp(frame)))
+    /// The frame without its venue's per-connection stamp.
+    fn key(&self, frame: &[u8]) -> u128 {
+        event_key(frame, self.exchange.frame_stamp(frame))
     }
 
-    /// [`Self::is_duplicate`] on a key `key` computes. It runs only while the
-    /// filter is enabled, so a single connection pays for no key.
-    pub fn is_duplicate_by(&mut self, key: impl FnOnce() -> u128) -> bool {
+    /// True if this frame's event was already seen inside the window. A
+    /// `false` return records it, so call this once per frame.
+    pub fn is_duplicate(&mut self, frame: &[u8]) -> bool {
         if !self.enabled {
             return false;
         }
@@ -155,7 +152,7 @@ impl Dedup {
             self.maintain();
         }
 
-        let key = key();
+        let key = self.key(frame);
         if self.previous.contains(&key) || !self.current.insert(key) {
             self.duplicate += 1;
             true
