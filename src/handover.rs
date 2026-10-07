@@ -1,7 +1,7 @@
 use std::{
     fs::{File, TryLockError},
     io,
-    os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
+    os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -581,15 +581,35 @@ async fn reject(stream: &mut UnixStream, reason: String) {
 /// second would unlink the listener the first had just bound: an orphan no
 /// later challenger can reach, beside a second incumbent. Older binaries do
 /// not take it.
-async fn selecting(path: &Path) -> anyhow::Result<File> {
+///
+/// `flock` needs no write access, so an existing lock file is opened
+/// read-only, and a missing one is created 0600 like the socket. One this
+/// process cannot open at all, such as one a `sudo` run left behind, is done
+/// without, as older binaries do, rather than failing the handover.
+async fn selecting(path: &Path) -> anyhow::Result<Option<File>> {
     let mut name = path.as_os_str().to_owned();
     name.push(".lock");
-    let lock = File::options()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&name)
-        .with_context(|| format!("cannot open {}", Path::new(&name).display()))?;
+    let name = Path::new(&name);
+    let opened = match File::open(name) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(name),
+        opened => opened,
+    };
+    let lock = match opened {
+        Ok(lock) => lock,
+        Err(error) => {
+            tracing::warn!(
+                path = %name.display(),
+                %error,
+                "cannot open the role-selection lock; choosing a role without it"
+            );
+            return Ok(None);
+        }
+    };
     timeout(HANDSHAKE_TIMEOUT, async {
         loop {
             match lock.try_lock() {
@@ -601,7 +621,7 @@ async fn selecting(path: &Path) -> anyhow::Result<File> {
     })
     .await
     .map_err(|_| anyhow!("timed out waiting to choose a role at {}", path.display()))??;
-    Ok(lock)
+    Ok(Some(lock))
 }
 
 async fn select_role(path: &Path) -> anyhow::Result<Role> {
@@ -1290,6 +1310,29 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The selection lock is created owner-only, like the socket, and never
+    /// written: one this user may only read is still taken, and one it may
+    /// not open at all, as a sudo run can leave it, is done without.
+    #[tokio::test]
+    async fn the_selection_lock_needs_no_write_access() {
+        let fixture = Fixture::new("lock-mode");
+        let mut lock = fixture.path.as_os_str().to_owned();
+        lock.push(".lock");
+        let set_mode =
+            |mode| std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(mode)).unwrap();
+
+        assert!(selecting(&fixture.path).await.unwrap().is_some());
+        let created = std::fs::metadata(&lock).unwrap().permissions().mode();
+        assert_eq!(created & 0o777, 0o600);
+        set_mode(0o400);
+        assert!(selecting(&fixture.path).await.unwrap().is_some());
+        set_mode(0o000);
+        match select_role(&fixture.path).await.unwrap() {
+            Role::Incumbent(listener) => listener.release(&fixture.path),
+            Role::Challenger(_) => panic!("nobody else holds the socket"),
+        }
     }
 
     #[test]
