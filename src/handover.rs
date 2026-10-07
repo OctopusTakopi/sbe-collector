@@ -146,6 +146,9 @@ impl Listener {
     }
 }
 
+/// `claim` runs once this process holds the role, bound afresh or taken over
+/// from the incumbent; a failure is reported, and collection goes on.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     path: PathBuf,
     identity: Identity,
@@ -154,6 +157,7 @@ pub async fn run(
     takeover_tx: mpsc::Sender<TakeoverRequest>,
     quality: QualityReporter,
     mut shutdown: watch::Receiver<bool>,
+    claim: impl FnOnce() -> anyhow::Result<()> + Send,
 ) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -225,6 +229,18 @@ pub async fn run(
         lost_incumbent = Some(lost);
         tokio::time::sleep(RESELECT_DELAY).await;
     };
+    if let Err(error) = claim() {
+        tracing::error!(
+            output = %identity.output,
+            error = format!("{error:#}"),
+            "cannot claim the output directory; collecting anyway"
+        );
+        quality.report(QualityEvent::StorageDegraded {
+            at_ns: QualityEvent::now_ns(),
+            target: identity.output.clone(),
+            error: format!("{error:#}"),
+        });
+    }
     server_loop(
         listener,
         &path,
@@ -821,6 +837,7 @@ mod tests {
                 takeover_tx,
                 quality,
                 shutdown_rx,
+                || Ok(()),
             ));
             Peer {
                 task,
@@ -882,6 +899,7 @@ mod tests {
                         takeover_tx,
                         QualityReporter::disabled(),
                         shutdown_rx,
+                        || Ok(()),
                     ))
             });
             Self { thread, shutdown }
@@ -1068,6 +1086,50 @@ mod tests {
         stop(new).await;
     }
 
+    /// A process that binds the socket holds the role, so it claims the
+    /// directory; a claim that fails is reported, and the incumbent carries
+    /// on.
+    #[tokio::test]
+    async fn a_failed_claim_is_reported_and_the_incumbent_carries_on() {
+        let fixture = Fixture::new("claim");
+        let (quality, events) = QualityReporter::test_channel();
+        let (_readiness, ready) = Readiness::new(1);
+        let (takeover_tx, _takeovers) = mpsc::channel(1);
+        let (_shutdown, shutdown) = watch::channel(false);
+        let incumbent = tokio::spawn(run(
+            fixture.path.clone(),
+            fixture.identity.clone(),
+            "old".to_owned(),
+            ready,
+            takeover_tx,
+            quality,
+            shutdown,
+            || Err(anyhow!("read-only file system")),
+        ));
+
+        let reported = timeout(Duration::from_secs(2), async {
+            loop {
+                match events.try_recv() {
+                    Ok(event) => break event,
+                    Err(_) => tokio::task::yield_now().await,
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                &reported,
+                QualityEvent::StorageDegraded { target, error, .. }
+                    if *target == fixture.identity.output && error.contains("read-only")
+            ),
+            "{reported:?}"
+        );
+        fixture.wait_until_listening().await;
+        assert!(!incumbent.is_finished());
+        incumbent.abort();
+    }
+
     /// The readiness deadline is fixed at the first acknowledgement: a
     /// challenge after a reselection does not start the wait afresh.
     #[tokio::test]
@@ -1153,6 +1215,7 @@ mod tests {
             takeover_tx,
             QualityReporter::disabled(),
             shutdown,
+            || unreachable!("a challenger turned away must not claim the directory"),
         )
         .await
         .unwrap_err();
