@@ -19,7 +19,7 @@ mod ws;
 
 use std::{path::PathBuf, time::Duration};
 
-use anyhow::{Context as _, anyhow};
+use anyhow::{Context as _, anyhow, bail};
 use clap::Parser;
 use sbe_collector::{exchange::Exchange, sbe::gate::Market};
 use tokio::{
@@ -131,6 +131,14 @@ async fn main() -> anyhow::Result<()> {
         info!("SIGHUP is ignored (inherited, e.g. from nohup); a hangup will not stop collection");
     }
     let connections = usize::from(args.connections);
+    // A symbol given twice would be subscribed twice, and its second
+    // answer, if any, can keep the session from settling.
+    if let Some((first, again)) = duplicate(&args.symbols) {
+        bail!(
+            "cannot collect {}: {again} is given twice, first as {first}",
+            args.exchange.as_str()
+        );
+    }
     let venue = Venue::prepare(args.exchange, &args.symbols)
         .await
         .with_context(|| format!("cannot collect {}", args.exchange.as_str()))?;
@@ -335,6 +343,16 @@ async fn main() -> anyhow::Result<()> {
 /// dead terminal, and `panic = "abort"` would then kill the process
 /// mid-shutdown. Failed log lines are dropped instead. Otherwise as
 /// `fmt::init()`: `RUST_LOG` targets, `INFO` by default.
+/// The first symbol given twice, case aside, with its first spelling.
+fn duplicate(symbols: &[String]) -> Option<(&str, &str)> {
+    symbols.iter().enumerate().find_map(|(index, again)| {
+        symbols[..index]
+            .iter()
+            .find(|first| first.eq_ignore_ascii_case(again))
+            .map(|first| (first.as_str(), again.as_str()))
+    })
+}
+
 fn init_tracing() {
     use tracing_subscriber::{
         filter::{LevelFilter, Targets},
@@ -351,4 +369,21 @@ fn init_tracing() {
         .finish()
         .with(targets)
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_symbol_given_twice_is_found_case_aside() {
+        let symbols = |names: &[&str]| -> Vec<String> {
+            names.iter().map(|name| (*name).to_owned()).collect()
+        };
+        assert_eq!(duplicate(&symbols(&["BTC-USDT", "ETH-USDT"])), None);
+        assert_eq!(
+            duplicate(&symbols(&["btcusdt", "ethusdt", "BTCUSDT"])),
+            Some(("btcusdt", "BTCUSDT"))
+        );
+    }
 }
