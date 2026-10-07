@@ -45,11 +45,13 @@ export OKX_API_KEY=... OKX_SECRET_KEY=... OKX_PASSPHRASE=...
 ./target/release/sbe-collector -c 2 /data/sbe/gate/futures gatesbefutures BTC_USDT ETH_USDT
 ```
 
-Missing credentials end the process at startup, and so does a symbol the
-venue says it does not list: every symbol is looked up first (Binance
+Missing credentials end the process at startup, and so do a symbol given
+twice and one the venue says it does not list: every symbol is looked up first (Binance
 `exchangeInfo`, OKX's instruments, Gate's pairs and contracts), and the error
 names each one refused with the venue's answer. A venue that cannot answer,
-unreachable or rate-limited, is asked again for up to two minutes.
+unreachable or rate-limited, is asked again for up to two minutes, except
+Binance turning this IP away (418, 429): asking again would escalate the ban,
+and its stream needs no REST, so the symbols are recorded unchecked.
 
 A venue refusing the websocket upgrade before any connection has delivered
 ends the process too, where the upgrade carries credentials: Binance answers
@@ -133,11 +135,12 @@ fresh daily file.
 
 A record does not say which exchange it is from, and Gate's two markets send
 identical headers over different layouts, so each output directory names its
-exchange in an `_exchange` file. The collector writes it on first start and
-refuses a directory marked for another exchange. A directory without one was
-recorded before markers existed, by `binancesbespot`. The JSON collector
-writes the same file under its own names: its directories are refused here,
-and `reader` and `gap_detector` skip them.
+exchange in an `_exchange` file. The first collector to hold the directory's
+handover role writes it, and a collector for another exchange is refused
+before it creates anything. A directory without one was recorded before
+markers existed, by `binancesbespot`. The JSON collector writes the same file
+under its own names: its directories are refused here, and `reader` and
+`gap_detector` skip them unless given `--exchange`.
 
 A cleanly sealed file ends with a clean-close trailer: a 24-byte zstd
 skippable frame holding `COLLECTR` and the offset it starts at, so the next
@@ -168,7 +171,7 @@ cargo build --release --bin reader --bin gap_detector
 `reader` prints decoded records; `gap_detector` checks receive-time gaps and
 each venue's id chains: depth and trade ids, best bid/offer update ids, Gate's
 `obu` deltas. Both decode a file as the exchange its directory names;
-`--exchange` overrides. On a file that is still open `reader` exits with
+`--exchange` decides instead, the marker unread. On a file that is still open `reader` exits with
 `incomplete frame` after the last complete record; that is expected.
 `gap_detector` says the same thing as an unterminated zstd stream.
 
