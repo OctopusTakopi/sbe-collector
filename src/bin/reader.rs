@@ -57,8 +57,12 @@ fn main() {
     for path in &args.files {
         println!("=== {} ===", path.display());
         let dir = path.parent().unwrap_or(Path::new("."));
-        let result = Exchange::of_recordings_in(dir).and_then(|marked| match marked {
-            Some(marked) => read_file(path, args.exchange.unwrap_or(marked)),
+        let decoded = match args.exchange {
+            Some(exchange) => Ok(Some(exchange)),
+            None => Exchange::of_recordings_in(dir),
+        };
+        let result = decoded.and_then(|decoded| match decoded {
+            Some(exchange) => read_file(path, exchange),
             None => {
                 eprintln!(
                     "Skipped {}: its directory holds another collector's recordings",

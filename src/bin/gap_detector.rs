@@ -176,23 +176,29 @@ fn discover(roots: &[PathBuf], exchange: Option<Exchange>) -> Result<Vec<Series>
         );
     }
 
-    // Per directory: the exchange it is decoded as, or `None` for one another
-    // collector recorded, whatever `--exchange` says.
+    // Per directory: the exchange it is decoded as, `--exchange` or its
+    // marker's, or `None` for one another collector recorded.
     let mut exchanges: HashMap<PathBuf, Option<Exchange>> = HashMap::new();
     let mut series: Vec<Series> = Vec::with_capacity(map.len());
     for ((dir, symbol), mut files) in map {
         let decoded = match exchanges.get(&dir) {
             Some(&decoded) => decoded,
             None => {
-                let marked = Exchange::of_recordings_in(&dir)
-                    .with_context(|| format!("cannot tell the exchange of {}", dir.display()))?;
-                if marked.is_none() {
-                    eprintln!(
-                        "note: skipped {}: it holds another collector's recordings",
-                        dir.display()
-                    );
-                }
-                let decoded = marked.map(|marked| exchange.unwrap_or(marked));
+                let decoded = match exchange {
+                    Some(exchange) => Some(exchange),
+                    None => {
+                        let marked = Exchange::of_recordings_in(&dir).with_context(|| {
+                            format!("cannot tell the exchange of {}", dir.display())
+                        })?;
+                        if marked.is_none() {
+                            eprintln!(
+                                "note: skipped {}: it holds another collector's recordings",
+                                dir.display()
+                            );
+                        }
+                        marked
+                    }
+                };
                 exchanges.insert(dir.clone(), decoded);
                 decoded
             }
@@ -1492,8 +1498,8 @@ mod tests {
         encoder.finish().unwrap();
     }
 
-    /// A directory collector recorded is left out of the scan, even with
-    /// `--exchange`: its records are not SBE.
+    /// A directory collector recorded is left out of the scan, unless
+    /// `--exchange` decodes every directory, its marker unread.
     #[test]
     fn foreign_directories_are_not_scanned() {
         let root = test_dir("foreign");
@@ -1507,15 +1513,33 @@ mod tests {
         )
         .unwrap();
 
-        for exchange in [None, Some(Exchange::BinanceSbeSpot)] {
+        let keys = |exchange| -> Vec<String> {
             let series = discover(std::slice::from_ref(&root), exchange).unwrap();
-            let keys: Vec<&str> = series.iter().map(|s| s.key.as_str()).collect();
-            assert_eq!(
-                keys,
-                [format!("{}/sbe/btcusdt", root.display())],
-                "{exchange:?}"
-            );
-        }
+            series.into_iter().map(|s| s.key).collect()
+        };
+        assert_eq!(keys(None), [format!("{}/sbe/btcusdt", root.display())]);
+        assert_eq!(
+            keys(Some(Exchange::BinanceSbeSpot)),
+            [
+                format!("{}/json/btcusdt", root.display()),
+                format!("{}/sbe/btcusdt", root.display())
+            ]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A marker that cannot be read stops the scan, unless `--exchange`
+    /// decides the decoding, the marker unread.
+    #[test]
+    fn an_unreadable_marker_gives_way_to_exchange() {
+        let root = test_dir("unreadable-marker");
+        write_zst(&root.join("btcusdt_20261007.zst"), &[]);
+        fs::write(root.join(sbe_collector::exchange::MARKER), b"\xff\xfe\n").unwrap();
+
+        assert!(discover(std::slice::from_ref(&root), None).is_err());
+        let series = discover(std::slice::from_ref(&root), Some(Exchange::OkxSbe)).unwrap();
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0].exchange, Exchange::OkxSbe);
         fs::remove_dir_all(root).unwrap();
     }
 
