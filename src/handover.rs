@@ -12,7 +12,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
     sync::{mpsc, oneshot, watch},
-    time::timeout,
+    time::{Instant, timeout, timeout_at},
 };
 
 use crate::{
@@ -163,6 +163,9 @@ pub async fn run(
     let mut reselections = 0;
     // The incumbent of the last challenge, if it vanished before draining.
     let mut lost_incumbent: Option<Lost> = None;
+    // When this process must be ready, fixed at the first acknowledgement: a
+    // challenge after a reselection does not start the wait afresh.
+    let mut ready_by = None;
     let listener = loop {
         let lost = match select_role(&path).await? {
             Role::Incumbent(listener) => {
@@ -194,16 +197,16 @@ pub async fn run(
             Role::Challenger(stream) => {
                 let outcome = challenge(
                     stream,
-                    &path,
                     &identity,
                     &run_id,
                     &mut ready,
+                    &mut ready_by,
                     &quality,
                     &mut shutdown,
                 )
                 .await?;
                 match outcome {
-                    Challenge::TookOver(listener) => break listener,
+                    Challenge::TookOver => break bind_after_handover(&path).await?,
                     Challenge::Stopped => return Ok(()),
                     Challenge::Lost(lost) => lost,
                 }
@@ -236,8 +239,8 @@ pub async fn run(
 
 /// How a challenge that did not fail ended.
 enum Challenge {
-    /// The incumbent drained and this process bound the socket.
-    TookOver(Listener),
+    /// The incumbent drained and released the socket to this process.
+    TookOver,
     /// This process was asked to stop before it reported ready. Retiring the
     /// incumbent now would leave nothing collecting.
     Stopped,
@@ -268,13 +271,15 @@ impl Challenge {
     }
 }
 
-/// Ask the incumbent to drain once this process is stably ready.
+/// Ask the incumbent to drain once this process is stably ready. Readiness
+/// is due by `ready_by`, set [`READY_TIMEOUT`] after the first
+/// acknowledgement if not yet.
 async fn challenge(
     mut stream: UnixStream,
-    path: &Path,
     identity: &Identity,
     run_id: &str,
     ready: &mut watch::Receiver<ReadinessState>,
+    ready_by: &mut Option<Instant>,
     quality: &QualityReporter,
     shutdown: &mut watch::Receiver<bool>,
 ) -> anyhow::Result<Challenge> {
@@ -298,6 +303,7 @@ async fn challenge(
         Ok(Err(error)) => return Challenge::lost(error, None, false),
         Err(_) => bail!("timed out waiting for handover acknowledgement"),
     };
+    let ready_by = *ready_by.get_or_insert_with(|| Instant::now() + READY_TIMEOUT);
 
     // The incumbent sends nothing before `Drained`, so anything readable
     // while warming up is EOF or a protocol violation.
@@ -305,7 +311,7 @@ async fn challenge(
     tokio::select! {
         biased;
         () = stop_requested(shutdown) => return Ok(Challenge::Stopped),
-        result = wait_until_stably_ready(ready, OVERLAP_GRACE) => result?,
+        result = wait_until_stably_ready(ready, OVERLAP_GRACE, ready_by) => result?,
         read = stream.read(&mut probe) => match read {
             Ok(0) => {
                 let eof = io::Error::from(io::ErrorKind::UnexpectedEof);
@@ -342,7 +348,7 @@ async fn challenge(
             if let Err(error) = outcome {
                 tracing::error!(error, "incumbent reported a degraded drain");
             }
-            Ok(Challenge::TookOver(bind_after_handover(path).await?))
+            Ok(Challenge::TookOver)
         }
         Ok(Message::Reject { reason }) => bail!("handover rejected after readiness: {reason}"),
         Ok(message) => bail!("unexpected handover completion: {message:?}"),
@@ -350,11 +356,13 @@ async fn challenge(
     }
 }
 
+/// Waits until readiness has held for `stable_for`, giving up at `deadline`.
 async fn wait_until_stably_ready(
     ready: &mut watch::Receiver<ReadinessState>,
     stable_for: Duration,
+    deadline: Instant,
 ) -> anyhow::Result<()> {
-    timeout(READY_TIMEOUT, async {
+    timeout_at(deadline, async {
         loop {
             while !ready.borrow_and_update().ready() {
                 ready
@@ -542,7 +550,10 @@ async fn negotiate(
         tracing::warn!(%error, "handover challenger disconnected before acknowledgement");
         return None;
     }
-    match timeout(READY_TIMEOUT, read_message(stream)).await {
+    // Longer than the challenger waits for itself, so one that never
+    // gets ready gives up first, instead of finding this end gone and
+    // challenging again.
+    match timeout(READY_TIMEOUT + HANDSHAKE_TIMEOUT, read_message(stream)).await {
         Ok(Ok(Message::Ready { run_id })) if run_id == peer_run_id => Some(peer_run_id),
         Ok(Ok(message)) => {
             tracing::warn!(?message, "handover peer did not send matching readiness");
@@ -711,7 +722,8 @@ mod tests {
         readiness.mark_writer_ready();
         let first = readiness.source_live(TEST_SOURCE);
         let mut waiter = tokio::spawn(async move {
-            wait_until_stably_ready(&mut ready, Duration::from_millis(200)).await
+            let deadline = Instant::now() + READY_TIMEOUT;
+            wait_until_stably_ready(&mut ready, Duration::from_millis(200), deadline).await
         });
 
         tokio::time::sleep(Duration::from_millis(80)).await;
@@ -1034,6 +1046,50 @@ mod tests {
             [HandoverState::IncumbentLostPromoted]
         );
         stop(new).await;
+    }
+
+    /// The readiness deadline is fixed at the first acknowledgement: a
+    /// challenge after a reselection does not start the wait afresh.
+    #[tokio::test]
+    async fn a_second_challenge_keeps_the_first_readiness_deadline() {
+        let fixture = Fixture::new("ready-by");
+        let listener = UnixListener::bind(&fixture.path).unwrap();
+        // Held, so readiness can still change: never ready.
+        let (_readiness, mut ready) = Readiness::new(1);
+        let (_stop, mut shutdown) = watch::channel(false);
+        let quality = QualityReporter::disabled();
+        let mut ready_by = None;
+        let mut deadlines = Vec::new();
+
+        for _ in 0..2 {
+            let stream = UnixStream::connect(&fixture.path).await.unwrap();
+            let (mut incumbent, _) = listener.accept().await.unwrap();
+            // Acknowledge, then vanish.
+            let incumbent = async move {
+                let hello = read_message(&mut incumbent).await.unwrap();
+                assert!(matches!(hello, Message::Hello { .. }));
+                let ack = Message::HelloAck {
+                    run_id: "old".to_owned(),
+                };
+                write_message(&mut incumbent, &ack).await.unwrap();
+            };
+            let (challenged, ()) = tokio::join!(
+                challenge(
+                    stream,
+                    &fixture.identity,
+                    "new",
+                    &mut ready,
+                    &mut ready_by,
+                    &quality,
+                    &mut shutdown,
+                ),
+                incumbent,
+            );
+            assert!(matches!(challenged.unwrap(), Challenge::Lost(_)));
+            deadlines.push(ready_by.unwrap());
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(deadlines[0], deadlines[1]);
     }
 
     #[tokio::test]
