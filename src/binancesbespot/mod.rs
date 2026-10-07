@@ -22,7 +22,7 @@ use crate::{
     dedup::Dedup,
     error::ConnectorError,
     file::Symbol,
-    listing::{self, Unlisted},
+    listing::{self, Barred, Unlisted},
     quality::{QualityEvent, QualityReporter},
     session::{Frame, Protocol},
     snapshot::{Repairs, Snapshots},
@@ -246,7 +246,16 @@ impl Subscription {
         }
         let endpoint = Endpoint::new(&STREAMS, symbols, &api_key)?;
         let client = listing::client()?;
-        let unlisted = listing::patiently(listing::PATIENCE, || unlisted(&client, symbols)).await?;
+        let answer = listing::patiently(listing::PATIENCE, || unlisted(&client, symbols)).await;
+        let unlisted = match answer {
+            // The SBE stream needs no REST: a REST ban only leaves the
+            // symbols unchecked.
+            Err(error) if error.is::<Barred>() => {
+                warn!(%error, "Binance turned this IP away; recording the symbols unchecked");
+                Vec::new()
+            }
+            answer => answer?,
+        };
         if !unlisted.is_empty() {
             return Err(Unlisted(unlisted).into());
         }
@@ -278,7 +287,8 @@ async fn unlisted(client: &reqwest::Client, symbols: &[String]) -> anyhow::Resul
 /// Why `exchangeInfo?symbol=` says Binance does not list a symbol, if it
 /// does not. A 400 refuses the request itself, which asking again cannot
 /// change: `-1121 Invalid symbol.`, or `-1100` for one with characters no
-/// symbol has. Anything else, a rate limit or an outage, is no answer.
+/// symbol has. A 418 ban or a 429 rate limit is [`Barred`]. Anything else,
+/// an outage, is no answer.
 fn exchange_info(status: u16, body: &[u8]) -> anyhow::Result<Option<String>> {
     #[derive(Deserialize)]
     struct Refusal {
@@ -292,6 +302,7 @@ fn exchange_info(status: u16, body: &[u8]) -> anyhow::Result<Option<String>> {
             Ok(refusal) => format!("{} {}", refusal.code, refusal.msg),
             Err(_) => preview(),
         })),
+        418 | 429 => Err(Barred(format!("exchangeInfo answered {status}: {}", preview())).into()),
         _ => bail!("exchangeInfo answered {status}: {}", preview()),
     }
 }
@@ -579,8 +590,21 @@ mod tests {
                 .as_deref(),
             Some("-1100 Illegal characters found.")
         );
-        assert!(exchange_info(418, br#"{"code":-1003}"#).is_err());
-        assert!(exchange_info(502, b"<html>").is_err());
+        let outage = exchange_info(502, b"<html>").unwrap_err();
+        assert!(!outage.is::<Barred>());
+    }
+
+    /// A ban or a rate limit is not asked again: that is what escalates it.
+    #[test]
+    fn exchange_info_bars_on_a_ban_or_a_rate_limit() {
+        for status in [418, 429] {
+            let error = exchange_info(status, br#"{"code":-1003}"#).unwrap_err();
+            assert!(error.is::<Barred>(), "{status}");
+            assert_eq!(
+                error.to_string(),
+                format!(r#"exchangeInfo answered {status}: {{"code":-1003}}"#)
+            );
+        }
     }
 
     #[tokio::test]

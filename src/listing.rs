@@ -1,7 +1,8 @@
 //! The startup lookups of the command line's symbols in the venue's own
 //! listings. A symbol the venue confirms it does not list stops the process
 //! with the venue's answer before anything starts; a venue that cannot
-//! answer, unreachable or rate-limited, is asked again for a while first.
+//! answer, unreachable or rate-limited, is asked again for a while first,
+//! unless it has [`Barred`] this IP.
 
 use std::{future::Future, time::Duration};
 
@@ -21,6 +22,12 @@ const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 #[error("the venue does not list {}", .0.join("; "))]
 pub(crate) struct Unlisted(pub(crate) Vec<String>);
 
+/// The venue turned this IP away, banned or rate-limited: asking again is
+/// what escalates a ban, so it is not asked again.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct Barred(pub(crate) String);
+
 /// A client for the lookups. Some venues refuse a request without a
 /// `User-Agent`.
 pub(crate) fn client() -> reqwest::Result<reqwest::Client> {
@@ -36,8 +43,8 @@ pub(crate) fn client() -> reqwest::Result<reqwest::Client> {
 }
 
 /// Asks `ask` until it answers, pausing longer each time, for at most
-/// `patience`. An `Err` from `ask` is no answer at all; a refusal is an
-/// answer, and part of `T`.
+/// `patience`. An `Err` from `ask` is no answer at all, and a [`Barred`] one
+/// ends the asking at once; a refusal is an answer, and part of `T`.
 pub(crate) async fn patiently<T, F, Fut>(patience: Duration, mut ask: F) -> anyhow::Result<T>
 where
     F: FnMut() -> Fut,
@@ -48,6 +55,7 @@ where
     loop {
         match ask().await {
             Ok(answer) => return Ok(answer),
+            Err(error) if error.is::<Barred>() => return Err(error),
             Err(error) if Instant::now() + delay < deadline => {
                 warn!(
                     error = format!("{error:#}"),
@@ -104,6 +112,23 @@ mod tests {
             format!("{error:#}"),
             "cannot check the symbols against the venue's listings within 120s: 503"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_venue_that_bars_this_ip_is_not_asked_again() {
+        let attempts = AtomicU32::new(0);
+        let start = Instant::now();
+
+        let error = patiently::<(), _, _>(PATIENCE, || async {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            Err(Barred("418".to_owned()).into())
+        })
+        .await
+        .unwrap_err();
+
+        assert!(error.is::<Barred>());
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(Instant::now(), start);
     }
 
     #[test]
